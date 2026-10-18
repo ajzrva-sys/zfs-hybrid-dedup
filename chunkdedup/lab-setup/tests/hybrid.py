@@ -383,8 +383,12 @@ class Suite:
         assert 0 < stream.stat().st_size < 24 << 20
         self.m.zfs('receive', '-u', receive, input_data=stream.read_bytes())
         recv_dir = self.m.ROOT / 'hybrid-recv'
+        def mount_received():
+            if self.m.zfs('get', '-H', '-o', 'value', 'mounted', receive).stdout.strip() == b'no':
+                self.m.zfs('mount', receive)
+            assert self.m.zfs('get', '-H', '-o', 'value', 'mounted', receive).stdout.strip() == b'yes'
         try:
-            self.m.zfs('set', 'mountpoint=' + str(recv_dir), receive); self.m.zfs('mount', receive)
+            self.m.zfs('set', 'mountpoint=' + str(recv_dir), receive); mount_received()
             for name, checksum in original.items(): assert self.m.digest(recv_dir / name) == checksum
             self.m.zfs('chunkdedup', 'verify', receive)
             self.m.helper('pwrite', b, 23, b'incremental-change'.hex())
@@ -394,7 +398,7 @@ class Suite:
                 process = subprocess.run([self.m.ZFS, 'send', '-i', ds + '@full', ds + '@incremental'], stdout=out, stderr=subprocess.PIPE, timeout=180)
                 assert process.returncode == 0, process.stderr
             self.m.zfs('receive', '-u', receive, input_data=stream.read_bytes())
-            self.m.zfs('mount', receive)
+            mount_received()
             assert self.m.digest(recv_dir / 'b') == changed
             assert self.m.digest(recv_dir / 'a') == original['a'] and self.m.digest(recv_dir / 'c') == original['c']
             self.m.zfs('chunkdedup', 'verify', receive)

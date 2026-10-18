@@ -10,11 +10,16 @@ selected per file; existing chunked files retain their format.
 
 ## Current status
 
-The native code compiled and loaded in an isolated FreeBSD VM. **21/21 existing
-regression cases and 11/12 hybrid cases passed.** The final hybrid replication
-test stopped on a harness error: it tried to mount an already mounted received
-filesystem. The full native gate remains **TEST_FAILURE**. Received-content
-and hybrid incremental-replication assertions remain incomplete.
+Fresh isolated VM and dedicated bare-metal tests passed **21/21 existing
+regression cases and 12/12 hybrid cases**, including snapshot/clone and full/
+incremental replication assertions. The replication mount-state harness error
+and a strict media-inventory mismatch have been corrected; native code is unchanged.
+
+The latest full native gate remains **INFRA_FAILURE** after a host-cleanup
+SSH timeout. Separate recovery confirmed the guest stopped and restored its
+exact VM configuration. A running unrelated service changed process identity,
+so the strict host-state comparison is not a pass. The original failed
+evaluation remains preserved.
 
 Current-revision matched physical-allocation, pure-read and RAM comparisons,
 and planned forced-power-loss validation, have **not run**. The foreground-read

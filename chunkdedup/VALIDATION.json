@@ -5,12 +5,12 @@
   "implementation_commit": "dc5117ed63ceadc7cbc479db725dfc633ad46d77",
   "local_evaluation": {
     "schema": 1,
-    "run_id": "20261017t235222z-2671604f-a0",
+    "run_id": "20261018t220059z-37b686da-a0",
     "profile": "local",
     "status": "PASS",
     "source_digest": "90ce02dca5f0da9148af08d93f6a517265e9396b91b3bb9f9b24197ced144faf",
     "policy_id": "native-chunkdedup-prototype-v1",
-    "evaluated_at": "2026-10-17T23:52:33.591024+00:00",
+    "evaluated_at": "2026-10-18T22:01:10.395342+00:00",
     "artifact_digests_checked": 189,
     "assessments": {
       "source_files_verified": 4134,
@@ -22,13 +22,13 @@
   },
   "native_evaluation": {
     "schema": 1,
-    "run_id": "20261017t235237z-1c24e42b-a0",
+    "run_id": "20261018t220121z-c8abad48-a0",
     "profile": "native",
-    "status": "TEST_FAILURE",
+    "status": "INFRA_FAILURE",
     "source_digest": "90ce02dca5f0da9148af08d93f6a517265e9396b91b3bb9f9b24197ced144faf",
     "policy_id": "native-chunkdedup-prototype-v1",
-    "evaluated_at": "2026-10-18T00:04:25.012731+00:00",
-    "artifact_digests_checked": 224,
+    "evaluated_at": "2026-10-18T22:13:26.617631+00:00",
+    "artifact_digests_checked": 222,
     "assessments": {
       "source_files_verified": 4134,
       "immutable_baseline_files_verified": 141,
@@ -36,15 +36,15 @@
     },
     "feedback": [
       {
-        "category": "TEST_FAILURE",
-        "stage": "guest_regression",
-        "rule": "executed_test_failed",
+        "category": "INFRA_FAILURE",
+        "stage": "host_restore",
+        "rule": "stage_infrastructure",
         "observed": {
           "returncode": 1,
-          "log": "native/guest_regression.log"
+          "log": "native/host_restore.log"
         },
-        "expected": "all required assertions pass",
-        "action": "Diagnose the observed log and repair only implementation source."
+        "expected": "stage executed with complete evidence",
+        "action": "Fix the unavailable environment; do not treat this as a source pass."
       }
     ],
     "claim": "validation incomplete; no current native pass claim"
@@ -182,13 +182,106 @@
     },
     {
       "name": "hybrid snapshots clones and logical replication",
-      "passed": false
+      "passed": true
     }
   ],
-  "remaining_failure": "Final hybrid replication harness tried to mount an already mounted received filesystem. Received content and hybrid incremental assertions were not reached.",
+  "remaining_failure": "Latest full native gate is INFRA_FAILURE after a five-second host-cleanup SSH timeout. Separate recovery confirmed the guest stopped and exact VM configuration restored, but strict host-state comparison found an existing running service with a changed process identity. Original failed evaluation is retained; no full native pass is claimed.",
   "matched_performance": "NOT_RUN",
   "memory_comparison": "NOT_RUN",
   "planned_power_loss": "NOT_RUN",
   "foreground_read_target": 1.25,
-  "lab_restored_and_stopped": true
+  "lab_restored_and_stopped": true,
+  "updated": "2026-10-18",
+  "previous_validation": [
+    {
+      "date": "2026-10-17",
+      "local_evaluation": {
+        "schema": 1,
+        "run_id": "20261017t235222z-2671604f-a0",
+        "profile": "local",
+        "status": "PASS",
+        "source_digest": "90ce02dca5f0da9148af08d93f6a517265e9396b91b3bb9f9b24197ced144faf",
+        "policy_id": "native-chunkdedup-prototype-v1",
+        "evaluated_at": "2026-10-17T23:52:33.591024+00:00",
+        "artifact_digests_checked": 189,
+        "assessments": {
+          "source_files_verified": 4134,
+          "immutable_baseline_files_verified": 141,
+          "conformance_fixtures_verified": 35
+        },
+        "feedback": [],
+        "claim": "local models/conformance only"
+      },
+      "native_evaluation": {
+        "schema": 1,
+        "run_id": "20261017t235237z-1c24e42b-a0",
+        "profile": "native",
+        "status": "TEST_FAILURE",
+        "source_digest": "90ce02dca5f0da9148af08d93f6a517265e9396b91b3bb9f9b24197ced144faf",
+        "policy_id": "native-chunkdedup-prototype-v1",
+        "evaluated_at": "2026-10-18T00:04:25.012731+00:00",
+        "artifact_digests_checked": 224,
+        "assessments": {
+          "source_files_verified": 4134,
+          "immutable_baseline_files_verified": 141,
+          "conformance_fixtures_verified": 35
+        },
+        "feedback": [
+          {
+            "category": "TEST_FAILURE",
+            "stage": "guest_regression",
+            "rule": "executed_test_failed",
+            "observed": {
+              "returncode": 1,
+              "log": "native/guest_regression.log"
+            },
+            "expected": "all required assertions pass",
+            "action": "Diagnose the observed log and repair only implementation source."
+          }
+        ],
+        "claim": "validation incomplete; no current native pass claim"
+      },
+      "legacy_checks_passed": 21,
+      "hybrid_checks_passed": 11,
+      "hybrid_checks_total": 12,
+      "remaining_failure": "Final hybrid replication harness tried to mount an already mounted received filesystem. Received content and hybrid incremental assertions were not reached."
+    }
+  ],
+  "fresh_vm_functional_runs": [
+    {
+      "run_id": "20261018t214707z-07a4e00a-a0",
+      "legacy_checks_passed": 21,
+      "hybrid_checks_passed": 12,
+      "full_native_gate": "INFRA_FAILURE",
+      "blocker": "Media inventory rejected the separately pinned sixth input; corrected afterward."
+    },
+    {
+      "run_id": "20261018t220121z-c8abad48-a0",
+      "legacy_checks_passed": 21,
+      "hybrid_checks_passed": 12,
+      "full_native_gate": "INFRA_FAILURE",
+      "blocker": "Host-cleanup SSH VM-state probe exceeded its five-second timeout."
+    }
+  ],
+  "bare_metal_functional": {
+    "status": "PASS",
+    "legacy_checks_passed": 21,
+    "hybrid_checks_passed": 12,
+    "layout": "Disposable SSD-backed file-vdev pools",
+    "restoration_status": "PASS",
+    "scope": "Functional evidence only; not the VM-specific full native gate, raw-device, performance or power-loss qualification."
+  },
+  "harness_corrections": [
+    "Check and assert mounted state after full and incremental receive, preserving previous content assertions.",
+    "Include the hybrid archive in exact media coverage when hybrid_tests is declared; preserve archive and test hashes."
+  ],
+  "restoration": {
+    "guest_module_and_test_pools_restored": true,
+    "lab_stopped": true,
+    "exact_vm_configuration_restored": true,
+    "own_workflow_lock_removed": true,
+    "strict_host_static_comparison_passed": false,
+    "difference": "One existing service was running before and after with a different process identity; cause unestablished. Recovery did not target services."
+  },
+  "foreground_read_target_verified": false
 }

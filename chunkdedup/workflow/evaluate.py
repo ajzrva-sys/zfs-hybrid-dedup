@@ -816,6 +816,8 @@ class Gate:
         media=self.root/'native/media'
         receipt=self.document('SHA256.json')
         required={'config.json','source-files.json','source.tar.gz','tests.tar.gz','native_driver.py'}
+        if 'hybrid_tests' in config:
+            required.add('hybrid.tar.gz')
         self.require(set(receipt)==required,'media_coverage',sorted(receipt),sorted(required),
                      'Freeze source, adapters and guest driver as one immutable media input.')
         for name,value in receipt.items():
