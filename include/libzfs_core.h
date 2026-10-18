@@ -79,6 +79,8 @@ _LIBZFS_CORE_H int lzc_hold(nvlist_t *, int, nvlist_t **);
 _LIBZFS_CORE_H int lzc_release(nvlist_t *, nvlist_t **);
 _LIBZFS_CORE_H int lzc_get_holds(const char *, nvlist_t **);
 _LIBZFS_CORE_H int lzc_get_props(const char *, nvlist_t **);
+/* Experimental native post-process chunk deduplication. */
+_LIBZFS_CORE_H int lzc_chunkdedup(const char *, nvlist_t *, nvlist_t **);
 
 enum lzc_send_flags {
 	LZC_SEND_FLAG_EMBED_DATA = 1 << 0,

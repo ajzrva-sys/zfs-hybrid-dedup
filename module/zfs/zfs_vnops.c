@@ -60,6 +60,7 @@
 #include <sys/zfs_quota.h>
 #include <sys/zfs_vfsops.h>
 #include <sys/zfs_znode.h>
+#include <sys/zfs_chunkdedup.h>
 
 /*
  * Enables access to the block cloning feature. If this setting is 0, then even
@@ -153,7 +154,12 @@ zfs_holey_common(znode_t *zp, ulong_t cmd, loff_t *off)
 		zn_flush_cached_data(zp, B_TRUE);
 
 	lr = zfs_rangelock_enter(&zp->z_rangelock, 0, UINT64_MAX, RL_READER);
-	error = dmu_offset_next(ZTOZSB(zp)->z_os, zp->z_id, hole, &noff);
+	if (zfs_chunkdedup_active(zp)) {
+		error = zfs_chunkdedup_seek(zp, &noff, hole);
+	} else {
+		error = dmu_offset_next(ZTOZSB(zp)->z_os, zp->z_id,
+		    hole, &noff);
+	}
 	zfs_rangelock_exit(lr);
 
 	if (error == ESRCH)
@@ -253,6 +259,13 @@ zfs_setup_direct(struct znode *zp, zfs_uio_t *uio, zfs_uio_rw_t rw,
 	objset_t *os = zfsvfs->z_os;
 	int ioflag = *ioflagp;
 	int error = 0;
+
+	/*
+	 * Logical recipes are resolved through the ARC. As for mmap requests,
+	 * direct requests fall back to buffered access for mapped records.
+	 */
+	if (zfs_chunkdedup_active(zp))
+		return (0);
 
 	if (os->os_direct == ZFS_DIRECT_ALWAYS) {
 		/* Force either direct or uncached I/O. */
@@ -460,8 +473,12 @@ zfs_read(struct znode *zp, zfs_uio_t *uio, int ioflag, cred_t *cr)
 		    zfs_uio_offset(uio) + nbytes - 1)) {
 			error = mappedread(zp, nbytes, uio);
 		} else {
-			error = dmu_read_uio_dbuf(sa_get_db(zp->z_sa_hdl),
-			    uio, nbytes, dflags);
+			if (zfs_chunkdedup_active(zp))
+				error = zfs_chunkdedup_read(zp, uio, nbytes);
+			else
+				error = dmu_read_uio_dbuf(
+				    sa_get_db(zp->z_sa_hdl), uio,
+				    nbytes, dflags);
 		}
 
 		if (error) {
@@ -862,16 +879,42 @@ zfs_write(znode_t *zp, zfs_uio_t *uio, int ioflag, cred_t *cr)
 		/*
 		 * Start a transaction.
 		 */
+		zfs_chunkdedup_lock(zfsvfs);
+		uint64_t old_size = zp->z_size;
+		boolean_t hydrate_tail = old_size != 0 && woff >= old_size;
 		dmu_tx_t *tx = dmu_tx_create(zfsvfs->z_os);
 		dmu_tx_hold_sa(tx, zp->z_sa_hdl, B_FALSE);
 		dmu_buf_impl_t *db = (dmu_buf_impl_t *)sa_get_db(zp->z_sa_hdl);
 		DB_DNODE_ENTER(db);
 		dmu_tx_hold_write_by_dnode(tx, DB_DNODE(db), woff, nbytes);
 		DB_DNODE_EXIT(db);
+		error = zfs_chunkdedup_hold_hydrate(zp, woff, nbytes, tx);
+		if (error == 0 && hydrate_tail)
+			error = zfs_chunkdedup_hold_hydrate(zp,
+			    old_size - 1, 1, tx);
+		if (error != 0) {
+			dmu_tx_abort(tx);
+			zfs_chunkdedup_unlock(zfsvfs);
+			if (abuf != NULL)
+				dmu_return_arcbuf(abuf);
+			break;
+		}
 		zfs_sa_upgrade_txholds(tx, zp);
 		error = dmu_tx_assign(tx, DMU_TX_WAIT);
 		if (error) {
 			dmu_tx_abort(tx);
+			zfs_chunkdedup_unlock(zfsvfs);
+			if (abuf != NULL)
+				dmu_return_arcbuf(abuf);
+			break;
+		}
+
+		error = zfs_chunkdedup_hydrate(zp, woff, nbytes, tx);
+		if (error == 0 && hydrate_tail)
+			error = zfs_chunkdedup_hydrate(zp, old_size - 1, 1, tx);
+		if (error != 0) {
+			dmu_tx_commit(tx);
+			zfs_chunkdedup_unlock(zfsvfs);
 			if (abuf != NULL)
 				dmu_return_arcbuf(abuf);
 			break;
@@ -911,6 +954,7 @@ zfs_write(znode_t *zp, zfs_uio_t *uio, int ioflag, cred_t *cr)
 				zfs_clear_setid_bits_if_necessary(zfsvfs, zp,
 				    cr, &clear_setid_bits_txg, tx);
 				dmu_tx_commit(tx);
+				zfs_chunkdedup_unlock(zfsvfs);
 				/*
 				 * Account for partial writes before
 				 * continuing the loop.
@@ -939,6 +983,7 @@ zfs_write(znode_t *zp, zfs_uio_t *uio, int ioflag, cred_t *cr)
 				zfs_clear_setid_bits_if_necessary(zfsvfs, zp,
 				    cr, &clear_setid_bits_txg, tx);
 				dmu_tx_commit(tx);
+				zfs_chunkdedup_unlock(zfsvfs);
 				break;
 			}
 			tx_bytes -= zfs_uio_resid(uio);
@@ -962,6 +1007,7 @@ zfs_write(znode_t *zp, zfs_uio_t *uio, int ioflag, cred_t *cr)
 				    cr, &clear_setid_bits_txg, tx);
 				dmu_return_arcbuf(abuf);
 				dmu_tx_commit(tx);
+				zfs_chunkdedup_unlock(zfsvfs);
 				break;
 			}
 			ASSERT3S(nbytes, <=, zfs_uio_resid(uio));
@@ -1003,6 +1049,7 @@ zfs_write(znode_t *zp, zfs_uio_t *uio, int ioflag, cred_t *cr)
 			(void) sa_update(zp->z_sa_hdl, SA_ZPL_SIZE(zfsvfs),
 			    (void *)&zp->z_size, sizeof (uint64_t), tx);
 			dmu_tx_commit(tx);
+			zfs_chunkdedup_unlock(zfsvfs);
 			ASSERT(error != 0);
 			break;
 		}
@@ -1044,6 +1091,7 @@ zfs_write(znode_t *zp, zfs_uio_t *uio, int ioflag, cred_t *cr)
 		    NULL);
 
 		dmu_tx_commit(tx);
+		zfs_chunkdedup_unlock(zfsvfs);
 
 		/*
 		 * Direct I/O was deferred in order to grow the first block.
@@ -1606,6 +1654,11 @@ zfs_clone_range(znode_t *inzp, uint64_t *inoffp, znode_t *outzp,
 	if (error != 0)
 		return (error);
 
+	if (zfs_chunkdedup_active(inzp) || zfs_chunkdedup_active(outzp)) {
+		zfs_exit_two(inzfsvfs, outzfsvfs, FTAG);
+		return (SET_ERROR(EOPNOTSUPP));
+	}
+
 	inos = inzfsvfs->z_os;
 	outos = outzfsvfs->z_os;
 
@@ -2012,6 +2065,12 @@ zfs_clone_range_replay(znode_t *zp, uint64_t off, uint64_t len, uint64_t blksz,
 
 	if ((error = zfs_enter_verify_zp(zfsvfs, zp, FTAG)) != 0)
 		return (error);
+
+	/* Such a log record must have been drained before optimization. */
+	if (zfs_chunkdedup_active(zp)) {
+		zfs_exit(zfsvfs, FTAG);
+		return (SET_ERROR(EIO));
+	}
 
 	ASSERT(zfsvfs->z_replay);
 	ASSERT(!zfs_is_readonly(zfsvfs));

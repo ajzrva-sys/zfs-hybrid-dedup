@@ -47,6 +47,9 @@ extern "C" {
 typedef struct zfsvfs zfsvfs_t;
 struct znode;
 
+/* The platform filesystem state owns the chunk validation cache. */
+#define ZFS_CHUNKDEDUP_CACHE_SUPPORTED 1
+
 /*
  * This structure emulates the vfs_t from other platforms.  It's purpose
  * is to facilitate the handling of mount options and minimize structural
@@ -121,6 +124,8 @@ struct zfsvfs {
 	uint64_t	z_version;	/* ZPL version */
 	uint64_t	z_shares_dir;	/* hidden shares dir */
 	dataset_kstats_t	z_kstat;	/* fs kstats */
+	kmutex_t	z_chunkdedup_lock; /* experimental chunk metadata */
+	struct zfs_chunkdedup_cache *z_chunkdedup_cache;
 	kmutex_t	z_lock;
 	uint64_t	z_userquota_obj;
 	uint64_t	z_groupquota_obj;

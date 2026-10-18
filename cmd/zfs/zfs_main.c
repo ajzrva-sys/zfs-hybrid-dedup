@@ -197,6 +197,7 @@ typedef enum {
 	HELP_VERSION,
 	HELP_REDACT,
 	HELP_REWRITE,
+	HELP_CHUNKDEDUP,
 	HELP_JAIL,
 	HELP_UNJAIL,
 	HELP_WAIT,
@@ -268,6 +269,7 @@ static zfs_command_t command_table[] = {
 	{ NULL },
 	{ "program",	zfs_do_channel_program,	HELP_CHANNEL_PROGRAM	},
 	{ "rewrite",	zfs_do_rewrite,		HELP_REWRITE		},
+	{ "chunkdedup", zfs_do_chunkdedup, HELP_CHUNKDEDUP },
 	{ "wait",	zfs_do_wait,		HELP_WAIT		},
 
 #ifdef __FreeBSD__
@@ -440,6 +442,12 @@ get_usage(zfs_help_t idx)
 	case HELP_REDACT:
 		return (gettext("\tredact <snapshot> <bookmark> "
 		    "<redaction_snapshot> ...\n"));
+	case HELP_CHUNKDEDUP:
+		return (gettext("\tchunkdedup <optimize|status|verify|unoptimize> "
+		    "[-r] [--min-age days] [--method auto|block|chunk] "
+		    "[--methods] <dataset|path>...\n"
+		    "\tchunkdedup watch [--interval seconds] [--min-age days] "
+		    "[--method auto|block|chunk] <dataset>...\n"));
 	case HELP_REWRITE:
 		return (gettext("\trewrite [-Prvx] [-o <offset>] [-l <length>] "
 		    "<directory|file ...>\n"));

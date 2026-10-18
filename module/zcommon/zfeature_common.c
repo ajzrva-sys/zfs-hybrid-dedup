@@ -810,6 +810,26 @@ zpool_feature_init(void)
 		    ZFEATURE_TYPE_BOOLEAN, physical_rewrite_deps, sfeatures);
 	}
 
+	{
+		static const spa_feature_t chunkdedup_deps[] = {
+			SPA_FEATURE_EXTENSIBLE_DATASET,
+			SPA_FEATURE_NONE
+		};
+		zfeature_register(SPA_FEATURE_CHUNKDEDUP,
+		    "org.ajzrva:chunkdedup", "chunkdedup",
+		    "Experimental dataset-local variable-chunk file mappings.",
+		    ZFEATURE_FLAG_PER_DATASET | ZFEATURE_FLAG_NO_UPGRADE,
+		    ZFEATURE_TYPE_BOOLEAN, chunkdedup_deps, sfeatures);
+#if defined(_KERNEL) && !defined(__FreeBSD__)
+		/*
+		 * The file pager integration is FreeBSD-first. Other kernels
+		 * must refuse even readonly imports containing mapped files.
+		 */
+		spa_feature_table[SPA_FEATURE_CHUNKDEDUP].fi_zfs_mod_supported =
+		    B_FALSE;
+#endif
+	}
+
 	zfs_mod_list_supported_free(sfeatures);
 }
 

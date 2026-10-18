@@ -1189,7 +1189,7 @@ zfs_path_to_zhandle(libzfs_handle_t *hdl, const char *path, zfs_type_t argtype)
 		return (NULL);
 	}
 
-	return (zfs_open(hdl, entry.mnt_special, ZFS_TYPE_FILESYSTEM));
+	return (zfs_open(hdl, entry.mnt_special, argtype));
 }
 
 /*

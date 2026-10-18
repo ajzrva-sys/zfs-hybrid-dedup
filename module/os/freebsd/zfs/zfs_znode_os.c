@@ -59,6 +59,7 @@
 #include <sys/stat.h>
 #include <sys/zap.h>
 #include <sys/zfs_znode.h>
+#include <sys/zfs_chunkdedup.h>
 #include <sys/sa.h>
 #include <sys/zfs_sa.h>
 #include <sys/zfs_stat.h>
@@ -1431,6 +1432,13 @@ zfs_extend(znode_t *zp, uint64_t end)
 		zfs_rangelock_exit(lr);
 		return (0);
 	}
+	/* Growing EOF changes the required length of its last mapped record. */
+	error = zfs_chunkdedup_unoptimize(zp);
+	if (error != 0) {
+		zfs_rangelock_exit(lr);
+		return (error);
+	}
+
 	tx = dmu_tx_create(zfsvfs->z_os);
 	dmu_tx_hold_sa(tx, zp->z_sa_hdl, B_FALSE);
 	zfs_sa_upgrade_txholds(tx, zp);
@@ -1498,7 +1506,7 @@ zfs_free_range(znode_t *zp, uint64_t off, uint64_t len)
 	/*
 	 * Lock the range being freed.
 	 */
-	lr = zfs_rangelock_enter(&zp->z_rangelock, off, len, RL_WRITER);
+	lr = zfs_rangelock_enter(&zp->z_rangelock, 0, UINT64_MAX, RL_WRITER);
 
 	/*
 	 * Nothing to do if file already at desired length.
@@ -1510,6 +1518,12 @@ zfs_free_range(znode_t *zp, uint64_t off, uint64_t len)
 
 	if (off + len > zp->z_size)
 		len = zp->z_size - off;
+
+	error = zfs_chunkdedup_unoptimize(zp);
+	if (error != 0) {
+		zfs_rangelock_exit(lr);
+		return (error);
+	}
 
 	error = dmu_free_long_range(zfsvfs->z_os, zp->z_id, off, len);
 
@@ -1561,6 +1575,12 @@ zfs_trunc(znode_t *zp, uint64_t end)
 	if (end >= zp->z_size) {
 		zfs_rangelock_exit(lr);
 		return (0);
+	}
+
+	error = zfs_chunkdedup_unoptimize(zp);
+	if (error != 0) {
+		zfs_rangelock_exit(lr);
+		return (error);
 	}
 
 	error = dmu_free_long_range(zfsvfs->z_os, zp->z_id, end,

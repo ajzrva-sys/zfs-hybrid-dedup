@@ -37,6 +37,8 @@
 #include <sys/zfs_project.h>
 #include <sys/zfs_quota.h>
 #include <sys/zfs_znode.h>
+#include <sys/dsl_prop.h>
+#include <sys/dsl_dataset.h>
 
 int
 zpl_get_file_info(dmu_object_type_t bonustype, const void *data,
@@ -318,6 +320,16 @@ zfs_set_userquota(zfsvfs_t *zfsvfs, zfs_userquota_prop_t type,
 	dmu_tx_t *tx;
 	uint64_t *objp;
 	boolean_t fuid_dirtied;
+
+	uint64_t chunkdedup = 0;
+	dsl_pool_config_enter(dmu_objset_pool(zfsvfs->z_os), FTAG);
+	(void) dsl_prop_get_ds(dmu_objset_ds(zfsvfs->z_os), "chunkdedup",
+	    8, 1, &chunkdedup, NULL);
+	dsl_pool_config_exit(dmu_objset_pool(zfsvfs->z_os), FTAG);
+	if (quota != 0 && (chunkdedup != 0 ||
+	    dsl_dataset_feature_is_active(dmu_objset_ds(zfsvfs->z_os),
+	    SPA_FEATURE_CHUNKDEDUP)))
+		return (SET_ERROR(ENOTSUP));
 
 	if (zfsvfs->z_version < ZPL_VERSION_USERSPACE)
 		return (SET_ERROR(ENOTSUP));

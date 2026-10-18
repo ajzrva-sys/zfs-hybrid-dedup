@@ -1592,7 +1592,7 @@ dbuf_read_impl(dmu_buf_impl_t *db, dnode_t *dn, zio_t *zio, dmu_flags_t flags,
     db_lock_type_t dblt, blkptr_t *bp, const void *tag)
 {
 	zbookmark_phys_t zb;
-	uint32_t aflags = ARC_FLAG_NOWAIT;
+	arc_flags_t aflags = ARC_FLAG_NOWAIT;
 	int err, zio_flags;
 
 	ASSERT(!zfs_refcount_is_zero(&db->db_holds));
@@ -1650,6 +1650,10 @@ dbuf_read_impl(dmu_buf_impl_t *db, dnode_t *dn, zio_t *zio, dmu_flags_t flags,
 		aflags |= ARC_FLAG_L2CACHE;
 	if (flags & DMU_IS_PREFETCH)
 		aflags |= ARC_FLAG_PREFETCH | ARC_FLAG_PRESCIENT_PREFETCH;
+	if ((flags & DMU_READ_LINEAR_ABD) &&
+	    !(flags & DMU_IS_PREFETCH) && db->db_level == 0 &&
+	    BP_GET_BUFC_TYPE(bp) == ARC_BUFC_DATA)
+		aflags |= ARC_FLAG_LINEAR_ABD;
 
 	dbuf_add_ref(db, NULL);
 

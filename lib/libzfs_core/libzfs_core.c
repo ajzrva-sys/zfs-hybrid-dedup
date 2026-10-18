@@ -88,6 +88,7 @@
 #include <pthread.h>
 #include <libzutil.h>
 #include <sys/nvpair.h>
+
 #include <sys/param.h>
 #include <sys/types.h>
 #include <sys/stat.h>
@@ -1993,4 +1994,11 @@ lzc_ddt_prune(const char *pool, zpool_ddt_prune_unit_t unit, uint64_t amount)
 	fnvlist_free(result);
 
 	return (error);
+}
+
+/* Experimental native post-process chunk deduplication. */
+int
+lzc_chunkdedup(const char *dataset, nvlist_t *args, nvlist_t **result)
+{
+	return (lzc_ioctl(ZFS_IOC_CHUNKDEDUP, dataset, args, result));
 }

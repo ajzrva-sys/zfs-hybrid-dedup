@@ -568,6 +568,11 @@ recv_begin_check_feature_flags_impl(uint64_t featureflags, spa_t *spa)
 		return (SET_ERROR(ZFS_ERR_UNKNOWN_SEND_STREAM_FEATURE));
 	}
 
+#ifndef __FreeBSD__
+	if (featureflags & DMU_BACKUP_FEATURE_CHUNKDEDUP)
+		return (SET_ERROR(ENOTSUP));
+#endif
+
 	/* Verify pool version supports SA if SA_SPILL feature set */
 	if ((featureflags & DMU_BACKUP_FEATURE_SA_SPILL) &&
 	    spa_version(spa) < SPA_VERSION_SA)
@@ -610,10 +615,70 @@ recv_begin_check_feature_flags_impl(uint64_t featureflags, spa_t *spa)
 	/*
 	 * If the LONGNAME is not enabled on the target, fail that request.
 	 */
+	if ((featureflags & DMU_BACKUP_FEATURE_CHUNKDEDUP) &&
+	    !spa_feature_is_enabled(spa, SPA_FEATURE_CHUNKDEDUP))
+		return (SET_ERROR(ENOTSUP));
+
 	if ((featureflags & DMU_BACKUP_FEATURE_LONGNAME) &&
 	    !spa_feature_is_enabled(spa, SPA_FEATURE_LONGNAME))
 		return (SET_ERROR(ENOTSUP));
 
+	return (0);
+}
+
+static int
+recv_chunkdedup_props_check(dsl_dataset_t *ds, boolean_t parent)
+{
+	uint64_t value, object, count;
+	char share[32];
+	if (dsl_prop_get_ds(ds, "dedup", 8, 1, &value, NULL) != 0 ||
+	    value != ZIO_CHECKSUM_OFF ||
+	    dsl_prop_get_ds(ds, "sharenfs", 1, sizeof (share), share,
+	    NULL) != 0 || strcmp(share, "off") != 0 ||
+	    dsl_prop_get_ds(ds, "sharesmb", 1, sizeof (share), share,
+	    NULL) != 0 || strcmp(share, "off") != 0)
+		return (SET_ERROR(ENOTSUP));
+	/* Per-identity quotas do not inherit into a new child dataset. */
+	if (parent)
+		return (0);
+	objset_t *os;
+	int error = dmu_objset_from_ds(ds, &os);
+	if (error != 0)
+		return (error);
+	if (dmu_objset_type(os) != DMU_OST_ZFS || os->os_encrypted)
+		return (SET_ERROR(ENOTSUP));
+	const zfs_prop_t defaults[] = {
+		ZFS_PROP_DEFAULTUSERQUOTA, ZFS_PROP_DEFAULTGROUPQUOTA,
+		ZFS_PROP_DEFAULTPROJECTQUOTA, ZFS_PROP_DEFAULTUSEROBJQUOTA,
+		ZFS_PROP_DEFAULTGROUPOBJQUOTA, ZFS_PROP_DEFAULTPROJECTOBJQUOTA
+	};
+	const zfs_userquota_prop_t quotas[] = {
+		ZFS_PROP_USERQUOTA, ZFS_PROP_GROUPQUOTA, ZFS_PROP_PROJECTQUOTA,
+		ZFS_PROP_USEROBJQUOTA, ZFS_PROP_GROUPOBJQUOTA,
+		ZFS_PROP_PROJECTOBJQUOTA
+	};
+	for (uint_t i = 0; i < ARRAY_SIZE(defaults); i++) {
+		error = zap_lookup(os, MASTER_NODE_OBJ,
+		    zfs_prop_to_name(defaults[i]), 8, 1, &value);
+		if (error == ENOENT)
+			continue;
+		if (error != 0)
+			return (error);
+		if (value != 0)
+			return (SET_ERROR(ENOTSUP));
+	}
+	for (uint_t i = 0; i < ARRAY_SIZE(quotas); i++) {
+		error = zap_lookup(os, MASTER_NODE_OBJ,
+		    zfs_userquota_prop_prefixes[quotas[i]], 8, 1, &object);
+		if (error == ENOENT)
+			continue;
+		if (error != 0)
+			return (error);
+		if ((error = zap_count(os, object, &count)) != 0)
+			return (error);
+		if (count != 0)
+			return (SET_ERROR(ENOTSUP));
+	}
 	return (0);
 }
 
@@ -644,6 +709,11 @@ dmu_recv_begin_check(void *arg, dmu_tx_t *tx)
 	error = recv_begin_check_feature_flags_impl(featureflags, dp->dp_spa);
 	if (error != 0)
 		return (error);
+
+	if ((featureflags & DMU_BACKUP_FEATURE_CHUNKDEDUP) &&
+	    (drrb->drr_type != DMU_OST_ZFS ||
+	    (featureflags & DMU_BACKUP_FEATURE_RAW)))
+		return (SET_ERROR(ENOTSUP));
 
 	/* Resumable receives require extensible datasets */
 	if (drba->drba_cookie->drc_resumable &&
@@ -676,6 +746,23 @@ dmu_recv_begin_check(void *arg, dmu_tx_t *tx)
 
 	error = dsl_dataset_hold_flags(dp, tofs, dsflags, FTAG, &ds);
 	if (error == 0) {
+		/*
+		 * Chunk recipes require an unencrypted file dataset, and
+		 * streams must explicitly advertise this format.
+		 */
+		if (((featureflags & DMU_BACKUP_FEATURE_CHUNKDEDUP) &&
+		    ds->ds_dir->dd_crypto_obj != 0) ||
+		    (dsl_dataset_feature_is_active(ds,
+		    SPA_FEATURE_CHUNKDEDUP) &&
+		    !(featureflags & DMU_BACKUP_FEATURE_CHUNKDEDUP))) {
+			dsl_dataset_rele_flags(ds, dsflags, FTAG);
+			return (SET_ERROR(ENOTSUP));
+		}
+		if ((featureflags & DMU_BACKUP_FEATURE_CHUNKDEDUP) &&
+		    (error = recv_chunkdedup_props_check(ds, B_FALSE)) != 0) {
+			dsl_dataset_rele_flags(ds, dsflags, FTAG);
+			return (error);
+		}
 		/* target fs already exists; recv into temp clone */
 
 		/* Can't recv a clone into an existing fs */
@@ -719,6 +806,11 @@ dmu_recv_begin_check(void *arg, dmu_tx_t *tx)
 		error = dsl_dataset_hold(dp, buf, FTAG, &ds);
 		if (error != 0)
 			return (error);
+		if ((featureflags & DMU_BACKUP_FEATURE_CHUNKDEDUP) &&
+		    (error = recv_chunkdedup_props_check(ds, B_TRUE)) != 0) {
+			dsl_dataset_rele(ds, FTAG);
+			return (error);
+		}
 
 		if ((featureflags & DMU_BACKUP_FEATURE_RAW) == 0 &&
 		    drba->drba_origin == NULL) {
@@ -736,6 +828,12 @@ dmu_recv_begin_check(void *arg, dmu_tx_t *tx)
 			if (error != 0) {
 				dsl_dataset_rele(ds, FTAG);
 				return (error);
+			}
+
+			if (will_encrypt &&
+			    (featureflags & DMU_BACKUP_FEATURE_CHUNKDEDUP)) {
+				dsl_dataset_rele(ds, FTAG);
+				return (SET_ERROR(ENOTSUP));
 			}
 
 			if (will_encrypt &&
@@ -793,6 +891,13 @@ dmu_recv_begin_check(void *arg, dmu_tx_t *tx)
 				dsl_dataset_rele_flags(origin, dsflags, FTAG);
 				dsl_dataset_rele(ds, FTAG);
 				return (SET_ERROR(ENODEV));
+			}
+
+			if (origin->ds_dir->dd_crypto_obj != 0 &&
+			    (featureflags & DMU_BACKUP_FEATURE_CHUNKDEDUP)) {
+				dsl_dataset_rele_flags(origin, dsflags, FTAG);
+				dsl_dataset_rele(ds, FTAG);
+				return (SET_ERROR(ENOTSUP));
 			}
 
 			if (origin->ds_dir->dd_crypto_obj != 0 &&
@@ -1016,6 +1121,13 @@ dmu_recv_begin_sync(void *arg, dmu_tx_t *tx)
 		newds->ds_feature[SPA_FEATURE_LARGE_BLOCKS] = (void *)B_TRUE;
 	}
 
+	if (featureflags & DMU_BACKUP_FEATURE_CHUNKDEDUP &&
+	    !dsl_dataset_feature_is_active(newds, SPA_FEATURE_CHUNKDEDUP)) {
+		dsl_dataset_activate_feature(newds->ds_object,
+		    SPA_FEATURE_CHUNKDEDUP, (void *)B_TRUE, tx);
+		newds->ds_feature[SPA_FEATURE_CHUNKDEDUP] = (void *)B_TRUE;
+	}
+
 	/*
 	 * Activate longname feature if received
 	 */
@@ -1096,6 +1208,10 @@ dmu_recv_resume_begin_check(void *arg, dmu_tx_t *tx)
 	    dp->dp_spa);
 	if (error != 0)
 		return (error);
+	if ((drc->drc_featureflags & DMU_BACKUP_FEATURE_CHUNKDEDUP) &&
+	    (drrb->drr_type != DMU_OST_ZFS ||
+	    (drc->drc_featureflags & DMU_BACKUP_FEATURE_RAW)))
+		return (SET_ERROR(ENOTSUP));
 
 	/* 6 extra bytes for /%recv */
 	char recvname[ZFS_MAX_DATASET_NAME_LEN + 6];
@@ -1118,6 +1234,14 @@ dmu_recv_resume_begin_check(void *arg, dmu_tx_t *tx)
 		error = dsl_dataset_hold_flags(dp, tofs, dsflags, FTAG, &ds);
 		if (error != 0)
 			return (error);
+	}
+	if ((dsl_dataset_feature_is_active(ds, SPA_FEATURE_CHUNKDEDUP) &&
+	    !(drc->drc_featureflags & DMU_BACKUP_FEATURE_CHUNKDEDUP)) ||
+	    ((drc->drc_featureflags & DMU_BACKUP_FEATURE_CHUNKDEDUP) &&
+	    (ds->ds_dir->dd_crypto_obj != 0 ||
+	    (error = recv_chunkdedup_props_check(ds, B_TRUE)) != 0))) {
+		dsl_dataset_rele_flags(ds, dsflags, FTAG);
+		return (SET_ERROR(ENOTSUP));
 	}
 
 	/*

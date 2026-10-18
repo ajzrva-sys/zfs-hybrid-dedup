@@ -189,6 +189,9 @@ typedef enum arc_flags
 	ARC_FLAG_COMPRESS_6		= 1 << 30
 } arc_flags_t;
 
+/* Request-only allocation hint; never stored in hdr b_flags. */
+#define	ARC_FLAG_LINEAR_ABD	((arc_flags_t)(1U << 31))
+
 typedef enum arc_buf_flags {
 	ARC_BUF_FLAG_SHARED		= 1 << 0,
 	ARC_BUF_FLAG_COMPRESSED		= 1 << 1,

@@ -38,6 +38,7 @@
 #include <sys/cmn_err.h>
 #include <sys/zfs_znode.h>
 #include <sys/zfs_vnops.h>
+#include <sys/zfs_chunkdedup.h>
 #include <sys/zfs_dir.h>
 #include <sys/zil.h>
 #include <sys/fs/zfs.h>
@@ -684,6 +685,7 @@ zfsvfs_create_impl(zfsvfs_t **zfvp, zfsvfs_t *zfsvfs, objset_t *os)
 
 	mutex_init(&zfsvfs->z_znodes_lock, NULL, MUTEX_DEFAULT, NULL);
 	mutex_init(&zfsvfs->z_lock, NULL, MUTEX_DEFAULT, NULL);
+	mutex_init(&zfsvfs->z_chunkdedup_lock, NULL, MUTEX_DEFAULT, NULL);
 	list_create(&zfsvfs->z_all_znodes, sizeof (znode_t),
 	    offsetof(znode_t, z_link_node));
 	ZFS_TEARDOWN_INIT(zfsvfs);
@@ -828,9 +830,11 @@ zfsvfs_free(zfsvfs_t *zfsvfs)
 	int i, size = zfsvfs->z_hold_size;
 
 	zfs_fuid_destroy(zfsvfs);
+	zfs_chunkdedup_cache_fini(zfsvfs);
 
 	mutex_destroy(&zfsvfs->z_znodes_lock);
 	mutex_destroy(&zfsvfs->z_lock);
+	mutex_destroy(&zfsvfs->z_chunkdedup_lock);
 	list_destroy(&zfsvfs->z_all_znodes);
 	ZFS_TEARDOWN_DESTROY(zfsvfs);
 	rw_destroy(&zfsvfs->z_teardown_inactive_lock);
@@ -1764,6 +1768,7 @@ zfs_resume_fs(zfsvfs_t *zfsvfs, dsl_dataset_t *ds)
 	VERIFY0(dmu_objset_from_ds(ds, &os));
 	dsl_pool_config_exit(dp, FTAG);
 
+	zfs_chunkdedup_cache_invalidate(zfsvfs);
 	err = zfsvfs_init(zfsvfs, os);
 	if (err != 0)
 		goto bail;
@@ -1981,6 +1986,16 @@ zfs_set_default_quota(zfsvfs_t *zfsvfs, zfs_prop_t prop, uint64_t quota)
 	objset_t *os = zfsvfs->z_os;
 	const char *propstr = zfs_prop_to_name(prop);
 	dmu_tx_t *tx;
+
+	uint64_t chunkdedup = 0;
+	dsl_pool_config_enter(dmu_objset_pool(os), FTAG);
+	(void) dsl_prop_get_ds(dmu_objset_ds(os), "chunkdedup", 8, 1,
+	    &chunkdedup, NULL);
+	dsl_pool_config_exit(dmu_objset_pool(os), FTAG);
+	if (quota != 0 && (chunkdedup != 0 ||
+	    dsl_dataset_feature_is_active(dmu_objset_ds(os),
+	    SPA_FEATURE_CHUNKDEDUP)))
+		return (SET_ERROR(ENOTSUP));
 
 	tx = dmu_tx_create(os);
 	dmu_tx_hold_zap(tx, MASTER_NODE_OBJ, B_FALSE, propstr);

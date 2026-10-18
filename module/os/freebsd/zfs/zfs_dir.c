@@ -48,6 +48,7 @@
 #include <sys/callb.h>
 #include <sys/smp.h>
 #include <sys/zfs_dir.h>
+#include <sys/zfs_chunkdedup.h>
 #include <sys/zfs_acl.h>
 #include <sys/fs/zfs.h>
 #include <sys/zap.h>
@@ -466,7 +467,13 @@ zfs_rmnode(znode_t *zp)
 		 * zap object in the delete queue.  Note a truncated file is
 		 * harmless since it only contains user data.
 		 */
-		error = dmu_free_long_range(os, zp->z_id, 0, DMU_OBJECT_END);
+		zfs_locked_range_t *lr = zfs_rangelock_enter(&zp->z_rangelock,
+		    0, UINT64_MAX, RL_WRITER);
+		error = zfs_chunkdedup_purge(zp);
+		zfs_rangelock_exit(lr);
+		if (error == 0)
+			error = dmu_free_long_range(os, zp->z_id, 0,
+			    DMU_OBJECT_END);
 		if (error) {
 			/*
 			 * Not enough space or we were interrupted by unmount.

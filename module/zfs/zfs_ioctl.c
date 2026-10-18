@@ -169,6 +169,8 @@
 #include <sys/zfs_quota.h>
 #include <sys/zfs_vfsops.h>
 #include <sys/zfs_znode.h>
+#include <sys/zfs_chunkdedup.h>
+#include <sys/zfs_vnops.h>
 #include <sys/zap.h>
 #include <sys/spa.h>
 #include <sys/spa_impl.h>
@@ -206,6 +208,11 @@
 #include <sys/dsl_bookmark.h>
 #include <sys/dsl_userhold.h>
 #include <sys/zfeature.h>
+#ifdef __FreeBSD__
+#include <sys/vm.h>
+#include <vm/vm.h>
+#include <vm/vm_object.h>
+#endif
 #include <sys/zcp.h>
 #include <sys/zio_checksum.h>
 #include <sys/vdev_removal.h>
@@ -279,6 +286,7 @@ static int zfs_ioc_userspace_upgrade(zfs_cmd_t *zc);
 static int zfs_ioc_id_quota_upgrade(zfs_cmd_t *zc);
 static int zfs_check_settable(const char *name, nvpair_t *property,
     cred_t *cr);
+static int zfs_chunkdedup_tree_check(const char *);
 static int zfs_check_clearable(const char *dataset, nvlist_t *props,
     nvlist_t **errors);
 static int zfs_fill_zplprops_root(uint64_t, nvlist_t *, nvlist_t *,
@@ -2822,6 +2830,42 @@ zfs_is_namespace_prop(zfs_prop_t prop)
 	}
 }
 
+static boolean_t
+zfs_chunkdedup_incompatible_pair(nvpair_t *pair, const char *name)
+{
+	zfs_prop_t prop = zfs_name_to_prop(name);
+	uint64_t value;
+	if (nvpair_type(pair) == DATA_TYPE_NVLIST &&
+	    nvlist_lookup_nvpair(fnvpair_value_nvlist(pair), ZPROP_VALUE,
+	    &pair) != 0)
+		return (B_FALSE);
+	if (prop == ZFS_PROP_DEDUP)
+		return (nvpair_value_uint64(pair, &value) == 0 &&
+		    value != ZIO_CHECKSUM_OFF);
+	if (prop == ZFS_PROP_SHARENFS || prop == ZFS_PROP_SHARESMB) {
+		const char *share;
+		return (nvpair_value_string(pair, &share) == 0 &&
+		    strcmp(share, "off") != 0);
+	}
+	if (prop == ZPROP_USERPROP && zfs_prop_userquota(name)) {
+		uint64_t *quota;
+		uint_t count;
+		return (nvpair_value_uint64_array(pair, &quota, &count) == 0 &&
+		    count == 3 && quota[2] != 0);
+	}
+	switch (prop) {
+	case ZFS_PROP_DEFAULTUSERQUOTA:
+	case ZFS_PROP_DEFAULTGROUPQUOTA:
+	case ZFS_PROP_DEFAULTPROJECTQUOTA:
+	case ZFS_PROP_DEFAULTUSEROBJQUOTA:
+	case ZFS_PROP_DEFAULTGROUPOBJQUOTA:
+	case ZFS_PROP_DEFAULTPROJECTOBJQUOTA:
+		return (nvpair_value_uint64(pair, &value) == 0 && value != 0);
+	default:
+		return (B_FALSE);
+	}
+}
+
 /*
  * This function is best effort. If it fails to set any of the given properties,
  * it continues to set as many as it can and returns the last error
@@ -2830,7 +2874,7 @@ zfs_is_namespace_prop(zfs_prop_t prop)
  * corresponding error numbers.
  *
  * If every property is set successfully, zero is returned and errlist is not
- * modified.
+ * modified. Incompatible chunkdedup batches are rejected before mutation.
  */
 int
 zfs_set_prop_nvlist(const char *dsname, zprop_source_t source, nvlist_t *nvl,
@@ -2843,6 +2887,28 @@ zfs_set_prop_nvlist(const char *dsname, zprop_source_t source, nvlist_t *nvl,
 	uint64_t intval;
 	const char *strval;
 	boolean_t should_update_mount_cache = B_FALSE;
+
+	nvpair_t *chunk_pair;
+	uint64_t chunk_value;
+	if (nvlist_lookup_nvpair(nvl, "chunkdedup", &chunk_pair) == 0) {
+		if (nvpair_type(chunk_pair) == DATA_TYPE_NVLIST)
+			(void) nvlist_lookup_nvpair(
+			    fnvpair_value_nvlist(chunk_pair), ZPROP_VALUE,
+			    &chunk_pair);
+		if (nvpair_value_uint64(chunk_pair, &chunk_value) == 0 &&
+		    chunk_value != 0) {
+			pair = NULL;
+			while ((pair = nvlist_next_nvpair(nvl, pair)) != NULL) {
+				if (!zfs_chunkdedup_incompatible_pair(pair,
+				    nvpair_name(pair)))
+					continue;
+				if (errlist != NULL)
+					fnvlist_add_int32(errlist,
+					    nvpair_name(pair), ENOTSUP);
+				return (SET_ERROR(ENOTSUP));
+			}
+		}
+	}
 
 	nvlist_t *genericnvl = fnvlist_alloc();
 	nvlist_t *retrynvl = fnvlist_alloc();
@@ -3135,6 +3201,12 @@ zfs_ioc_inherit_prop(zfs_cmd_t *zc)
 	nvpair_t *pair;
 	zprop_type_t type;
 	int err;
+	if (prop == ZFS_PROP_DEDUP || prop == ZFS_PROP_SHARENFS ||
+	    prop == ZFS_PROP_SHARESMB) {
+		/* Retain explicit off values for experimental descendants. */
+		if ((err = zfs_chunkdedup_tree_check(zc->zc_name)) != 0)
+			return (err);
+	}
 
 	if (!received) {
 		/*
@@ -4950,6 +5022,113 @@ zfs_ioc_rename(zfs_cmd_t *zc)
 	}
 }
 
+/*
+ * The experimental format excludes accounting and exports whose ownership
+ * semantics cannot account for hidden shared chunk objects.
+ */
+static boolean_t
+zfs_chunkdedup_dataset(const char *dsname)
+{
+	uint64_t enabled = 0;
+	objset_t *os;
+	boolean_t active = B_FALSE;
+	(void) dsl_prop_get_integer(dsname, "chunkdedup", &enabled, NULL);
+	if (enabled != 0)
+		return (B_TRUE);
+	if (dmu_objset_hold(dsname, FTAG, &os) == 0) {
+		if (dmu_objset_type(os) == DMU_OST_ZFS)
+			active = dsl_dataset_feature_is_active(
+			    dmu_objset_ds(os), SPA_FEATURE_CHUNKDEDUP) ||
+			    zap_contains(os, MASTER_NODE_OBJ,
+			    ZFS_CHUNKDEDUP_MASTER) == 0;
+		dmu_objset_rele(os, FTAG);
+	}
+	return (active);
+}
+
+static int
+zfs_chunkdedup_tree_cb(const char *name, void *arg)
+{
+	(void) arg;
+	return (zfs_chunkdedup_dataset(name) ? SET_ERROR(ENOTSUP) : 0);
+}
+
+static int
+zfs_chunkdedup_tree_check(const char *name)
+{
+	return (dmu_objset_find(name, zfs_chunkdedup_tree_cb, NULL,
+	    DS_FIND_CHILDREN | DS_FIND_SERIALIZE));
+}
+
+#ifdef __FreeBSD__
+static int
+zfs_chunkdedup_enable_check(const char *dsname)
+{
+	objset_t *os;
+	uint64_t value, object, count;
+	char share[32];
+	int error = dmu_objset_hold(dsname, FTAG, &os);
+	if (error != 0)
+		return (error);
+	if (dmu_objset_type(os) != DMU_OST_ZFS || os->os_encrypted ||
+	    !spa_feature_is_enabled(dmu_objset_spa(os),
+	    SPA_FEATURE_CHUNKDEDUP)) {
+		error = SET_ERROR(ENOTSUP);
+		goto out;
+	}
+	/* dmu_objset_hold() already holds this pool's config reader. */
+	if (dsl_prop_get_ds(dmu_objset_ds(os), "dedup", 8, 1, &value,
+	    NULL) != 0 ||
+	    value != ZIO_CHECKSUM_OFF) {
+		error = SET_ERROR(ENOTSUP);
+		goto out;
+	}
+	const zfs_prop_t defaults[] = {
+		ZFS_PROP_DEFAULTUSERQUOTA, ZFS_PROP_DEFAULTGROUPQUOTA,
+		ZFS_PROP_DEFAULTPROJECTQUOTA, ZFS_PROP_DEFAULTUSEROBJQUOTA,
+		ZFS_PROP_DEFAULTGROUPOBJQUOTA, ZFS_PROP_DEFAULTPROJECTOBJQUOTA
+	};
+	const zfs_userquota_prop_t quotas[] = {
+		ZFS_PROP_USERQUOTA, ZFS_PROP_GROUPQUOTA, ZFS_PROP_PROJECTQUOTA,
+		ZFS_PROP_USEROBJQUOTA, ZFS_PROP_GROUPOBJQUOTA,
+		ZFS_PROP_PROJECTOBJQUOTA
+	};
+	for (uint_t i = 0; i < ARRAY_SIZE(defaults); i++) {
+		if (zfs_get_zplprop(os, defaults[i], &value) != 0 ||
+		    value != 0) {
+			error = SET_ERROR(ENOTSUP);
+			goto out;
+		}
+	}
+	for (uint_t i = 0; i < ARRAY_SIZE(quotas); i++) {
+		error = zap_lookup(os, MASTER_NODE_OBJ,
+		    zfs_userquota_prop_prefixes[quotas[i]], 8, 1, &object);
+		if (error == ENOENT) {
+			error = 0;
+			continue;
+		}
+		if (error != 0)
+			goto out;
+		if ((error = zap_count(os, object, &count)) != 0)
+			goto out;
+		if (count != 0) {
+			error = SET_ERROR(ENOTSUP);
+			goto out;
+		}
+	}
+	if ((dsl_prop_get_ds(dmu_objset_ds(os), "sharenfs", 1,
+	    sizeof (share), share,
+	    NULL) != 0 || strcmp(share, "off") != 0) ||
+	    (dsl_prop_get_ds(dmu_objset_ds(os), "sharesmb", 1,
+	    sizeof (share), share,
+	    NULL) != 0 || strcmp(share, "off") != 0))
+		error = SET_ERROR(ENOTSUP);
+out:
+	dmu_objset_rele(os, FTAG);
+	return (error);
+}
+#endif
+
 static int
 zfs_check_settable(const char *dsname, nvpair_t *pair, cred_t *cr)
 {
@@ -5024,6 +5203,33 @@ zfs_check_settable(const char *dsname, nvpair_t *pair, cred_t *cr)
 		nvlist_t *attrs;
 		VERIFY0(nvpair_value_nvlist(pair, &attrs));
 		VERIFY0(nvlist_lookup_nvpair(attrs, ZPROP_VALUE, &pair));
+	}
+
+	if (prop == ZFS_PROP_CHUNKDEDUP &&
+	    nvpair_value_uint64(pair, &intval) == 0 && intval != 0) {
+#ifdef __FreeBSD__
+		if ((err = zfs_chunkdedup_enable_check(dsname)) != 0)
+			return (err);
+#else
+		return (SET_ERROR(ENOTSUP));
+#endif
+	}
+	if ((prop == ZFS_PROP_DEDUP || prop == ZFS_PROP_SHARENFS ||
+	    prop == ZFS_PROP_SHARESMB) &&
+	    zfs_chunkdedup_incompatible_pair(pair, propname) &&
+	    (err = zfs_chunkdedup_tree_check(dsname)) != 0)
+		return (err);
+	if (zfs_chunkdedup_dataset(dsname)) {
+		if (prop == ZFS_PROP_DEDUP &&
+		    nvpair_value_uint64(pair, &intval) == 0 &&
+		    intval != ZIO_CHECKSUM_OFF)
+			return (SET_ERROR(ENOTSUP));
+		if (prop == ZFS_PROP_SHARESMB || prop == ZFS_PROP_SHARENFS) {
+			const char *share;
+			if (nvpair_value_string(pair, &share) != 0 ||
+			    strcmp(share, "off") != 0)
+				return (SET_ERROR(ENOTSUP));
+		}
 	}
 
 	/*
@@ -7439,6 +7645,762 @@ error:
 	return (ret);
 }
 
+/*
+ * Version-one ABI: object identity plus complete Microsoft chunk ranges.
+ * The kernel rereads and hashes candidate bytes, never trusting user data.
+ */
+static const zfs_ioc_key_t zfs_keys_chunkdedup[] = {
+	{"op", DATA_TYPE_STRING, 0},
+	{"object", DATA_TYPE_UINT64, ZK_OPTIONAL},
+	{"generation", DATA_TYPE_UINT64, ZK_OPTIONAL},
+	{"size", DATA_TYPE_UINT64, ZK_OPTIONAL},
+	{"mtime_sec", DATA_TYPE_UINT64, ZK_OPTIONAL},
+	{"mtime_nsec", DATA_TYPE_UINT64, ZK_OPTIONAL},
+	{"offset", DATA_TYPE_UINT64, ZK_OPTIONAL},
+	{"length", DATA_TYPE_UINT64, ZK_OPTIONAL},
+	{"chunk_offsets", DATA_TYPE_UINT64_ARRAY, ZK_OPTIONAL},
+	{"chunk_lengths", DATA_TYPE_UINT64_ARRAY, ZK_OPTIONAL},
+	{"chunk_hashes", DATA_TYPE_UINT8_ARRAY, ZK_OPTIONAL},
+	{"source_object", DATA_TYPE_UINT64, ZK_OPTIONAL},
+	{"source_generation", DATA_TYPE_UINT64, ZK_OPTIONAL},
+	{"source_size", DATA_TYPE_UINT64, ZK_OPTIONAL},
+	{"source_mtime_sec", DATA_TYPE_UINT64, ZK_OPTIONAL},
+	{"source_mtime_nsec", DATA_TYPE_UINT64, ZK_OPTIONAL},
+	{"source_offset", DATA_TYPE_UINT64, ZK_OPTIONAL},
+#ifdef ZFS_DEBUG
+	{"kind", DATA_TYPE_STRING, ZK_OPTIONAL},
+	{"token", DATA_TYPE_NVLIST, ZK_OPTIONAL},
+#endif
+};
+
+#ifdef __FreeBSD__
+typedef struct cd_native_identity {
+	uint64_t object;
+	uint64_t generation;
+	uint64_t size;
+	uint64_t mtime[2];
+} cd_native_identity_t;
+
+static int
+cd_native_identity_get(nvlist_t *nvl, const char *prefix,
+    cd_native_identity_t *id)
+{
+	const char *names[] = { "object", "generation", "size", "mtime_sec",
+	    "mtime_nsec" };
+	uint64_t *values[] = { &id->object, &id->generation, &id->size,
+	    &id->mtime[0], &id->mtime[1] };
+	for (uint_t i = 0; i < ARRAY_SIZE(names); i++) {
+		char key[64];
+		(void) snprintf(key, sizeof (key), "%s%s", prefix, names[i]);
+		if (nvlist_lookup_uint64(nvl, key, values[i]) != 0)
+			return (SET_ERROR(EINVAL));
+	}
+	return (0);
+}
+
+/* Caller holds the vnode lock and filesystem teardown reader. */
+static int
+cd_native_identity_check(znode_t *zp, const cd_native_identity_t *id)
+{
+	uint64_t mtime[2];
+	if (ZTOV(zp)->v_type != VREG || zp->z_unlinked ||
+	    zp->z_gen != id->generation || zp->z_size != id->size)
+		return (SET_ERROR(ESTALE));
+	int error = sa_lookup(zp->z_sa_hdl, SA_ZPL_MTIME(ZTOZSB(zp)), mtime,
+	    sizeof (mtime));
+	if (error != 0)
+		return (error);
+	return (memcmp(mtime, id->mtime, sizeof (mtime)) == 0 ? 0 :
+	    SET_ERROR(ESTALE));
+}
+
+static boolean_t
+cd_native_idle(znode_t *zp)
+{
+	vm_object_t vmobj = ZTOV(zp)->v_object;
+	/* One scanner descriptor and one ioctl vnode reference. */
+	return (ZTOV(zp)->v_usecount <= 2 && ZTOV(zp)->v_writecount == 0 &&
+	    (vmobj == NULL || (vmobj->ref_count <= 1 &&
+	    !vm_object_mightbedirty(vmobj))));
+}
+
+static int
+cd_native_bp(znode_t *zp, uint64_t offset, blkptr_t *bp)
+{
+	uint64_t block = zp->z_blksz;
+	if (block == 0 || block > SPA_MAXBLOCKSIZE || offset >= zp->z_size ||
+	    offset % block != 0 || (!ISP2(block) && zp->z_size > block))
+		return (SET_ERROR(EINVAL));
+	size_t count = 1;
+	int error = dmu_read_l0_bps(ZTOZSB(zp)->z_os, zp->z_id, offset,
+	    MIN(block, zp->z_size - offset), bp, &count);
+	if (error == 0 && count != 1)
+		error = SET_ERROR(EIO);
+	return (error);
+}
+
+static void
+cd_native_geometry(objset_t *os, nvlist_t *outnvl)
+{
+	spa_t *spa = dmu_objset_spa(os);
+	uint64_t ashift = SPA_MINBLOCKSHIFT, parity = 0, columns = UINT64_MAX;
+	boolean_t supported = B_TRUE, found = B_FALSE;
+	spa_config_enter(spa, SCL_CONFIG, FTAG, RW_READER);
+	vdev_t *root = spa->spa_root_vdev;
+	for (uint64_t i = 0; i < root->vdev_children; i++) {
+		vdev_t *vd = root->vdev_child[i];
+		if (!vdev_is_concrete(vd) || vd->vdev_islog ||
+		    vd->vdev_alloc_bias == VDEV_BIAS_DEDUP)
+			continue;
+		found = B_TRUE;
+		ashift = MAX(ashift, vd->vdev_ashift);
+		if (vd->vdev_ops == &vdev_raidz_ops) {
+			uint64_t p = vdev_get_nparity(vd);
+			parity = MAX(parity, p);
+			if (vd->vdev_children <= p)
+				supported = B_FALSE;
+			else
+				columns = MIN(columns, vd->vdev_children - p);
+		} else if (vd->vdev_ops != &vdev_mirror_ops &&
+		    vd->vdev_ops != &vdev_disk_ops &&
+		    vd->vdev_ops != &vdev_file_ops) {
+			supported = B_FALSE;
+		}
+	}
+	spa_config_exit(spa, SCL_CONFIG, FTAG);
+	fnvlist_add_uint64(outnvl, "ashift", ashift);
+	fnvlist_add_uint64(outnvl, "parity", parity);
+	fnvlist_add_uint64(outnvl, "data_columns",
+	    columns == UINT64_MAX ? 1 : columns);
+	fnvlist_add_boolean_value(outnvl, "geometry_supported", supported && found);
+	fnvlist_add_uint64(outnvl, "copies", os->os_copies);
+	fnvlist_add_uint64(outnvl, "compression", os->os_compress);
+}
+
+static int
+cd_native_inspect(zfsvfs_t *zfsvfs, nvlist_t *innvl, nvlist_t *outnvl)
+{
+	cd_native_identity_t id;
+	znode_t *zp = NULL;
+	zfs_locked_range_t *lr = NULL;
+	boolean_t entered = B_FALSE, locked = B_FALSE;
+	uint64_t offset;
+	boolean_t range = nvlist_lookup_uint64(innvl, "offset", &offset) == 0;
+	int error = cd_native_identity_get(innvl, "", &id);
+	if (error != 0)
+		return (error);
+	if ((error = zfs_enter(zfsvfs, FTAG)) != 0)
+		return (error);
+	entered = B_TRUE;
+	if ((error = zfs_zget(zfsvfs, id.object, &zp)) != 0)
+		goto out;
+	/* The initial file query settles writes before per-block inspection. */
+	if (!range && !zfs_is_readonly(zfsvfs)) {
+		if ((error = zil_commit(zfsvfs->z_log, id.object)) != 0)
+			goto out;
+		txg_wait_synced(dmu_objset_pool(zfsvfs->z_os), 0);
+	}
+	zfs_exit(zfsvfs, FTAG);
+	entered = B_FALSE;
+	if ((error = vn_lock(ZTOV(zp), LK_SHARED | LK_RETRY)) != 0)
+		goto out;
+	locked = B_TRUE;
+	if ((error = zfs_enter_verify_zp(zfsvfs, zp, FTAG)) != 0)
+		goto out;
+	entered = B_TRUE;
+	if ((error = cd_native_identity_check(zp, &id)) != 0)
+		goto out;
+	lr = zfs_rangelock_enter(&zp->z_rangelock, 0, UINT64_MAX, RL_READER);
+	boolean_t chunked = zfs_chunkdedup_active(zp);
+	dmu_object_info_t doi;
+	if ((error = dmu_object_info(zfsvfs->z_os, zp->z_id, &doi)) != 0)
+		goto out;
+	fnvlist_add_uint64(outnvl, "block_size", zp->z_blksz);
+	fnvlist_add_uint64(outnvl, "allocated_bytes",
+	    doi.doi_physical_blocks_512 * SPA_MINBLOCKSIZE);
+	fnvlist_add_boolean_value(outnvl, "chunked", chunked);
+	fnvlist_add_boolean_value(outnvl, "eligible",
+	    cd_native_idle(zp) && !zfsvfs->z_os->os_encrypted &&
+	    !zfs_is_readonly(zfsvfs));
+	cd_native_geometry(zfsvfs->z_os, outnvl);
+	if (range) {
+		blkptr_t bp;
+		if ((error = cd_native_bp(zp, offset, &bp)) != 0)
+			goto out;
+		boolean_t real = !BP_IS_HOLE(&bp) && !BP_IS_EMBEDDED(&bp);
+		fnvlist_add_uint64(outnvl, "block_length",
+		    MIN(zp->z_blksz, zp->z_size - offset));
+		fnvlist_add_uint64(outnvl, "block_asize", BP_GET_ASIZE(&bp));
+		fnvlist_add_boolean_value(outnvl, "block_hole", BP_IS_HOLE(&bp));
+		fnvlist_add_boolean_value(outnvl, "block_embedded",
+		    BP_IS_EMBEDDED(&bp));
+		/* Conservative region hint, also valid before any BRT exists. */
+		fnvlist_add_boolean_value(outnvl, "block_shared", real &&
+		    (BP_GET_DEDUP(&bp) || brt_maybe_exists(
+		    dmu_objset_spa(zfsvfs->z_os), &bp)));
+		if (real) {
+			uint64_t birth = BP_GET_PHYSICAL_BIRTH(&bp);
+			BP_SET_BIRTH(&bp, 0, birth);
+			BP_SET_REWRITE(&bp, 0);
+		} else {
+			BP_ZERO(&bp);
+		}
+		fnvlist_add_uint8_array(outnvl, "block_identity",
+		    (uint8_t *)&bp, sizeof (bp));
+	}
+out:
+	if (lr != NULL)
+		zfs_rangelock_exit(lr);
+	if (entered)
+		zfs_exit(zfsvfs, FTAG);
+	if (locked)
+		VOP_UNLOCK(ZTOV(zp));
+	if (zp != NULL)
+		zfs_zrele_async(zp);
+	return (error);
+}
+
+static int
+cd_native_lock_pair(znode_t *src, znode_t *dst)
+{
+	if (src == dst) {
+		return (vn_lock(ZTOV(dst), LK_EXCLUSIVE | LK_RETRY));
+	}
+#if (__FreeBSD_version >= 1302506 && __FreeBSD_version < 1400000) || \
+	__FreeBSD_version >= 1400086
+	vn_lock_pair(ZTOV(src), false, LK_EXCLUSIVE, ZTOV(dst), false,
+	    LK_EXCLUSIVE);
+#else
+	vn_lock_pair(ZTOV(src), false, ZTOV(dst), false);
+#endif
+	return (0);
+}
+
+static void
+cd_native_unlock_pair(znode_t *src, znode_t *dst)
+{
+	VOP_UNLOCK(ZTOV(dst));
+	if (src != dst)
+		VOP_UNLOCK(ZTOV(src));
+}
+
+/*
+ * Metadata-neutral, one-block deduplication. Like upstream afb4010's dedupe
+ * path, it neither logs a content change nor refreshes file pages: the bytes
+ * are unchanged, and a crash may lose only optimization progress. Existing
+ * clone_range and its content-changing ZIL replay remain untouched.
+ */
+static int
+cd_native_share(zfsvfs_t *zfsvfs, nvlist_t *innvl, nvlist_t *outnvl)
+{
+	cd_native_identity_t source, target;
+	znode_t *src = NULL, *dst = NULL;
+	zfs_locked_range_t *slr = NULL, *dlr = NULL;
+	boolean_t entered = B_FALSE, locked = B_FALSE;
+	uint64_t inoff, outoff, length;
+	uint_t srcseq, dstseq;
+	int error = cd_native_identity_get(innvl, "", &target);
+	if (error == 0)
+		error = cd_native_identity_get(innvl, "source_", &source);
+	if (error != 0)
+		return (error);
+	if (nvlist_lookup_uint64(innvl, "source_offset", &inoff) != 0 ||
+	    nvlist_lookup_uint64(innvl, "offset", &outoff) != 0 ||
+	    nvlist_lookup_uint64(innvl, "length", &length) != 0 ||
+	    length == 0 || length > SPA_MAXBLOCKSIZE)
+		return (SET_ERROR(EINVAL));
+	if ((error = zfs_enter(zfsvfs, FTAG)) != 0)
+		return (error);
+	entered = B_TRUE;
+	if (zfs_is_readonly(zfsvfs)) {
+		error = SET_ERROR(EROFS);
+		goto out;
+	}
+	if ((error = zfs_zget(zfsvfs, target.object, &dst)) != 0)
+		goto out;
+	if (source.object == target.object)
+		src = dst;
+	else if ((error = zfs_zget(zfsvfs, source.object, &src)) != 0)
+		goto out;
+	zfs_exit(zfsvfs, FTAG);
+	entered = B_FALSE;
+	if ((error = cd_native_lock_pair(src, dst)) != 0)
+		goto out;
+	locked = B_TRUE;
+	if ((error = zfs_enter_verify_zp(zfsvfs, dst, FTAG)) != 0)
+		goto out;
+	entered = B_TRUE;
+	if ((error = zfs_verify_zp(src)) != 0 ||
+	    (error = cd_native_identity_check(src, &source)) != 0 ||
+	    (error = cd_native_identity_check(dst, &target)) != 0)
+		goto out;
+	if (!cd_native_idle(src) || !cd_native_idle(dst)) {
+		error = SET_ERROR(EBUSY);
+		goto out;
+	}
+	srcseq = src->z_seq;
+	dstseq = dst->z_seq;
+	/* A clean BP already proves durability; avoid a TXG wait per block. */
+	blkptr_t probe;
+	boolean_t drain = B_FALSE;
+	error = cd_native_bp(src, inoff, &probe);
+	if (error == EAGAIN)
+		drain = B_TRUE;
+	else if (error != 0)
+		goto out;
+	error = cd_native_bp(dst, outoff, &probe);
+	if (error == EAGAIN)
+		drain = B_TRUE;
+	else if (error != 0)
+		goto out;
+	/* Drain dirty files without vnode, range, or installation locks. */
+	zfs_exit(zfsvfs, FTAG);
+	entered = B_FALSE;
+	cd_native_unlock_pair(src, dst);
+	locked = B_FALSE;
+	if (drain) {
+		if ((error = zfs_enter(zfsvfs, FTAG)) != 0)
+			goto out;
+		entered = B_TRUE;
+		if ((error = zil_commit(zfsvfs->z_log, source.object)) != 0 ||
+		    (src != dst && (error = zil_commit(zfsvfs->z_log,
+		    target.object)) != 0))
+			goto out;
+		txg_wait_synced(dmu_objset_pool(zfsvfs->z_os), 0);
+		zfs_exit(zfsvfs, FTAG);
+		entered = B_FALSE;
+	}
+	if ((error = cd_native_lock_pair(src, dst)) != 0)
+		goto out;
+	locked = B_TRUE;
+	if ((error = zfs_enter_verify_zp(zfsvfs, dst, FTAG)) != 0)
+		goto out;
+	entered = B_TRUE;
+	if ((error = zfs_verify_zp(src)) != 0 ||
+	    (error = cd_native_identity_check(src, &source)) != 0 ||
+	    (error = cd_native_identity_check(dst, &target)) != 0)
+		goto out;
+	if (src->z_seq != srcseq || dst->z_seq != dstseq) {
+		error = SET_ERROR(EAGAIN);
+		goto out;
+	}
+	if (!cd_native_idle(src) || !cd_native_idle(dst)) {
+		error = SET_ERROR(EBUSY);
+		goto out;
+	}
+	if (zfs_is_readonly(zfsvfs) || zfsvfs->z_os->os_encrypted ||
+	    (zfsvfs->z_vfs->vfs_flag & MNT_EXPORTED) != 0 ||
+	    zfs_chunkdedup_active(src) || zfs_chunkdedup_active(dst)) {
+		error = SET_ERROR(ENOTSUP);
+		goto out;
+	}
+	if ((src->z_pflags & ZFS_AV_QUARANTINED) ||
+	    (dst->z_pflags & (ZFS_IMMUTABLE | ZFS_APPENDONLY | ZFS_READONLY))) {
+		error = SET_ERROR(EPERM);
+		goto out;
+	}
+	uint64_t block = src->z_blksz;
+	if (block == 0 || block > SPA_MAXBLOCKSIZE ||
+	    block != dst->z_blksz || inoff >= src->z_size ||
+	    outoff >= dst->z_size || length > src->z_size - inoff ||
+	    length > dst->z_size - outoff || inoff % block != 0 ||
+	    outoff % block != 0 || length > block ||
+	    (length != block && (length != src->z_size - inoff ||
+	    length != dst->z_size - outoff)) ||
+	    (!ISP2(block) && (src->z_size > block || dst->z_size > block)) ||
+	    (src == dst && inoff < outoff + length && outoff < inoff + length)) {
+		error = SET_ERROR(EINVAL);
+		goto out;
+	}
+	/* Whole-file locks keep the first implementation's lock order simple. */
+	if (src == dst) {
+		dlr = zfs_rangelock_enter(&dst->z_rangelock, 0, UINT64_MAX,
+		    RL_WRITER);
+	} else if (src < dst) {
+		slr = zfs_rangelock_enter(&src->z_rangelock, 0, UINT64_MAX,
+		    RL_WRITER);
+		dlr = zfs_rangelock_enter(&dst->z_rangelock, 0, UINT64_MAX,
+		    RL_WRITER);
+	} else {
+		dlr = zfs_rangelock_enter(&dst->z_rangelock, 0, UINT64_MAX,
+		    RL_WRITER);
+		slr = zfs_rangelock_enter(&src->z_rangelock, 0, UINT64_MAX,
+		    RL_WRITER);
+	}
+	blkptr_t inbp, outbp;
+	if ((error = cd_native_bp(src, inoff, &inbp)) != 0 ||
+	    (error = cd_native_bp(dst, outoff, &outbp)) != 0)
+		goto out;
+	if (BP_IS_HOLE(&inbp) || BP_IS_EMBEDDED(&inbp) ||
+	    BP_IS_HOLE(&outbp) || BP_IS_EMBEDDED(&outbp) ||
+	    BP_GET_DEDUP(&inbp) || BP_GET_DEDUP(&outbp)) {
+		error = SET_ERROR(ENOTSUP);
+		goto out;
+	}
+	if (BP_GET_PHYSICAL_BIRTH(&inbp) == BP_GET_PHYSICAL_BIRTH(&outbp) &&
+	    DVA_EQUAL(&inbp.blk_dva[0], &outbp.blk_dva[0])) {
+		fnvlist_add_uint64(outnvl, "already_shared_bytes", length);
+		fnvlist_add_uint64(outnvl, "shared_bytes", 0);
+		fnvlist_add_uint64(outnvl, "compared_bytes", 0);
+		goto out;
+	}
+	uint8_t *bytes = vmem_alloc(2 * length, KM_SLEEP);
+	error = dmu_read(zfsvfs->z_os, src->z_id, inoff, length, bytes,
+	    DMU_READ_PREFETCH);
+	if (error == 0)
+		error = dmu_read(zfsvfs->z_os, dst->z_id, outoff, length,
+		    bytes + length, DMU_READ_PREFETCH);
+	if (error == 0 && memcmp(bytes, bytes + length, length) != 0)
+		error = SET_ERROR(EILSEQ);
+	vmem_free(bytes, 2 * length);
+	if (error != 0)
+		goto out;
+	dmu_tx_t *tx = dmu_tx_create(zfsvfs->z_os);
+	dmu_buf_impl_t *db = (dmu_buf_impl_t *)sa_get_db(dst->z_sa_hdl);
+	DB_DNODE_ENTER(db);
+	dmu_tx_hold_clone_by_dnode(tx, DB_DNODE(db), outoff, length, block);
+	DB_DNODE_EXIT(db);
+	error = dmu_tx_assign(tx, DMU_TX_WAIT);
+	if (error != 0) {
+		dmu_tx_abort(tx);
+		goto out;
+	}
+	error = dmu_brt_clone(zfsvfs->z_os, dst->z_id, outoff, length, tx,
+	    &inbp, 1);
+	dmu_tx_commit(tx);
+	if (error == 0) {
+		fnvlist_add_uint64(outnvl, "shared_bytes", length);
+		fnvlist_add_uint64(outnvl, "already_shared_bytes", 0);
+		fnvlist_add_uint64(outnvl, "compared_bytes", length);
+	}
+out:
+	if (dlr != NULL)
+		zfs_rangelock_exit(dlr);
+	if (slr != NULL)
+		zfs_rangelock_exit(slr);
+	if (entered)
+		zfs_exit(zfsvfs, FTAG);
+	if (locked)
+		cd_native_unlock_pair(src, dst);
+	if (src != NULL && src != dst)
+		zfs_zrele_async(src);
+	if (dst != NULL)
+		zfs_zrele_async(dst);
+	return (error);
+}
+#endif
+
+static int
+zfs_ioc_chunkdedup(const char *name, nvlist_t *innvl, nvlist_t *outnvl)
+{
+#ifndef __FreeBSD__
+	(void) name;
+	(void) innvl;
+	(void) outnvl;
+	return (SET_ERROR(ENOTSUP));
+#else
+	zfsvfs_t *zfsvfs;
+	znode_t *zp = NULL;
+	zfs_locked_range_t *lr = NULL;
+	const char *op = fnvlist_lookup_string(innvl, "op");
+	uint64_t object, generation, size, offset, length;
+	uint64_t *offsets, *lengths;
+	uint8_t *hashes;
+	uint_t n, nl, nh;
+	int error;
+	boolean_t locked = B_FALSE, entered = B_FALSE;
+
+	if ((error = getzfsvfs(name, &zfsvfs)) != 0)
+		return (error);
+	if (strcmp(op, "inspect") == 0) {
+		error = cd_native_inspect(zfsvfs, innvl, outnvl);
+		goto rele;
+	}
+	if (strcmp(op, "share-blocks") == 0) {
+		uint64_t enabled;
+		if ((error = dsl_prop_get_integer(name, "chunkdedup", &enabled,
+		    NULL)) != 0 || enabled == 0) {
+			error = error != 0 ? error : SET_ERROR(EINVAL);
+			goto rele;
+		}
+		if ((error = zfs_chunkdedup_enable_check(name)) != 0)
+			goto rele;
+		if (!zfs_bclone_enabled || !spa_feature_is_enabled(
+		    dmu_objset_spa(zfsvfs->z_os), SPA_FEATURE_BLOCK_CLONING)) {
+			error = SET_ERROR(ENOTSUP);
+			goto rele;
+		}
+		error = cd_native_share(zfsvfs, innvl, outnvl);
+		goto rele;
+	}
+	if ((error = zfs_enter(zfsvfs, FTAG)) != 0)
+		goto rele;
+	entered = B_TRUE;
+	if (strcmp(op, "block-status") == 0) {
+		spa_t *spa = dmu_objset_spa(zfsvfs->z_os);
+		fnvlist_add_string(outnvl, "pool", spa_name(spa));
+		fnvlist_add_uint64(outnvl, "brt_used", brt_get_used(spa));
+		fnvlist_add_uint64(outnvl, "brt_saved", brt_get_saved(spa));
+		fnvlist_add_uint64(outnvl, "brt_ratio", brt_get_ratio(spa));
+		goto exit;
+	}
+	if (strcmp(op, "chunk-lookup") == 0) {
+		if (nvlist_lookup_uint64_array(innvl, "chunk_lengths", &lengths,
+		    &n) != 0 || nvlist_lookup_uint8_array(innvl, "chunk_hashes",
+		    &hashes, &nh) != 0 || n == 0 ||
+		    n > ZFS_CHUNKDEDUP_MAX_CHUNKS ||
+		    nh != n * ZFS_CHUNKDEDUP_HASH_SIZE) {
+			error = SET_ERROR(EINVAL);
+			goto exit;
+		}
+		zfs_chunkdedup_chunk_t *chunks = kmem_zalloc(
+		    n * sizeof (*chunks), KM_SLEEP);
+		uint64_t objects[ZFS_CHUNKDEDUP_MAX_CHUNKS];
+		uint64_t asizes[ZFS_CHUNKDEDUP_MAX_CHUNKS];
+		for (uint_t i = 0; i < n; i++) {
+			chunks[i].zc_length = lengths[i];
+			memcpy(chunks[i].zc_hash,
+			    hashes + i * ZFS_CHUNKDEDUP_HASH_SIZE,
+			    ZFS_CHUNKDEDUP_HASH_SIZE);
+		}
+		error = zfs_chunkdedup_lookup(zfsvfs, chunks, n, objects, asizes);
+		kmem_free(chunks, n * sizeof (*chunks));
+		if (error == 0) {
+			fnvlist_add_uint64_array(outnvl, "chunk_objects", objects, n);
+			fnvlist_add_uint64_array(outnvl, "chunk_asizes", asizes, n);
+		}
+		goto exit;
+	}
+	if (strcmp(op, "status") == 0) {
+		zfs_chunkdedup_stats_t stats;
+		error = zfs_chunkdedup_status(zfsvfs, &stats);
+		if (error == 0) {
+			fnvlist_add_uint64(outnvl, "files", stats.zcs_files);
+			fnvlist_add_uint64(outnvl, "records",
+			    stats.zcs_records);
+			fnvlist_add_uint64(outnvl, "chunks", stats.zcs_chunks);
+			fnvlist_add_uint64(outnvl, "chunk_bytes",
+			    stats.zcs_chunk_bytes);
+			fnvlist_add_uint64(outnvl, "logical_bytes",
+			    stats.zcs_logical_bytes);
+			fnvlist_add_uint64(outnvl, "references",
+			    stats.zcs_references);
+		}
+		goto exit;
+	}
+#ifdef ZFS_DEBUG
+	if (strcmp(op, "debug-collision-selftest") == 0) {
+		error = zfs_chunkdedup_test_collision(outnvl);
+		goto exit;
+	}
+	boolean_t debug_inject = strcmp(op, "debug-inject") == 0;
+	boolean_t debug_restore = strcmp(op, "debug-restore") == 0;
+	boolean_t debug_op = debug_inject || debug_restore;
+#else
+	boolean_t debug_op = B_FALSE;
+#endif
+	if (strcmp(op, "read") != 0 && strcmp(op, "optimize") != 0 &&
+	    strcmp(op, "verify") != 0 &&
+	    strcmp(op, "unoptimize") != 0 && !debug_op) {
+		error = SET_ERROR(EINVAL);
+		goto exit;
+	}
+	if (nvlist_lookup_uint64(innvl, "object", &object) != 0 ||
+	    nvlist_lookup_uint64(innvl, "generation", &generation) != 0 ||
+	    nvlist_lookup_uint64(innvl, "size", &size) != 0) {
+		error = SET_ERROR(EINVAL);
+		goto exit;
+	}
+	if (strcmp(op, "verify") != 0 && strcmp(op, "read") != 0 &&
+	    zfs_is_readonly(zfsvfs)) {
+		error = SET_ERROR(EROFS);
+		goto exit;
+	}
+	if (strcmp(op, "optimize") == 0) {
+		uint64_t enabled;
+		if ((error = dsl_prop_get_integer(name, "chunkdedup", &enabled,
+		    NULL)) != 0 || enabled == 0) {
+			error = error != 0 ? error : SET_ERROR(EINVAL);
+			goto exit;
+		}
+		if ((error = zfs_chunkdedup_enable_check(name)) != 0)
+			goto exit;
+		if ((zfsvfs->z_vfs->vfs_flag & MNT_EXPORTED) != 0) {
+			error = SET_ERROR(ENOTSUP);
+			goto exit;
+		}
+	}
+	if ((error = zfs_zget(zfsvfs, object, &zp)) != 0)
+		goto exit;
+	/* Match ordinary VOP order: vnode first, then teardown reader. */
+	zfs_exit(zfsvfs, FTAG);
+	entered = B_FALSE;
+	error = vn_lock(ZTOV(zp), (strcmp(op, "read") == 0 ? LK_SHARED :
+	    LK_EXCLUSIVE) | LK_RETRY);
+	if (error != 0)
+		goto exit;
+	locked = B_TRUE;
+	if ((error = zfs_enter_verify_zp(zfsvfs, zp, FTAG)) != 0)
+		goto exit;
+	entered = B_TRUE;
+	if (ZTOV(zp)->v_type != VREG || zp->z_unlinked ||
+	    zp->z_gen != generation || zp->z_size != size) {
+		error = SET_ERROR(ESTALE);
+		goto exit;
+	}
+	if (strcmp(op, "read") == 0) {
+		uint64_t mtime[2], expected_mtime[2];
+		if (nvlist_lookup_uint64(innvl, "mtime_sec",
+		    &expected_mtime[0]) != 0 || nvlist_lookup_uint64(innvl,
+		    "mtime_nsec", &expected_mtime[1]) != 0 ||
+		    sa_lookup(zp->z_sa_hdl, SA_ZPL_MTIME(zfsvfs), mtime,
+		    sizeof (mtime)) != 0 ||
+		    memcmp(mtime, expected_mtime, sizeof (mtime)) != 0) {
+			error = SET_ERROR(ESTALE);
+			goto exit;
+		}
+		if (nvlist_lookup_uint64(innvl, "offset", &offset) != 0 ||
+		    nvlist_lookup_uint64(innvl, "length", &length) != 0 ||
+		    length == 0 || length > (256U << 10) || offset > size ||
+		    length > size - offset) {
+			error = SET_ERROR(EINVAL);
+			goto exit;
+		}
+		uint8_t *bytes = kmem_alloc(length, KM_SLEEP);
+		lr = zfs_rangelock_enter(&zp->z_rangelock, offset, length,
+		    RL_READER);
+		error = zfs_chunkdedup_read_buf(zp, offset, length, bytes);
+		if (error == 0)
+			fnvlist_add_uint8_array(outnvl, "bytes", bytes, length);
+		kmem_free(bytes, length);
+		goto exit;
+	}
+	if (strcmp(op, "optimize") == 0) {
+		/*
+		 * Capture an epoch while serialized with file writes. Drain
+		 * without installation locks, then prove no intervening write
+		 * left a live ZIL record referring to backing holes.
+		 */
+		uint_t sequence = zp->z_seq;
+		zfs_exit(zfsvfs, FTAG);
+		entered = B_FALSE;
+		VOP_UNLOCK(ZTOV(zp));
+		locked = B_FALSE;
+		if ((error = zfs_enter(zfsvfs, FTAG)) != 0)
+			goto exit;
+		entered = B_TRUE;
+		error = zil_commit(zfsvfs->z_log, object);
+		if (error != 0)
+			goto exit;
+		txg_wait_synced(dmu_objset_pool(zfsvfs->z_os), 0);
+		zfs_exit(zfsvfs, FTAG);
+		entered = B_FALSE;
+		if ((error = vn_lock(ZTOV(zp), LK_EXCLUSIVE | LK_RETRY)) != 0)
+			goto exit;
+		locked = B_TRUE;
+		if ((error = zfs_enter_verify_zp(zfsvfs, zp, FTAG)) != 0)
+			goto exit;
+		entered = B_TRUE;
+		if (zp->z_seq != sequence || zp->z_gen != generation ||
+		    zp->z_size != size || zp->z_unlinked) {
+			error = SET_ERROR(EAGAIN);
+			goto exit;
+		}
+	}
+	if (strcmp(op, "optimize") == 0) {
+		vm_object_t vmobj = ZTOV(zp)->v_object;
+		uint64_t mtime[2], expected_mtime[2];
+		if (nvlist_lookup_uint64(innvl, "mtime_sec",
+		    &expected_mtime[0]) != 0 || nvlist_lookup_uint64(innvl,
+		    "mtime_nsec", &expected_mtime[1]) != 0 ||
+		    sa_lookup(zp->z_sa_hdl, SA_ZPL_MTIME(zfsvfs), mtime,
+		    sizeof (mtime)) != 0 ||
+		    memcmp(mtime, expected_mtime, sizeof (mtime)) != 0) {
+			error = SET_ERROR(ESTALE);
+			goto exit;
+		}
+		/* Caller descriptor plus this ioctl's vnode reference. */
+		if (ZTOV(zp)->v_usecount > 2 || ZTOV(zp)->v_writecount != 0) {
+			error = SET_ERROR(EBUSY);
+			goto exit;
+		}
+		if (vmobj != NULL) {
+			/* Native dirty check under the vnode lock. */
+			boolean_t busy = vmobj->ref_count > 1 ||
+			    vm_object_mightbedirty(vmobj);
+			if (busy) {
+				error = SET_ERROR(EBUSY);
+				goto exit;
+			}
+		}
+		if (nvlist_lookup_uint64(innvl, "offset", &offset) != 0 ||
+		    nvlist_lookup_uint64(innvl, "length", &length) != 0 ||
+		    nvlist_lookup_uint64_array(innvl, "chunk_offsets", &offsets,
+		    &n) != 0 || nvlist_lookup_uint64_array(innvl,
+		    "chunk_lengths", &lengths, &nl) != 0 ||
+		    nvlist_lookup_uint8_array(innvl,
+		    "chunk_hashes", &hashes, &nh) != 0 || n != nl || n == 0 ||
+		    n > ZFS_CHUNKDEDUP_MAX_CHUNKS ||
+		    nh != n * ZFS_CHUNKDEDUP_HASH_SIZE) {
+			error = SET_ERROR(EINVAL);
+			goto exit;
+		}
+		zfs_chunkdedup_chunk_t *chunks = kmem_alloc(
+		    n * sizeof (*chunks), KM_SLEEP);
+		for (uint_t i = 0; i < n; i++) {
+			chunks[i].zc_offset = offsets[i];
+			chunks[i].zc_length = lengths[i];
+			memcpy(chunks[i].zc_hash,
+			    hashes + i * ZFS_CHUNKDEDUP_HASH_SIZE,
+			    ZFS_CHUNKDEDUP_HASH_SIZE);
+		}
+		lr = zfs_rangelock_enter(&zp->z_rangelock, 0, UINT64_MAX,
+		    RL_WRITER);
+		error = zfs_chunkdedup_optimize(zp, offset, length, chunks, n);
+		kmem_free(chunks, n * sizeof (*chunks));
+#ifdef ZFS_DEBUG
+	} else if (debug_op) {
+		const char *kind;
+		nvlist_t *token = NULL;
+		if (nvlist_lookup_string(innvl, "kind", &kind) != 0 ||
+		    (debug_restore && nvlist_lookup_nvlist(innvl, "token",
+		    &token) != 0)) {
+			error = SET_ERROR(EINVAL);
+			goto exit;
+		}
+		if (debug_inject)
+			token = fnvlist_alloc();
+		lr = zfs_rangelock_enter(&zp->z_rangelock, 0, UINT64_MAX,
+		    RL_WRITER);
+		error = zfs_chunkdedup_test_corrupt(zp, kind, token,
+		    debug_restore);
+		if (debug_inject) {
+			if (error == 0)
+				fnvlist_add_nvlist(outnvl, "token", token);
+			fnvlist_free(token);
+		}
+#endif
+	} else {
+		lr = zfs_rangelock_enter(&zp->z_rangelock, 0, UINT64_MAX,
+		    strcmp(op, "verify") == 0 ? RL_READER : RL_WRITER);
+		error = strcmp(op, "verify") == 0 ?
+		    zfs_chunkdedup_verify(zp) : zfs_chunkdedup_unoptimize(zp);
+	}
+exit:
+	if (lr != NULL)
+		zfs_rangelock_exit(lr);
+	if (entered)
+		zfs_exit(zfsvfs, FTAG);
+	if (locked)
+		VOP_UNLOCK(ZTOV(zp));
+	if (zp != NULL)
+		zrele(zp);
+rele:
+	zfs_vfs_rele(zfsvfs);
+	return (error);
+#endif
+}
+
 static zfs_ioc_vec_t zfs_ioc_vec[ZFS_IOC_LAST - ZFS_IOC_FIRST];
 
 static void
@@ -7744,6 +8706,11 @@ zfs_ioctl_init(void)
 	    zfs_ioc_ddt_prune, zfs_secpolicy_config, POOL_NAME,
 	    POOL_CHECK_SUSPENDED | POOL_CHECK_READONLY, B_TRUE, B_TRUE,
 	    zfs_keys_ddt_prune, ARRAY_SIZE(zfs_keys_ddt_prune));
+
+	zfs_ioctl_register("chunkdedup", ZFS_IOC_CHUNKDEDUP,
+	    zfs_ioc_chunkdedup, zfs_secpolicy_config, DATASET_NAME,
+	    POOL_CHECK_SUSPENDED, B_FALSE, B_FALSE,
+	    zfs_keys_chunkdedup, ARRAY_SIZE(zfs_keys_chunkdedup));
 
 	/* IOCTLS that use the legacy function signature */
 

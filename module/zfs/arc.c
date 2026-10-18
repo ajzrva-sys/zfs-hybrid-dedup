@@ -5841,6 +5841,20 @@ arc_cached(spa_t *spa, const blkptr_t *bp)
 	return (flags);
 }
 
+/* The allocation hint does not change caching or transform semantics. */
+static int
+arc_read_alloc_flags(const blkptr_t *bp, arc_flags_t flags,
+    boolean_t has_consumer)
+{
+	if ((flags & ARC_FLAG_LINEAR_ABD) && has_consumer &&
+	    !(flags & (ARC_FLAG_PREFETCH | ARC_FLAG_NO_BUF)) &&
+	    !BP_IS_EMBEDDED(bp) && !BP_IS_PROTECTED(bp) &&
+	    BP_GET_LEVEL(bp) == 0 && BP_GET_BUFC_TYPE(bp) == ARC_BUFC_DATA &&
+	    BP_GET_COMPRESS(bp) == ZIO_COMPRESS_OFF)
+		return (ARC_HDR_ALLOC_LINEAR);
+	return (0);
+}
+
 /*
  * "Read" the block at the specified DVA (in bp) via the
  * cache.  If the block is found in the cache, invoke the provided
@@ -6070,7 +6084,8 @@ top:
 		boolean_t devw = B_FALSE;
 		uint64_t size;
 		abd_t *hdr_abd;
-		int alloc_flags = encrypted_read ? ARC_HDR_ALLOC_RDATA : 0;
+		int alloc_flags = (encrypted_read ? ARC_HDR_ALLOC_RDATA : 0) |
+		    arc_read_alloc_flags(bp, *arc_flags, done != NULL);
 		arc_buf_contents_t type = BP_GET_BUFC_TYPE(bp);
 		int config_lock;
 		int error;

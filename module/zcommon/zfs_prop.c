@@ -424,6 +424,9 @@ zfs_prop_init(void)
 	    "on | off | fletcher2 | fletcher4 | sha256 | sha512 | skein"
 	    " | edonr | blake3",
 	    "CHECKSUM", checksum_table, sfeatures);
+	zprop_register_index(ZFS_PROP_CHUNKDEDUP, "chunkdedup", 0,
+	    PROP_INHERIT, ZFS_TYPE_FILESYSTEM, "off | on", "CHUNKDEDUP",
+	    boolean_table, sfeatures);
 	zprop_register_index(ZFS_PROP_DEDUP, "dedup", ZIO_CHECKSUM_OFF,
 	    PROP_INHERIT, ZFS_TYPE_FILESYSTEM | ZFS_TYPE_VOLUME,
 	    "on | off | verify | sha256[,verify] | sha512[,verify] | "

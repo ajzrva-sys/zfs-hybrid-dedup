@@ -373,6 +373,7 @@ SRCS+=	abd.c \
 	zfs_rlock.c \
 	zfs_sa.c \
 	zfs_vnops.c \
+	zfs_chunkdedup.c \
 	zfs_znode.c \
 	zil.c \
 	zio.c \

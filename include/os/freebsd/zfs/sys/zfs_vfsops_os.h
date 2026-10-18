@@ -47,6 +47,9 @@ typedef struct rmslock zfs_teardown_inactive_lock_t;
 typedef struct zfsvfs zfsvfs_t;
 struct znode;
 
+/* The platform filesystem state owns the chunk validation cache. */
+#define ZFS_CHUNKDEDUP_CACHE_SUPPORTED 1
+
 struct zfsvfs {
 	vfs_t		*z_vfs;		/* generic fs struct */
 	zfsvfs_t	*z_parent;	/* parent fs */
@@ -90,6 +93,8 @@ struct zfsvfs {
 	uint64_t	z_version;	/* ZPL version */
 	uint64_t	z_shares_dir;	/* hidden shares dir */
 	dataset_kstats_t	z_kstat;	/* fs kstats */
+	kmutex_t	z_chunkdedup_lock; /* experimental chunk metadata */
+	struct zfs_chunkdedup_cache *z_chunkdedup_cache;
 	kmutex_t	z_lock;
 	uint64_t	z_userquota_obj;
 	uint64_t	z_groupquota_obj;

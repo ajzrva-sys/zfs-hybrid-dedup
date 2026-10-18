@@ -85,6 +85,7 @@
 #include <vm/vm_param.h>
 #include <sys/zil.h>
 #include <sys/zfs_vnops.h>
+#include <sys/zfs_chunkdedup.h>
 #include <sys/module.h>
 #include <sys/sysent.h>
 #include <sys/dmu_impl.h>
@@ -518,7 +519,6 @@ int
 mappedread_sf(znode_t *zp, int nbytes, zfs_uio_t *uio)
 {
 	vnode_t *vp = ZTOV(zp);
-	objset_t *os = zp->z_zfsvfs->z_os;
 	struct sf_buf *sf;
 	vm_object_t obj;
 	vm_page_t pp;
@@ -540,8 +540,7 @@ mappedread_sf(znode_t *zp, int nbytes, zfs_uio_t *uio)
 		    VM_ALLOC_SBUSY | VM_ALLOC_NORMAL | VM_ALLOC_IGN_SBUSY);
 		if (vm_page_none_valid(pp)) {
 			va = zfs_map_page(pp, &sf);
-			error = dmu_read(os, zp->z_id, start, bytes, va,
-			    DMU_READ_PREFETCH);
+			error = zfs_chunkdedup_read_buf(zp, start, bytes, va);
 			if (bytes != PAGESIZE && error == 0)
 				memset(va + bytes, 0, PAGESIZE - bytes);
 			zfs_unmap_page(sf);
@@ -612,8 +611,7 @@ mappedread(znode_t *zp, int nbytes, zfs_uio_t *uio)
 			zfs_unmap_page(sf);
 			page_unhold(pp);
 		} else {
-			error = dmu_read_uio_dbuf(sa_get_db(zp->z_sa_hdl),
-			    uio, bytes, DMU_READ_PREFETCH);
+			error = zfs_chunkdedup_read(zp, uio, bytes);
 		}
 		len -= bytes;
 		off = 0;
@@ -4166,6 +4164,129 @@ zfs_pathconf(vnode_t *vp, int cmd, ulong_t *valp, cred_t *cr,
 	}
 }
 
+/*
+ * Resolve a contiguous logical range once instead of once for each VM page.
+ * Optional pages are acquired without waiting, as in dmu_read_pages(), while
+ * the caller's native-record range lock protects them from writers.  Keep
+ * staging bounded and publish a page only after its bytes have been read.
+ */
+static int
+zfs_chunkdedup_read_pages(znode_t *zp, vm_page_t *ma, int count,
+    int *rbehind, int *rahead, int last_size)
+{
+	vm_object_t object = ma[0]->object;
+	vm_pindex_t first = ma[0]->pindex;
+	vm_pindex_t last = ma[count - 1]->pindex;
+	int behind = *rbehind, ahead = *rahead;
+	uint64_t start = IDX_TO_OFF(first - behind);
+	uint64_t end = IDX_TO_OFF(last) + last_size + IDX_TO_OFF(ahead);
+	/* Optional final pages extend to round_page(EOF), not logical EOF. */
+	end = MIN(end, zp->z_size);
+	if (end <= IDX_TO_OFF(last))
+		return (SET_ERROR(EIO));
+	size_t allocation = MIN(roundup(end - start, PAGE_SIZE),
+	    ZFS_CHUNKDEDUP_MAX_RANGE);
+	zfs_chunkdedup_stage_t stage;
+	int error = zfs_chunkdedup_stage_acquire(ZTOZSB(zp), allocation, &stage);
+	if (error != 0)
+		return (error);
+	void *buffer = stage.buffer;
+
+	ASSERT3U(first + count - 1, ==, last);
+	ASSERT3S(last_size, >, 0);
+	ASSERT3S(last_size, <=, PAGE_SIZE);
+	IMPLY(last_size < PAGE_SIZE, ahead == 0);
+	*rbehind = 0;
+	*rahead = 0;
+
+	for (uint64_t offset = start; offset < end; ) {
+		size_t take = MIN(allocation, end - offset);
+		error = zfs_chunkdedup_read_buf(zp, offset, take, buffer);
+		if (error != 0)
+			break;
+
+		/* Native-record read-behind fits in the first bounded batch. */
+		if (offset == start) {
+			for (int i = 0; i < behind; i++) {
+				vm_page_t m = vm_page_grab_unlocked(object,
+				    first - 1 - i, VM_ALLOC_NORMAL |
+				    VM_ALLOC_NOWAIT | VM_ALLOC_SBUSY |
+				    VM_ALLOC_IGN_SBUSY);
+				if (m == NULL)
+					break;
+				if (!vm_page_none_valid(m)) {
+					ASSERT(vm_page_all_valid(m));
+					vm_page_sunbusy(m);
+					break;
+				}
+				struct sf_buf *sf;
+				size_t within = IDX_TO_OFF(m->pindex) - offset;
+				ASSERT3U(within + PAGE_SIZE, <=, take);
+				ASSERT0(m->dirty);
+				ASSERT(!pmap_page_is_write_mapped(m));
+				caddr_t va = zfs_map_page(m, &sf);
+				memcpy(va, (uint8_t *)buffer + within, PAGE_SIZE);
+				zfs_unmap_page(sf);
+				vm_page_valid(m);
+				if ((m->busy_lock & VPB_BIT_WAITERS) != 0)
+					vm_page_activate(m);
+				else
+					vm_page_deactivate(m);
+				vm_page_sunbusy(m);
+				(*rbehind)++;
+			}
+		}
+
+		for (size_t pos = 0; pos < take; pos += PAGE_SIZE) {
+			vm_pindex_t index = OFF_TO_IDX(offset + pos);
+			vm_page_t m;
+			boolean_t optional = index > last;
+			if (index < first)
+				continue;
+			if (optional) {
+				m = vm_page_grab_unlocked(object, index,
+				    VM_ALLOC_NORMAL | VM_ALLOC_NOWAIT |
+				    VM_ALLOC_SBUSY | VM_ALLOC_IGN_SBUSY);
+				if (m == NULL)
+					goto out;
+				if (!vm_page_none_valid(m)) {
+					ASSERT(vm_page_all_valid(m));
+					vm_page_sunbusy(m);
+					goto out;
+				}
+			} else {
+				m = ma[index - first];
+				if (m == bogus_page)
+					continue;
+				vm_page_assert_xbusied(m);
+				ASSERT(vm_page_none_valid(m));
+			}
+			ASSERT0(m->dirty);
+			ASSERT(!pmap_page_is_write_mapped(m));
+			struct sf_buf *sf;
+			caddr_t va = zfs_map_page(m, &sf);
+			size_t bytes = MIN(PAGE_SIZE, take - pos);
+			memcpy(va, (uint8_t *)buffer + pos, bytes);
+			if (bytes < PAGE_SIZE)
+				memset(va + bytes, 0, PAGE_SIZE - bytes);
+			zfs_unmap_page(sf);
+			vm_page_valid(m);
+			if (optional) {
+				if ((m->busy_lock & VPB_BIT_WAITERS) != 0)
+					vm_page_activate(m);
+				else
+					vm_page_deactivate(m);
+				vm_page_sunbusy(m);
+				(*rahead)++;
+			}
+		}
+		offset += take;
+	}
+out:
+	zfs_chunkdedup_stage_release(ZTOZSB(zp), &stage, error == 0);
+	return (error);
+}
+
 static int
 zfs_getpages(struct vnode *vp, vm_page_t *ma, int count, int *rbehind,
     int *rahead)
@@ -4247,13 +4368,16 @@ zfs_getpages(struct vnode *vp, vm_page_t *ma, int count, int *rbehind,
 	}
 
 	pgsin_b = 0;
-	if (rbehind != NULL) {
+	boolean_t chunked = zfs_chunkdedup_active(zp);
+	if (rbehind != NULL &&
+	    (!chunked || blksz <= ZFS_CHUNKDEDUP_MAX_RECORD)) {
 		pgsin_b = OFF_TO_IDX(start - rounddown(start, blksz));
 		pgsin_b = MIN(*rbehind, pgsin_b);
 	}
 
 	pgsin_a = 0;
-	if (rahead != NULL) {
+	if (rahead != NULL &&
+	    (!chunked || blksz <= ZFS_CHUNKDEDUP_MAX_RECORD)) {
 		pgsin_a = OFF_TO_IDX(roundup(end, blksz) - end);
 		if (end + IDX_TO_OFF(pgsin_a) >= obj_size)
 			pgsin_a = OFF_TO_IDX(round_page(obj_size) - end);
@@ -4266,6 +4390,7 @@ zfs_getpages(struct vnode *vp, vm_page_t *ma, int count, int *rbehind,
 	 * ZFS will panic if we request DMU to read beyond the end of the last
 	 * allocated block.
 	 */
+	error = 0;
 	for (int i = 0; i < count; i++) {
 		int dummypgsin, count1, j, last_size;
 
@@ -4283,10 +4408,15 @@ zfs_getpages(struct vnode *vp, vm_page_t *ma, int count, int *rbehind,
 		dummypgsin = 0;
 		last_size = j == count ?
 		    MIN(end, obj_size) - (end - PAGE_SIZE) : PAGE_SIZE;
-		error = dmu_read_pages(zfsvfs->z_os, zp->z_id, &ma[i], count1,
-		    i == 0 ? &pgsin_b : &dummypgsin,
-		    j == count ? &pgsin_a : &dummypgsin,
-		    last_size);
+		if (chunked) {
+			error = zfs_chunkdedup_read_pages(zp, &ma[i], count1,
+			    i == 0 ? &pgsin_b : &dummypgsin,
+			    j == count ? &pgsin_a : &dummypgsin, last_size);
+		} else {
+			error = dmu_read_pages(zfsvfs->z_os, zp->z_id,
+			    &ma[i], count1, i == 0 ? &pgsin_b : &dummypgsin,
+			    j == count ? &pgsin_a : &dummypgsin, last_size);
+		}
 		if (error != 0)
 			break;
 		i += count1 - 1;
@@ -4455,14 +4585,30 @@ zfs_putpages(struct vnode *vp, vm_page_t *ma, size_t len, int flags,
 		goto out;
 	}
 
+	zfs_chunkdedup_lock(zfsvfs);
 	tx = dmu_tx_create(zfsvfs->z_os);
 	dmu_tx_hold_write(tx, zp->z_id, off, len);
+
+	err = zfs_chunkdedup_hold_hydrate(zp, off, len, tx);
+	if (err != 0) {
+		dmu_tx_abort(tx);
+		zfs_chunkdedup_unlock(zfsvfs);
+		goto out;
+	}
 
 	dmu_tx_hold_sa(tx, zp->z_sa_hdl, B_FALSE);
 	zfs_sa_upgrade_txholds(tx, zp);
 	err = dmu_tx_assign(tx, DMU_TX_WAIT);
 	if (err != 0) {
 		dmu_tx_abort(tx);
+		zfs_chunkdedup_unlock(zfsvfs);
+		goto out;
+	}
+
+	err = zfs_chunkdedup_hydrate(zp, off, len, tx);
+	if (err != 0) {
+		dmu_tx_commit(tx);
+		zfs_chunkdedup_unlock(zfsvfs);
 		goto out;
 	}
 
@@ -4540,6 +4686,7 @@ zfs_putpages(struct vnode *vp, vm_page_t *ma, size_t len, int flags,
 		VM_CNT_ADD(v_vnodepgsout, ncount);
 	}
 	dmu_tx_commit(tx);
+	zfs_chunkdedup_unlock(zfsvfs);
 
 out:
 	zfs_rangelock_exit(lr);

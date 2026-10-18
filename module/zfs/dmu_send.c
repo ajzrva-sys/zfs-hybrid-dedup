@@ -2015,6 +2015,9 @@ setup_featureflags(struct dmu_send_params *dspp, objset_t *os,
 		*featureflags |= DMU_BACKUP_FEATURE_LARGE_DNODE;
 	}
 
+	if (dsl_dataset_feature_is_active(to_ds, SPA_FEATURE_CHUNKDEDUP))
+		*featureflags |= DMU_BACKUP_FEATURE_CHUNKDEDUP;
+
 	if (dsl_dataset_feature_is_active(to_ds, SPA_FEATURE_LONGNAME)) {
 		*featureflags |= DMU_BACKUP_FEATURE_LONGNAME;
 	}

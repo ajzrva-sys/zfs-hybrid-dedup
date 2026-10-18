@@ -67,6 +67,9 @@ extern "C" {
  */
 #define	ZFS_PROJID		0x0000800000000000ull
 
+/* Internal: logical records reference experimental immutable chunk objects. */
+#define	ZFS_CHUNKDEDUP		0x0001000000000000ull
+
 #define	ZFS_ATTR_SET(zp, attr, value, pflags, tx) \
 { \
 	if (value) \
