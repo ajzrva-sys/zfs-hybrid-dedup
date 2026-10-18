@@ -1,0 +1,22 @@
+{
+  "status": "PASS",
+  "checked_at": "2026-10-09T20:26:31.213964+00:00",
+  "scope": "Fresh verification of this source-only bundle in a separate scratch copy; no native kernel or guest claim",
+  "no_dotnet_checks": [
+    "portable C compiler -std=c11 -Wall -Wextra -Werror",
+    "public C API lifecycle, cancellation and capacity checks",
+    "35 original-C# fixture outputs and independent SHA-512 checks"
+  ],
+  "optional_oracle_checks": {
+    "sdk": "8.0.425 osx-arm64",
+    "build": "PASS; unchanged Microsoft sources; two existing nullable warnings (CS8629, CS8604), zero errors",
+    "fixture_rechecks": 35,
+    "certificate_generation_suppressed": true
+  },
+  "excluded": [
+    "downloaded SDK",
+    "compiled binaries and object files",
+    "build caches and debug bundles",
+    "large generated result streams"
+  ]
+}

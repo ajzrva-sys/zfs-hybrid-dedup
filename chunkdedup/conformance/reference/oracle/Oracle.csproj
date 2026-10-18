@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType><TargetFramework>net8.0</TargetFramework>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks><Nullable>enable</Nullable>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+    <NoWarn>SYSLIB0021;SYSLIB0045</NoWarn>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="Program.cs"/><Compile Include="Shims.cs"/>
+    <Compile Include="../RegressionChunking.cs"/>
+    <Compile Include="../Rabin64Table.cs"/>
+    <Compile Include="../DedupBasicChunkInfo.cs"/>
+    <Compile Include="../DedupChunkCutType.cs"/>
+    <Compile Include="../DeterministicChunker.cs"/>
+    <Compile Include="../ManagedChunker.cs"/>
+    <Compile Include="../ChunkerConfiguration.cs"/>
+    <Compile Include="../ChunkInfo.cs"/>
+    <Compile Include="../IChunker.cs"/>
+    <Compile Include="../INonDeterministicChunker.cs"/>
+  </ItemGroup>
+</Project>

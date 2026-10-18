@@ -1,0 +1,91 @@
+{
+  "repository": "https://github.com/microsoft/BuildXL",
+  "commit": "852a00e5b45ef8a8d06a2eb9040495c36243078f",
+  "license": "MIT",
+  "sources": [
+    {
+      "file": "RegressionChunking.cs",
+      "source_path": "Public/Src/Cache/ContentStore/Hashing/Chunking/RegressionChunking.cs",
+      "url": "https://raw.githubusercontent.com/microsoft/BuildXL/852a00e5b45ef8a8d06a2eb9040495c36243078f/Public/Src/Cache/ContentStore/Hashing/Chunking/RegressionChunking.cs",
+      "sha256": "109b0ba5b66145828b05ecf3e3ea17ffbe8fe499ee5612bc9f0f6c7ebd13a7a2"
+    },
+    {
+      "file": "Rabin64Table.cs",
+      "source_path": "Public/Src/Cache/ContentStore/Hashing/Chunking/Rabin64Table.cs",
+      "url": "https://raw.githubusercontent.com/microsoft/BuildXL/852a00e5b45ef8a8d06a2eb9040495c36243078f/Public/Src/Cache/ContentStore/Hashing/Chunking/Rabin64Table.cs",
+      "sha256": "393ac8b8c55791e5b349733c1257b181928b8aac7ff52a50297244ef5e19007e"
+    },
+    {
+      "file": "DedupBasicChunkInfo.cs",
+      "source_path": "Public/Src/Cache/ContentStore/Hashing/Chunking/DedupBasicChunkInfo.cs",
+      "url": "https://raw.githubusercontent.com/microsoft/BuildXL/852a00e5b45ef8a8d06a2eb9040495c36243078f/Public/Src/Cache/ContentStore/Hashing/Chunking/DedupBasicChunkInfo.cs",
+      "sha256": "7111dd23cf66de15fc1f8a7a19753af86716a825e1c071671ea6c6757e1cb7c9"
+    },
+    {
+      "file": "DedupChunkCutType.cs",
+      "source_path": "Public/Src/Cache/ContentStore/Hashing/Chunking/DedupChunkCutType.cs",
+      "url": "https://raw.githubusercontent.com/microsoft/BuildXL/852a00e5b45ef8a8d06a2eb9040495c36243078f/Public/Src/Cache/ContentStore/Hashing/Chunking/DedupChunkCutType.cs",
+      "sha256": "4c479b55dacbfd05a3f06053c9ed6ea76c3a69fa0a56a71497ee617b4650315e"
+    },
+    {
+      "file": "DeterministicChunker.cs",
+      "source_path": "Public/Src/Cache/ContentStore/Hashing/DeterministicChunker.cs",
+      "url": "https://raw.githubusercontent.com/microsoft/BuildXL/852a00e5b45ef8a8d06a2eb9040495c36243078f/Public/Src/Cache/ContentStore/Hashing/DeterministicChunker.cs",
+      "sha256": "69809eb1ff864c3a7ecaab67e8d7681dfa88342c566d2e53e9c8194673a0b16d"
+    },
+    {
+      "file": "ManagedChunker.cs",
+      "source_path": "Public/Src/Cache/ContentStore/Hashing/ManagedChunker.cs",
+      "url": "https://raw.githubusercontent.com/microsoft/BuildXL/852a00e5b45ef8a8d06a2eb9040495c36243078f/Public/Src/Cache/ContentStore/Hashing/ManagedChunker.cs",
+      "sha256": "7e3b5d1f2c6de38d16b97ba3f532bdcaaa418910a7daa8a8d4e367b779e262a6"
+    },
+    {
+      "file": "ChunkerConfiguration.cs",
+      "source_path": "Public/Src/Cache/ContentStore/Hashing/ChunkerConfiguration.cs",
+      "url": "https://raw.githubusercontent.com/microsoft/BuildXL/852a00e5b45ef8a8d06a2eb9040495c36243078f/Public/Src/Cache/ContentStore/Hashing/ChunkerConfiguration.cs",
+      "sha256": "54aaeff2e3f8d3d683cd3c93b30b591652b71637d489144efad7e926b6283855"
+    },
+    {
+      "file": "ChunkInfo.cs",
+      "source_path": "Public/Src/Cache/ContentStore/Hashing/ChunkInfo.cs",
+      "url": "https://raw.githubusercontent.com/microsoft/BuildXL/852a00e5b45ef8a8d06a2eb9040495c36243078f/Public/Src/Cache/ContentStore/Hashing/ChunkInfo.cs",
+      "sha256": "d595f9b0913988cdd435cb512195d4519a251ed05db79d5d7321fb8976609a47"
+    },
+    {
+      "file": "IChunker.cs",
+      "source_path": "Public/Src/Cache/ContentStore/Hashing/IChunker.cs",
+      "url": "https://raw.githubusercontent.com/microsoft/BuildXL/852a00e5b45ef8a8d06a2eb9040495c36243078f/Public/Src/Cache/ContentStore/Hashing/IChunker.cs",
+      "sha256": "5c6d0566eff8e446b651c2accc9e39789ca212d077f3f28829e4c185e386ca2e"
+    },
+    {
+      "file": "INonDeterministicChunker.cs",
+      "source_path": "Public/Src/Cache/ContentStore/Hashing/INonDeterministicChunker.cs",
+      "url": "https://raw.githubusercontent.com/microsoft/BuildXL/852a00e5b45ef8a8d06a2eb9040495c36243078f/Public/Src/Cache/ContentStore/Hashing/INonDeterministicChunker.cs",
+      "sha256": "21d06893db083557250596491fd66736f2d33565e27556ae225e8f503c001b4b"
+    },
+    {
+      "file": "DedupChunkHashAlgorithm.cs",
+      "source_path": "Public/Src/Cache/ContentStore/Hashing/DedupChunkHashAlgorithm.cs",
+      "url": "https://raw.githubusercontent.com/microsoft/BuildXL/852a00e5b45ef8a8d06a2eb9040495c36243078f/Public/Src/Cache/ContentStore/Hashing/DedupChunkHashAlgorithm.cs",
+      "sha256": "b4f201832267c2e6fdd72b15f63d8c888982654028fd74f0dffc9c20540ebeef"
+    },
+    {
+      "file": "DedupNode.cs",
+      "source_path": "Public/Src/Cache/ContentStore/Hashing/DedupNode.cs",
+      "url": "https://raw.githubusercontent.com/microsoft/BuildXL/852a00e5b45ef8a8d06a2eb9040495c36243078f/Public/Src/Cache/ContentStore/Hashing/DedupNode.cs",
+      "sha256": "fbea1d7a94d95a76eac6a8326581507ff1adc837dfe3db2d1d496bb79dec9144"
+    },
+    {
+      "file": "DedupNodeContentHasherTests.cs",
+      "source_path": "Public/Src/Cache/ContentStore/InterfacesTest/Hashing/DedupNodeContentHasherTests.cs",
+      "url": "https://raw.githubusercontent.com/microsoft/BuildXL/852a00e5b45ef8a8d06a2eb9040495c36243078f/Public/Src/Cache/ContentStore/InterfacesTest/Hashing/DedupNodeContentHasherTests.cs",
+      "sha256": "77d8e36a123f5a02f261e7b9554c1408bef20e0702f4bd029a0b5bbca06dc07b"
+    },
+    {
+      "file": "../chunker/LICENSE",
+      "source_path": "LICENSE",
+      "url": "https://raw.githubusercontent.com/microsoft/BuildXL/852a00e5b45ef8a8d06a2eb9040495c36243078f/LICENSE",
+      "sha256": "88dc396a6da58d834a863fe88a832c268e29d41c3c0419354d4eb7923973c77f"
+    }
+  ]
+}

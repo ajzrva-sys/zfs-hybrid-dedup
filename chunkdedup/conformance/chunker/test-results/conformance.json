@@ -1,0 +1,359 @@
+{
+  "status": "PASS",
+  "tests": 65,
+  "elapsed_seconds": 34.282,
+  "oracle": "original pinned Microsoft C# ManagedChunker + DeterministicChunker + RegressionChunking",
+  "details": [
+    {
+      "test": "microsoft_published",
+      "seed": 0,
+      "size": 0,
+      "chunks": 0
+    },
+    {
+      "test": "microsoft_published",
+      "seed": 0,
+      "size": 1,
+      "chunks": 1
+    },
+    {
+      "test": "microsoft_published",
+      "seed": 0,
+      "size": 32767,
+      "chunks": 1
+    },
+    {
+      "test": "microsoft_published",
+      "seed": 0,
+      "size": 32768,
+      "chunks": 1
+    },
+    {
+      "test": "microsoft_published",
+      "seed": 0,
+      "size": 32769,
+      "chunks": 1
+    },
+    {
+      "test": "microsoft_published",
+      "seed": 0,
+      "size": 65535,
+      "chunks": 1
+    },
+    {
+      "test": "microsoft_published",
+      "seed": 0,
+      "size": 65536,
+      "chunks": 2
+    },
+    {
+      "test": "microsoft_published",
+      "seed": 0,
+      "size": 65537,
+      "chunks": 2
+    },
+    {
+      "test": "microsoft_published",
+      "seed": 0,
+      "size": 131071,
+      "chunks": 2
+    },
+    {
+      "test": "microsoft_published",
+      "seed": 0,
+      "size": 131072,
+      "chunks": 2
+    },
+    {
+      "test": "microsoft_published",
+      "seed": 0,
+      "size": 131073,
+      "chunks": 2
+    },
+    {
+      "test": "microsoft_published",
+      "seed": 0,
+      "size": 524287,
+      "chunks": 8
+    },
+    {
+      "test": "microsoft_published",
+      "seed": 0,
+      "size": 524288,
+      "chunks": 8
+    },
+    {
+      "test": "microsoft_published",
+      "seed": 0,
+      "size": 524289,
+      "chunks": 7
+    },
+    {
+      "test": "microsoft_published",
+      "seed": 0,
+      "size": 1048575,
+      "chunks": 14
+    },
+    {
+      "test": "microsoft_published",
+      "seed": 0,
+      "size": 1048576,
+      "chunks": 15
+    },
+    {
+      "test": "microsoft_published",
+      "seed": 0,
+      "size": 1048577,
+      "chunks": 13
+    },
+    {
+      "test": "microsoft_published",
+      "seed": 0,
+      "size": 2097151,
+      "chunks": 28
+    },
+    {
+      "test": "microsoft_published",
+      "seed": 0,
+      "size": 2097152,
+      "chunks": 24
+    },
+    {
+      "test": "microsoft_published",
+      "seed": 0,
+      "size": 2097153,
+      "chunks": 27
+    },
+    {
+      "test": "seeded",
+      "seed": 69519,
+      "size": 1254972,
+      "chunks": 14
+    },
+    {
+      "test": "seeded",
+      "seed": 0,
+      "size": 8388608,
+      "chunks": 86
+    },
+    {
+      "test": "empty",
+      "size": 0,
+      "chunks": 0
+    },
+    {
+      "test": "tiny-zeros",
+      "size": 15,
+      "chunks": 1
+    },
+    {
+      "test": "tiny-nonzero",
+      "size": 5,
+      "chunks": 1
+    },
+    {
+      "test": "zeros",
+      "size": 2097275,
+      "chunks": 17
+    },
+    {
+      "test": "ff",
+      "size": 2097169,
+      "chunks": 17
+    },
+    {
+      "test": "ascending",
+      "size": 2097158,
+      "chunks": 17
+    },
+    {
+      "test": "zero-transition",
+      "size": 1212418,
+      "chunks": 11
+    },
+    {
+      "test": "window-transition",
+      "size": 163856,
+      "chunks": 2
+    },
+    {
+      "test": "stream_segmentation",
+      "fixture": "microsoft-seed0-2097153",
+      "read_size": 1
+    },
+    {
+      "test": "stream_segmentation",
+      "fixture": "microsoft-seed0-2097153",
+      "read_size": 15
+    },
+    {
+      "test": "stream_segmentation",
+      "fixture": "microsoft-seed0-2097153",
+      "read_size": 16
+    },
+    {
+      "test": "stream_segmentation",
+      "fixture": "microsoft-seed0-2097153",
+      "read_size": 17
+    },
+    {
+      "test": "stream_segmentation",
+      "fixture": "microsoft-seed0-2097153",
+      "read_size": 4093
+    },
+    {
+      "test": "stream_segmentation",
+      "fixture": "microsoft-seed0-2097153",
+      "read_size": 32768
+    },
+    {
+      "test": "stream_segmentation",
+      "fixture": "microsoft-seed0-2097153",
+      "read_size": 65536
+    },
+    {
+      "test": "stream_segmentation",
+      "fixture": "microsoft-seed0-2097153",
+      "read_size": 1048575
+    },
+    {
+      "test": "stream_segmentation",
+      "fixture": "microsoft-seed0-2097153",
+      "read_size": 1048576
+    },
+    {
+      "test": "stream_segmentation",
+      "fixture": "microsoft-seed0-2097153",
+      "read_size": 16777216
+    },
+    {
+      "test": "stream_segmentation",
+      "fixture": "zero-transition",
+      "read_size": 1
+    },
+    {
+      "test": "stream_segmentation",
+      "fixture": "zero-transition",
+      "read_size": 15
+    },
+    {
+      "test": "stream_segmentation",
+      "fixture": "zero-transition",
+      "read_size": 16
+    },
+    {
+      "test": "stream_segmentation",
+      "fixture": "zero-transition",
+      "read_size": 17
+    },
+    {
+      "test": "stream_segmentation",
+      "fixture": "zero-transition",
+      "read_size": 4093
+    },
+    {
+      "test": "stream_segmentation",
+      "fixture": "zero-transition",
+      "read_size": 32768
+    },
+    {
+      "test": "stream_segmentation",
+      "fixture": "zero-transition",
+      "read_size": 65536
+    },
+    {
+      "test": "stream_segmentation",
+      "fixture": "zero-transition",
+      "read_size": 1048575
+    },
+    {
+      "test": "stream_segmentation",
+      "fixture": "zero-transition",
+      "read_size": 1048576
+    },
+    {
+      "test": "stream_segmentation",
+      "fixture": "zero-transition",
+      "read_size": 16777216
+    },
+    {
+      "test": "stream_segmentation",
+      "fixture": "ff",
+      "read_size": 1
+    },
+    {
+      "test": "stream_segmentation",
+      "fixture": "ff",
+      "read_size": 15
+    },
+    {
+      "test": "stream_segmentation",
+      "fixture": "ff",
+      "read_size": 16
+    },
+    {
+      "test": "stream_segmentation",
+      "fixture": "ff",
+      "read_size": 17
+    },
+    {
+      "test": "stream_segmentation",
+      "fixture": "ff",
+      "read_size": 4093
+    },
+    {
+      "test": "stream_segmentation",
+      "fixture": "ff",
+      "read_size": 32768
+    },
+    {
+      "test": "stream_segmentation",
+      "fixture": "ff",
+      "read_size": 65536
+    },
+    {
+      "test": "stream_segmentation",
+      "fixture": "ff",
+      "read_size": 1048575
+    },
+    {
+      "test": "stream_segmentation",
+      "fixture": "ff",
+      "read_size": 1048576
+    },
+    {
+      "test": "stream_segmentation",
+      "fixture": "ff",
+      "read_size": 16777216
+    },
+    {
+      "test": "partial_regression",
+      "strength": 1,
+      "cut_type": 7,
+      "size": 131072
+    },
+    {
+      "test": "partial_regression",
+      "strength": 2,
+      "cut_type": 8,
+      "size": 131072
+    },
+    {
+      "test": "partial_regression",
+      "strength": 3,
+      "cut_type": 9,
+      "size": 131072
+    },
+    {
+      "test": "partial_regression",
+      "strength": 4,
+      "cut_type": 10,
+      "size": 131072
+    },
+    {
+      "test": "large_stream",
+      "size": 5368709243,
+      "chunks": 81921
+    }
+  ]
+}

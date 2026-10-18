@@ -1,0 +1,11 @@
+{
+  "type": "object",
+  "properties": {
+    "diagnosis": {"type": "string"},
+    "hypothesis": {"type": "string"},
+    "evidence": {"type": "array", "items": {"type": "object", "properties": {"stage": {"type": "string", "enum": ["source_freeze", "static_analysis", "baseline_integrity", "toolchain", "chunker_api", "microsoft_conformance", "core_model", "worker_batches", "packaging", "guest_build", "guest_module_load", "guest_provenance", "guest_regression", "evidence_capture", "guest_restore", "host_restore", "host_state_compare"]}, "quote": {"type": "string"}}, "required": ["stage", "quote"], "additionalProperties": false}},
+    "patch": {"type": "string"}
+  },
+  "required": ["diagnosis", "hypothesis", "evidence", "patch"],
+  "additionalProperties": false
+}

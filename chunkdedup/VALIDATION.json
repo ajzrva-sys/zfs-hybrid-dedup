@@ -1,0 +1,194 @@
+{
+  "schema": 1,
+  "scope": "Public summary of saved validation, not raw host logs or independent attestation",
+  "tested_source_digest": "90ce02dca5f0da9148af08d93f6a517265e9396b91b3bb9f9b24197ced144faf",
+  "implementation_commit": "dc5117ed63ceadc7cbc479db725dfc633ad46d77",
+  "local_evaluation": {
+    "schema": 1,
+    "run_id": "20261017t235222z-2671604f-a0",
+    "profile": "local",
+    "status": "PASS",
+    "source_digest": "90ce02dca5f0da9148af08d93f6a517265e9396b91b3bb9f9b24197ced144faf",
+    "policy_id": "native-chunkdedup-prototype-v1",
+    "evaluated_at": "2026-10-17T23:52:33.591024+00:00",
+    "artifact_digests_checked": 189,
+    "assessments": {
+      "source_files_verified": 4134,
+      "immutable_baseline_files_verified": 141,
+      "conformance_fixtures_verified": 35
+    },
+    "feedback": [],
+    "claim": "local models/conformance only"
+  },
+  "native_evaluation": {
+    "schema": 1,
+    "run_id": "20261017t235237z-1c24e42b-a0",
+    "profile": "native",
+    "status": "TEST_FAILURE",
+    "source_digest": "90ce02dca5f0da9148af08d93f6a517265e9396b91b3bb9f9b24197ced144faf",
+    "policy_id": "native-chunkdedup-prototype-v1",
+    "evaluated_at": "2026-10-18T00:04:25.012731+00:00",
+    "artifact_digests_checked": 224,
+    "assessments": {
+      "source_files_verified": 4134,
+      "immutable_baseline_files_verified": 141,
+      "conformance_fixtures_verified": 35
+    },
+    "feedback": [
+      {
+        "category": "TEST_FAILURE",
+        "stage": "guest_regression",
+        "rule": "executed_test_failed",
+        "observed": {
+          "returncode": 1,
+          "log": "native/guest_regression.log"
+        },
+        "expected": "all required assertions pass",
+        "action": "Diagnose the observed log and repair only implementation source."
+      }
+    ],
+    "claim": "validation incomplete; no current native pass claim"
+  },
+  "legacy_checks": [
+    {
+      "name": "guest guard and helper build",
+      "passed": true
+    },
+    {
+      "name": "isolated pools and bounded datasets",
+      "passed": true
+    },
+    {
+      "name": "deterministic mixed fixtures",
+      "passed": true
+    },
+    {
+      "name": "sharing, saved physical space and metadata",
+      "passed": true
+    },
+    {
+      "name": "cold native read paths",
+      "passed": true
+    },
+    {
+      "name": "foreground logical read and memory metrics",
+      "passed": true
+    },
+    {
+      "name": "partial writes, mmap writes and idempotent reoptimization",
+      "passed": true
+    },
+    {
+      "name": "rename, hardlink and open-unlinked lifecycle",
+      "passed": true
+    },
+    {
+      "name": "truncate, partial EOF append, extension and sparse data",
+      "passed": true
+    },
+    {
+      "name": "age, busy file, property, quota and export admission",
+      "passed": true
+    },
+    {
+      "name": "tiny files and 40-100 KiB partial EOF records",
+      "passed": true
+    },
+    {
+      "name": "atime-on conversion preserves file timestamps and metadata",
+      "passed": true
+    },
+    {
+      "name": "sparse extents and bounded physical hole allocation",
+      "passed": true
+    },
+    {
+      "name": "background watching and writable mmap races",
+      "passed": true
+    },
+    {
+      "name": "short tails crossing 1 MiB conversion batches",
+      "passed": true
+    },
+    {
+      "name": "interrupted conversion and resumable mixed mappings",
+      "passed": true
+    },
+    {
+      "name": "debug-only collision comparator and corrupt mapping rejection",
+      "passed": true
+    },
+    {
+      "name": "snapshot, clone independence and logical copy",
+      "passed": true
+    },
+    {
+      "name": "full/incremental replication and receiver feature rejection",
+      "passed": true
+    },
+    {
+      "name": "unoptimization, live reference GC and snapshot retention",
+      "passed": true
+    },
+    {
+      "name": "quota exhaustion preserves logical reads",
+      "passed": true
+    }
+  ],
+  "hybrid_checks": [
+    {
+      "name": "hybrid CLI contracts and forced methods",
+      "passed": true
+    },
+    {
+      "name": "native exact sharing preserves metadata and COW",
+      "passed": true
+    },
+    {
+      "name": "automatic unique data stays native",
+      "passed": true
+    },
+    {
+      "name": "automatic shifted cohort selects chunking",
+      "passed": true
+    },
+    {
+      "name": "native sparse tails and incompatible geometry",
+      "passed": true
+    },
+    {
+      "name": "verified sharing rejects stale unequal and busy ranges",
+      "passed": true
+    },
+    {
+      "name": "native peers and snapshots survive CDC conversion",
+      "passed": true
+    },
+    {
+      "name": "existing CDC resume and explicit restoration",
+      "passed": true
+    },
+    {
+      "name": "automatic background watching shares native blocks",
+      "passed": true
+    },
+    {
+      "name": "interrupted CDC conversion resumes through automatic mode",
+      "passed": true
+    },
+    {
+      "name": "exhausted quota preserves content during conversion",
+      "passed": true
+    },
+    {
+      "name": "hybrid snapshots clones and logical replication",
+      "passed": false
+    }
+  ],
+  "remaining_failure": "Final hybrid replication harness tried to mount an already mounted received filesystem. Received content and hybrid incremental assertions were not reached.",
+  "matched_performance": "NOT_RUN",
+  "memory_comparison": "NOT_RUN",
+  "planned_power_loss": "NOT_RUN",
+  "foreground_read_target": 1.25,
+  "lab_restored_and_stopped": true
+}

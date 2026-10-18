@@ -1,71 +1,76 @@
-![img](https://openzfs.github.io/openzfs-docs/_static/img/logo/480px-Open-ZFS-Secondary-Logo-Colour-halfsize.png)
+# ZFS hybrid background deduplication
 
-OpenZFS is an advanced file system and volume manager which was originally
-developed for Solaris and is now maintained by the OpenZFS community.
-This repository contains the code for running OpenZFS on Linux and FreeBSD.
+An experimental FreeBSD-first OpenZFS 2.4.4 fork that writes files normally,
+then deduplicates them in the background using native block sharing or
+content-defined chunking (CDC).
 
-[![codecov](https://codecov.io/gh/openzfs/zfs/branch/master/graph/badge.svg)](https://codecov.io/gh/openzfs/zfs)
-[![coverity](https://scan.coverity.com/projects/1973/badge.svg)](https://scan.coverity.com/projects/openzfs-zfs)
+Native block sharing is preferred. Automatic mode selects CDC only when its
+conservative estimated live allocation is at least 20% lower. One method is
+selected per file; existing chunked files retain their format.
 
-# Official Resources
+## Current status
 
-  * [Documentation](https://openzfs.github.io/openzfs-docs/) - for using and developing this repo
-  * [ZoL site](https://zfsonlinux.org) - Linux release info & links
-  * [Mailing lists](https://openzfs.github.io/openzfs-docs/Project%20and%20Community/Mailing%20Lists.html)
-  * [OpenZFS site](https://openzfs.org/) - for conference videos and info on other platforms (illumos, OSX, Windows, etc)
+The native code compiled and loaded in an isolated FreeBSD VM. **21/21 existing
+regression cases and 11/12 hybrid cases passed.** The final hybrid replication
+test stopped on a harness error: it tried to mount an already mounted received
+filesystem. The full native gate remains **TEST_FAILURE**. Received-content
+and hybrid incremental-replication assertions remain incomplete.
 
-# Installation
+Current-revision matched physical-allocation, pure-read and RAM comparisons,
+and planned forced-power-loss validation, have **not run**. The foreground-read
+target remains 1.25x pristine latency. This is a development prototype; run
+experimental modules only inside a disposable guest.
 
-Full documentation for installing OpenZFS on your favorite operating system can
-be found at the [Getting Started Page](https://openzfs.github.io/openzfs-docs/Getting%20Started/index.html).
+See [validation status](chunkdedup/STATUS.md), [saved validation summary](chunkdedup/VALIDATION.json)
+and [command/design documentation](chunkdedup/HYBRID.md).
 
-# Contribute & Develop
+## What is implemented
 
-We have a separate document with [contribution guidelines](./.github/CONTRIBUTING.md).
+- `zfs chunkdedup optimize` and `watch` accept `--method=auto|block|chunk`;
+  automatic selection is the default.
+- Native sharing compares current bytes, validates identities and excludes
+  competing opens/mappings, then shares ordinary blocks through BRT accounting.
+- CDC preserves the Microsoft-derived regression chunker, chunk identifiers,
+  immutable chunk objects and existing on-disk format.
+- The worker analyzes the traversal before conversion, with temporary disk
+  catalogs, bounded memory, allocation estimates and conservative fallbacks.
+- `status --methods` reports per-file representation and labeled pool-wide BRT
+  statistics. Plain six-field status remains compatible.
 
-We have a [Code of Conduct](./CODE_OF_CONDUCT.md).
+## Verify locally
 
-# Release
+Requirements: Python 3.9+, Git, Clang with working ASan/UBSan, and OpenSSL
+headers/libraries (for example `libssl-dev` on Debian/Ubuntu).
 
-OpenZFS is released under a CDDL license.
-For more details see the NOTICE, LICENSE and COPYRIGHT files; `UCRL-CODE-235197`
+```sh
+git clone https://github.com/ajzrva-sys/zfs-hybrid-dedup.git
+cd zfs-hybrid-dedup
+./scripts/verify.sh --output ../hybrid-verification
+```
 
-# Supported Kernels and Distributions
+This checks source integrity, pinned Microsoft fixtures, the actual chunker,
+the native core model, worker batching, selection policy and packaging.
+Local checks do not load a kernel module or prove native filesystem behavior.
+Generated evidence belongs outside this checkout. For native reproduction,
+read the [guarded offline lab recipe](chunkdedup/lab-setup/README.md).
 
-## Linux
+## Source and provenance
 
-Given the wide variety of Linux environments, we prioritize development and testing on stable, supported kernels and distributions.
+The fork is based on upstream [`zfs-2.4.4`](https://github.com/openzfs/zfs/commit/71a9f9578616a90c3c14bb59629fb4d31bfd68d1).
+The first feature commit exactly matches the 4,134-file tested source snapshot;
+its digest and file manifest are in [SOURCE.json](chunkdedup/SOURCE.json) and
+[tested-source-files.json](chunkdedup/tested-source-files.json). Later publication
+changes add documentation, tests and a portable verification wrapper. They do
+not change the native implementation.
 
-### Kernel ([kernel.org](https://kernel.org))
+The complete [source patch](chunkdedup/source.patch) applies to the pinned
+upstream base. The [original upstream README](chunkdedup/upstream/README.md)
+is preserved. Microsoft BuildXL chunker provenance is pinned to commit
+`852a00e5b45ef8a8d06a2eb9040495c36243078f` in the conformance bundle.
 
-All **longterm** kernels from [kernel.org](https://kernel.org) are supported. **stable** kernels are usually supported in the next OpenZFS release.
+## Licensing
 
-**Supported longterm kernels**: **6.18**, **6.12**, **6.6**, **6.1**, **5.15**, **5.10**.
-
-### Red Hat Enterprise Linux (RHEL)
-
-All RHEL (and compatible systems: AlmaLinux OS, Rocky Linux, etc) on the **full** or **maintenance** support tracks are supported.
-
-**Supported RHEL releases**: **8.10**, **9.7**, **10.1**.
-
-### Ubuntu
-
-All Ubuntu **LTS** releases are supported.
-
-**Supported Ubuntu releases**: **26.04 “Resolute”**, **24.04 “Noble”**, **22.04 “Jammy”**.
-
-### Debian
-
-All Debian **stable** and **LTS** releases are supported.
-
-**Supported Debian releases**: **13 “Trixie”**, **12 “Bookworm”**, **11 “Bullseye”**.
-
-### Other Distributions
-
-Generally, if a distribution is following an LTS kernel, it should work well with OpenZFS.
-
-## FreeBSD
-
-All FreeBSD releases receiving **security support** are supported by OpenZFS.
-
-**Supported FreeBSD releases**: **15.1**, **14.4**.
+Preserve OpenZFS's [LICENSE](LICENSE), [COPYRIGHT](COPYRIGHT), [NOTICE](NOTICE)
+and third-party notices. The Microsoft-derived chunker/tables include their
+[MIT notice](cmd/zfs/CHUNKDEDUP-MIT-LICENSE) and original attribution. Licensing
+is described per file/component; the entire fork is not relicensed under MIT.

@@ -1,0 +1,20 @@
+{
+  "base_revision": "71a9f9578616a90c3c14bb59629fb4d31bfd68d1",
+  "source_digest": "90ce02dca5f0da9148af08d93f6a517265e9396b91b3bb9f9b24197ced144faf",
+  "patch_sha256": "2ff285744ed133ed7020a9c463311d59a001d15008a03a9e77965c959e290e84",
+  "patch_bytes": 241386,
+  "apply_check": {
+    "returncode": 0,
+    "stderr": ""
+  },
+  "native_validation": "TEST_FAILURE",
+  "local_verification": "PASS",
+  "local_run": "20261017t235222z-2671604f-a0",
+  "candidate_module_loaded": true,
+  "new_test_pools_created": true,
+  "lab_stopped": true,
+  "report": "STATUS.md",
+  "native_run": "20261017t235237z-1c24e42b-a0",
+  "implementation_commit": "dc5117ed63ceadc7cbc479db725dfc633ad46d77",
+  "publication_layout": "OpenZFS source at repository root; verification kit in chunkdedup/"
+}

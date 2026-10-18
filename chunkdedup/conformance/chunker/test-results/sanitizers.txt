@@ -1,0 +1,5 @@
+regression_1: offset0 length32768 type7
+regression_2: offset0 length32768 type8
+regression_3: offset0 length32768 type9
+regression_4: offset0 length32768 type10
+API lifecycle, cancellation, bounds and four regression types PASS
