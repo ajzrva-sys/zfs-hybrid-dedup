@@ -1,20 +1,26 @@
 {
+  "schema": 1,
   "base_revision": "71a9f9578616a90c3c14bb59629fb4d31bfd68d1",
-  "source_digest": "90ce02dca5f0da9148af08d93f6a517265e9396b91b3bb9f9b24197ced144faf",
-  "patch_sha256": "2ff285744ed133ed7020a9c463311d59a001d15008a03a9e77965c959e290e84",
-  "patch_bytes": 241386,
+  "source_digest": "833fb482f3675b5ad87e3bbdcb18cca66760de1625ecd219be2c22359724a1ed",
+  "source_file_count": 4138,
+  "patch_sha256": "59a5862ccbb8bbefee067d28cf220f3e82e7ab71c2ca2e63ca1f0b54fd7fb4f1",
+  "patch_bytes": 305637,
   "apply_check": {
     "returncode": 0,
-    "stderr": ""
+    "scope": "Applied to an isolated Git index loaded at the pinned upstream base",
+    "result_tree": "752d7ee2aa98ee2b997edd4ad8210ce3d074b7f3"
   },
-  "native_validation": "TEST_FAILURE",
   "local_verification": "PASS",
-  "local_run": "20261017t235222z-2671604f-a0",
-  "candidate_module_loaded": true,
-  "new_test_pools_created": true,
-  "lab_stopped": true,
-  "report": "STATUS.md",
-  "native_run": "20261017t235237z-1c24e42b-a0",
-  "implementation_commit": "dc5117ed63ceadc7cbc479db725dfc633ad46d77",
-  "publication_layout": "OpenZFS source at repository root; verification kit in chunkdedup/"
+  "latest_full_native_validation": "NOT_RUN",
+  "predecessor_native_validation": {
+    "profile": "native-smoke",
+    "status": "PASS",
+    "source_digest": "98882f3c8618f31f28dcb7208c0909f78eca5290de029a2763749b7a5bc5ebcc",
+    "fresh_build": false,
+    "original_cases": 21,
+    "hybrid_cases": 12
+  },
+  "publication_layout": "OpenZFS source at repository root; verification kit in chunkdedup/",
+  "source_projection": "tested-source-files.json describes the development source snapshot. Its original README.md is preserved as chunkdedup/upstream/README.md; the repository root README and verification wrapper are publication additions.",
+  "report": "STATUS.md"
 }

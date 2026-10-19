@@ -35,6 +35,7 @@ extern "C" {
 void *safe_malloc(size_t size);
 void nomem(void);
 int zfs_do_chunkdedup(int, char **);
+int zfs_do_blockdedup(int, char **);
 extern libzfs_handle_t *g_zfs;
 
 #ifdef	__cplusplus

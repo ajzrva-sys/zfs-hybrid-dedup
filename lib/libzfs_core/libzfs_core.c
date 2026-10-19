@@ -2002,3 +2002,10 @@ lzc_chunkdedup(const char *dataset, nvlist_t *args, nvlist_t **result)
 {
 	return (lzc_ioctl(ZFS_IOC_CHUNKDEDUP, dataset, args, result));
 }
+
+/* Verified ordinary-block sharing; no additional on-disk format. */
+int
+lzc_blockdedup(const char *dataset, nvlist_t *args, nvlist_t **result)
+{
+	return (lzc_ioctl(ZFS_IOC_BLOCKDEDUP, dataset, args, result));
+}

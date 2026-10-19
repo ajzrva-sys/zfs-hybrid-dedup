@@ -354,12 +354,11 @@ if phase=='prepare':
  save('source-before.json',source_check())
  if C['mode']=='smoke':
   B=json.loads(pathlib.Path('/root/lab/workflow/latest-build.json').read_text())
+  assert B==C['build'],'actual cached build differs from frozen receipt'
   assert B['source_digest']==C['source_digest'],'smoke cannot validate changed source'
+  assert P==C['prefix']==B['prefix'],'cached prefix differs from frozen media'
   assert sha(B['module'])==B['module_sha256'] and sha(B['binary'])==B['binary_sha256']
-  oldprefix=P;C['build']=B;C['prefix']=P=B['prefix'];Z=P+'/sbin/zfs';ZP=P+'/sbin/zpool'
-  path=R/'tests/regression.py';text=path.read_text();assert text.count(oldprefix)>0;text=text.replace(oldprefix,P);path.write_text(text)
-  C['adapter']['regression.py']['adapted_sha256']=hashlib.sha256(text.encode()).hexdigest()
-  C['adapter']['regression.py']['substitutions'][1]['to']=P;save('config.json',C)
+  save('build-status.json',B)
 elif phase=='build':
  assert C['mode']=='build'
  # autoreconf honors AUTOPOINT. The bundled gettext helpers are frozen source;
@@ -575,6 +574,24 @@ class Console:
         self.log.close()
 
 
+def cached_build_receipt(path, source_digest):
+    receipt = json.loads(Path(path).read_text())
+    assert isinstance(receipt, dict), 'cached receipt must be an object'
+    assert receipt.get('status') == 'PASS' and receipt.get('phase') == 'complete', 'cached build is not complete/PASS'
+    assert receipt.get('source_digest') == source_digest, 'cached build source differs'
+    run_id = receipt.get('build_run_id', '')
+    assert re.fullmatch(r'[a-z0-9][a-z0-9-]{0,39}', run_id), 'invalid cached build identity'
+    prefix = '/opt/chunkdedup-workflow/' + run_id
+    assert receipt.get('prefix') == prefix, 'cached prefix is not an owned managed prefix'
+    assert receipt.get('binary') == prefix + '/sbin/zfs', 'cached CLI is outside its prefix'
+    assert receipt.get('module') == '/root/lab/workflow/' + run_id + '/source/module/openzfs.ko', 'cached module is outside its build'
+    for key in ('module_sha256', 'binary_sha256'):
+        assert isinstance(receipt.get(key), str) and re.fullmatch('[0-9a-f]{64}', receipt[key]), 'invalid cached artifact hash'
+    assert type(receipt.get('started')) in (int, float) and type(receipt.get('finished')) in (int, float)
+    assert 0 < receipt['started'] <= receipt['finished'], 'invalid cached build interval'
+    return receipt
+
+
 class Runner:
     def __init__(self, args):
         self.args = args
@@ -688,7 +705,8 @@ class Runner:
         manifest = json.loads(self.args.source_manifest.read_text())
         entries = validate_manifest(repo, manifest, self.args.source_digest)
         tests = self.args.kit.resolve() / 'lab-setup/tests'
-        prefix = '/opt/chunkdedup-workflow/' + self.args.run_id
+        cached = cached_build_receipt(self.args.cached_build_receipt, self.args.source_digest) if self.args.mode == 'smoke' else None
+        prefix = cached['prefix'] if cached is not None else '/opt/chunkdedup-workflow/' + self.args.run_id
         adapted, adaptation, cases = adapt_tests(tests, self.args.run_id, self.guest_run, prefix)
         media = self.directory / 'media'
         media.mkdir()
@@ -698,6 +716,8 @@ class Runner:
                   'build_timeout': self.args.build_timeout, 'cases': cases, 'adapter': adaptation,
                   'suite_sha256': adaptation['regression.py']['original_sha256'],
                   'hybrid_tests': {name: file_digest(tests / name) for name in HYBRID_TEST_FILES}}
+        if cached is not None:
+            config['build'] = cached
         atomic_json(media / 'config.json', config)
         atomic_json(media / 'source-files.json', manifest)
         (media / 'native_driver.py').write_text(GUEST_DRIVER)
@@ -945,6 +965,7 @@ def main(argv=None):
     p.add_argument('--source-manifest', type=Path, required=True)
     p.add_argument('--source-digest', required=True)
     p.add_argument('--mode', choices=['build', 'smoke'], default='build')
+    p.add_argument('--cached-build-receipt', type=Path)
     p.add_argument('--build-timeout', type=int, default=3600)
     p.add_argument('--test-timeout', type=int, default=1200)
     args = p.parse_args(argv)
@@ -956,6 +977,15 @@ def main(argv=None):
         p.error('only the explicit retained bsd lab is supported')
     if not 60 <= args.build_timeout <= 7200 or not 60 <= args.test_timeout <= 3600:
         p.error('timeouts must be bounded: build60..7200, test60..3600 seconds')
+    if args.cached_build_receipt and args.mode != 'smoke':
+        p.error('--cached-build-receipt is accepted only in smoke mode')
+    if args.mode == 'smoke':
+        if not args.cached_build_receipt:
+            p.error('smoke mode needs --cached-build-receipt')
+        try:
+            cached_build_receipt(args.cached_build_receipt, args.source_digest)
+        except (OSError, ValueError, AssertionError, KeyError, TypeError) as error:
+            p.error(str(error))
     runner = Runner(args)
     def cancel(signum, frame):
         runner.cancelled = True

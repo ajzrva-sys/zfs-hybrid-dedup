@@ -40,7 +40,7 @@ Create that separate source checkout without changing this branch:
 ```sh
 git worktree add --detach ../hybrid-media-source 71a9f9578616a90c3c14bb59629fb4d31bfd68d1
 git -C ../hybrid-media-source apply "$PWD/chunkdedup/source.patch"
-git -C ../hybrid-media-source add -N cmd/zfs/CHUNKDEDUP-MIT-LICENSE   cmd/zfs/chunkdedup_chunker.c cmd/zfs/chunkdedup_chunker.h   cmd/zfs/rabin64_table.h cmd/zfs/zfs_chunkdedup_user.c   cmd/zfs/chunkdedup_hybrid.c cmd/zfs/chunkdedup_hybrid.h   include/sys/zfs_chunkdedup.h module/zfs/zfs_chunkdedup.c
+git -C ../hybrid-media-source add -N cmd include lib module
 python3 chunkdedup/lab-setup/build-media.py --help
 ```
 
@@ -64,6 +64,20 @@ and separate 12-case hybrid suite, captures evidence, restores the original
 guest module and retained pools, restores the VM configuration, stops the
 lab and compares host state. It never installs a host module.
 
-The latest recorded run remains failed at the final hybrid harness mount.
-The source publication does not repair that test or restart a repair round.
-Crash and matched performance/RAM validation remain separate, incomplete work.
+For a previously compiled, exactly matching source/module/tools set, the runner
+also supports `--profile native-smoke --cached-build-receipt PATH`. The receipt
+and actual cached binaries are checked before testing; reuse is recorded
+explicitly and does not count as a fresh compilation.
+
+The durability-batching predecessor passed all 21 original and 12 hybrid cases
+through that cached-build profile, including guest and host restoration. The
+latest parallel CLI revision passed local and focused strict/sanitizer checks;
+its kernel sources are unchanged from that predecessor. The complete native
+suite was not rerun after this userspace-only update. See [current validation
+scope](../STATUS.md) for source identities and retained failure history.
+
+The one-CPU lab recipe isolates functional testing; it does not measure
+multicore scaling. The hybrid optimizer itself defaults to online CPUs, capped
+at 64, and accepts `--threads=1..64`. The separate block-only command is
+currently serial. Matched performance/RAM and forced-power-loss qualification
+remain incomplete; the 1.25x foreground-read target is unqualified.

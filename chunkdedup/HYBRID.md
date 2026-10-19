@@ -1,9 +1,8 @@
 # Hybrid background deduplication
 
-The hybrid revision adds native block sharing alongside the existing
-Microsoft-derived content-defined chunk format. Verification results for this
-revision belong in its dated hybrid report; historical prototype reports do
-not establish that the new native operation passed.
+The hybrid optimizer combines native block sharing with the Microsoft-derived
+content-defined chunk format. [Validation status](STATUS.md) distinguishes the
+latest parallel CLI checks from its kernel-tested predecessor.
 
 ## Commands and policy
 
@@ -15,6 +14,25 @@ The worker analyzes the complete requested traversal before converting files.
 It uses private temporary on-disk catalogs, a disk-backed grouping/index, and a
 4 MiB external-sort buffer rather than retaining a dataset-sized RAM index.
 Catalogs are rebuilt each pass. Source reads preserve access time.
+
+Scanning and hashing use the online CPU count by default, capped at 64 workers.
+Set `--threads=N` to select 1 through 64 workers:
+
+```sh
+zfs chunkdedup optimize --method=block --threads=16 -r tank/data
+```
+
+At most twice the worker count is admitted at once. Workers own their file
+descriptors, chunkers and private disk-backed output. The coordinator merges
+results in traversal order, assigns global identities and handles hardlinks.
+Cancellation stops admission and joins workers before releasing their resources
+or applying a conversion. Selection and installation remain sequential.
+
+Inspection of durable files avoids a forced sync per file. Dirty candidates
+are queued in same-dataset batches of up to 256, sharing one pool transaction-
+group durability wait. Each is retried once against its saved identity;
+still-dirty, changed or busy files defer. Catalogs remain temporary, including
+in forced block mode; no persistent CDC index is retained.
 
 Files connected by matching chunks or native blocks are costed together. The
 native estimate charges each distinct native block once. The chunk estimate
@@ -68,6 +86,12 @@ Native inline deduplication must remain off. CDC retains its existing 128 KiB
 record and 65,536-entry metadata limits. Block sharing requires the existing
 `block_cloning` pool feature; the CDC pool/stream format is unchanged.
 
+The separate `zfs blockdedup` command exposes the block-only port. It requires
+the matching patched module and the `block_cloning` feature, but does not
+require enabling the CDC pool feature. That command is currently serial and
+does not accept `--threads`; the hybrid command's `--method=block` mode provides
+parallel analysis while retaining hybrid admission rules.
+
 ## Reporting and reproducibility
 
 Plain `status` preserves its six CDC fields. `status --methods` adds per-file
@@ -83,6 +107,24 @@ The required profiles remain:
 ./scripts/verify.sh
 ./scripts/verify.sh --profile native --host bsd
 ```
+
+The native runner also accepts `--profile native-smoke` with an explicit
+`--cached-build-receipt` from a prior successful build. It validates the frozen
+source, cached module/tools and their hashes before rerunning the native tests.
+Its result records build reuse separately from fresh compilation.
+
+Focused queue and parallel checks compile current production C functions with
+strict warnings and AddressSanitizer/UndefinedBehaviorSanitizer:
+
+```sh
+sh chunkdedup/lab-setup/tests/test_sync_batches.sh "$PWD"
+sh chunkdedup/lab-setup/tests/test_parallel_scan.sh "$PWD"
+```
+
+The parallel check covers concurrent execution, bounded admission, ordered
+results, callback errors, slot reuse and joining active work before caller
+cleanup. Extracted CLI coordinator/catalog checks cover global IDs, dirty
+retry handoff, hardlinks, skipped/stale results and cancellation.
 
 The original 21-case CDC suite and fixture hashes are unchanged. Its temporary
 adapter explicitly selects chunk mode; the separate hybrid suite exercises the
@@ -100,7 +142,7 @@ and scrub health after recovery, while documenting the interruption point.
 The earlier development runner used a cached lab-specific pristine build and
 is not included in this portable publication.
 
-All native execution is confined to the existing guarded offline guest. The
+Native verification runs in the guarded offline guest. The
 runner temporarily attaches its input ISO as a read-only optical device and restores
 the original VM configuration and guest module before shutdown. Host storage,
 service-preservation and lab-usage guards remain in force.

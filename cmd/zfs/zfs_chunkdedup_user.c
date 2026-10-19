@@ -14,6 +14,7 @@
 #include <inttypes.h>
 #include <limits.h>
 #include <signal.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -21,6 +22,7 @@
 #include <unistd.h>
 #include "chunkdedup_chunker.h"
 #include "chunkdedup_hybrid.h"
+#include "chunkdedup_parallel.h"
 #ifdef __APPLE__
 #include <CommonCrypto/CommonDigest.h>
 #else
@@ -28,7 +30,9 @@
 #endif
 #include "zfs_util.h"
 
-static volatile sig_atomic_t cd_stop;
+/* A signal may arrive on any scan thread. Keep the handler lock-free. */
+_Static_assert(ATOMIC_INT_LOCK_FREE == 2, "lock-free signal flag required");
+static atomic_int cd_stop;
 
 static void
 cd_signal(int signal)
@@ -297,6 +301,14 @@ struct cd_catalog_file {
 	enum cd_method method;
 };
 
+#define	CD_SYNC_BATCH_FILES	256
+
+struct cd_retry_file {
+	char dataset[ZFS_MAX_DATASET_NAME_LEN];
+	char path[PATH_MAX];
+	struct stat identity;
+};
+
 struct cd_catalog {
 	FILE *files, *blocks, *chunks, *sorted_blocks, *sorted_chunks, *seen;
 	char directory[PATH_MAX];
@@ -304,6 +316,11 @@ struct cd_catalog {
 	uint64_t seen_capacity;
 	enum cd_method method;
 	boolean_t watch;
+	/* Worker-private spools; only the coordinator owns seen/retry/IDs. */
+	boolean_t staging;
+	atomic_int *cancel;
+	struct cd_retry_file *retry;
+	uint_t retry_count;
 };
 
 struct cd_catalog_item {
@@ -312,6 +329,12 @@ struct cd_catalog_item {
 };
 
 static boolean_t cd_deferred(int);
+
+static boolean_t
+cd_catalog_stopped(const struct cd_catalog *c)
+{
+	return (cd_stop || (c->cancel != NULL && atomic_load(c->cancel)));
+}
 
 struct cd_catalog_seen {
 	uint64_t device, object, occupied;
@@ -531,6 +554,29 @@ struct cd_catalog_chunker {
 	uint64_t id;
 };
 
+static int cd_catalog_retry(struct cd_catalog *, uint64_t);
+
+static int
+cd_catalog_enqueue(struct cd_catalog *c, const struct cd_catalog_file *file,
+    uint64_t age)
+{
+	if (cd_stop)
+		return (ECANCELED);
+	if (c->retry_count != 0 && (c->retry_count == CD_SYNC_BATCH_FILES ||
+	    strcmp(c->retry[0].dataset, file->dataset) != 0)) {
+		int error = cd_catalog_retry(c, age);
+		if (error != 0)
+			return (error);
+	}
+	if (cd_stop)
+		return (ECANCELED);
+	struct cd_retry_file *retry = &c->retry[c->retry_count++];
+	(void) strlcpy(retry->dataset, file->dataset, sizeof (retry->dataset));
+	(void) strlcpy(retry->path, file->path, sizeof (retry->path));
+	retry->identity = file->identity;
+	return (0);
+}
+
 static int
 cd_catalog_chunk(void *argument, const struct chunkdedup_chunk *chunk,
     const uint8_t *bytes)
@@ -538,6 +584,8 @@ cd_catalog_chunk(void *argument, const struct chunkdedup_chunk *chunk,
 	struct cd_catalog_chunker *arg = argument;
 	struct cd_catalog_file *file = arg->file;
 	(void) bytes;
+	if (cd_catalog_stopped(arg->catalog))
+		return (ECANCELED);
 	uint64_t allocation = 0;
 	int error = cd_hybrid_alloc(chunk->length, file->ashift,
 	    file->parity, file->columns, file->copies, &allocation);
@@ -583,7 +631,8 @@ cd_catalog_chunk(void *argument, const struct chunkdedup_chunk *chunk,
 
 static int
 cd_catalog_analyze(struct cd_catalog *c, const char *dataset,
-    const char *path, uint64_t age)
+    const char *path, uint64_t age, const struct stat *expected,
+    boolean_t retryable)
 {
 	off_t block_start = ftello(c->blocks), chunk_start = ftello(c->chunks);
 	if (block_start < 0 || chunk_start < 0)
@@ -596,12 +645,29 @@ cd_catalog_analyze(struct cd_catalog *c, const char *dataset,
 	    sizeof (file.path)) >= sizeof (file.path))
 		return (ENAMETOOLONG);
 	int fd = open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+	if (fd < 0 && expected != NULL &&
+	    (errno == ENOENT || errno == ELOOP || errno == ESTALE)) {
+		c->skipped++;
+		return (0);
+	}
 	if (fd < 0)
 		return (errno);
 	int error = fstat(fd, &file.identity) != 0 ? errno : 0;
 	nvlist_t *info = NULL;
 	if (error != 0)
 		goto done;
+	if (expected != NULL && (file.identity.st_dev != expected->st_dev ||
+	    file.identity.st_ino != expected->st_ino ||
+	    file.identity.st_size != expected->st_size ||
+	    file.identity.st_mtime != expected->st_mtime
+#ifdef __FreeBSD__
+	    || file.identity.st_gen != expected->st_gen ||
+	    file.identity.st_mtim.tv_nsec != expected->st_mtim.tv_nsec
+#endif
+	    )) {
+		error = ESTALE;
+		goto done;
+	}
 	time_t now = time(NULL);
 	if (now == (time_t)-1) {
 		error = EIO;
@@ -616,10 +682,10 @@ cd_catalog_analyze(struct cd_catalog *c, const char *dataset,
 	/* Mounted datasets have distinct device ids; hard links share one inode. */
 	file.dataset_id = (uint64_t)file.identity.st_dev;
 	boolean_t duplicate;
-	if ((error = cd_catalog_seen(c, &file.identity, B_FALSE,
+	if (!c->staging && (error = cd_catalog_seen(c, &file.identity, B_FALSE,
 	    &duplicate)) != 0)
 		goto done;
-	if (duplicate) {
+	if (!c->staging && duplicate) {
 		c->skipped++;
 		goto done;
 	}
@@ -696,7 +762,7 @@ cd_catalog_analyze(struct cd_catalog *c, const char *dataset,
 	}
 	uint64_t native_bytes = 0;
 	for (uint64_t offset = 0; offset < (uint64_t)file.identity.st_size &&
-	    error == 0 && !cd_stop; offset += file.block_size) {
+	    error == 0 && !cd_catalog_stopped(c); offset += file.block_size) {
 		nvlist_t *block = NULL;
 		error = cd_inspect(dataset, &file.identity, B_TRUE, offset,
 		    &block);
@@ -760,11 +826,11 @@ cd_catalog_analyze(struct cd_catalog *c, const char *dataset,
 			    hash, length, c->count, offset, asize,
 			    file.block_size);
 	}
-	if (error == 0 && !cd_stop)
+	if (error == 0 && !cd_catalog_stopped(c))
 		error = chunkdedup_chunker_finish(chunker);
 	free(buffer);
 	chunkdedup_chunker_destroy(chunker);
-	if (error != 0 || cd_stop)
+	if (error != 0 || cd_catalog_stopped(c))
 		goto done;
 	if (native_bytes > allocated) {
 		file.uncertain = B_TRUE;
@@ -773,7 +839,7 @@ cd_catalog_analyze(struct cd_catalog *c, const char *dataset,
 		file.native_base = allocated - native_bytes;
 	}
 append:
-	if ((error = cd_catalog_seen(c, &file.identity, B_TRUE,
+	if (!c->staging && (error = cd_catalog_seen(c, &file.identity, B_TRUE,
 	    &duplicate)) != 0)
 		goto done;
 	if (fseeko(c->files, 0, SEEK_END) != 0 ||
@@ -799,13 +865,52 @@ done:
 			}
 		}
 	}
-	if (error == EBUSY || error == ESTALE || error == EAGAIN) {
+	if (c->staging && cd_deferred(error))
+		return (error);
+	if (error == EAGAIN && retryable)
+		return (cd_catalog_enqueue(c, &file, age));
+	if (error == EBUSY || error == ESTALE || error == EAGAIN ||
+	    (error == ENOENT && expected != NULL)) {
 		(void) fprintf(stderr, "%s: deferred (%s)\n", path,
 		    strerror(error));
 		c->skipped++;
 		return (0);
 	}
 	return (error);
+}
+
+/* One pool barrier for a bounded set of dirty candidates, then one retry.
+ * Saved identities prevent a changed or replaced file joining the old pass.
+ */
+static int
+cd_catalog_retry(struct cd_catalog *c, uint64_t age)
+{
+	uint_t count = c->retry_count;
+	if (count == 0 || cd_stop)
+		return (0);
+	uint64_t objects[CD_SYNC_BATCH_FILES];
+	for (uint_t i = 0; i < count; i++)
+		objects[i] = c->retry[i].identity.st_ino;
+	nvlist_t *args = fnvlist_alloc(), *result = NULL;
+	fnvlist_add_string(args, "op", "sync-batch");
+	fnvlist_add_uint64_array(args, "objects", objects, count);
+	int error = lzc_chunkdedup(c->retry[0].dataset, args, &result);
+	nvlist_free(result);
+	fnvlist_free(args);
+	/* A vanished/busy hint need not invalidate other discovery results.
+	 * Retrying without its barrier remains safe: dirty BPs defer again.
+	 */
+	if (error != 0 && error != ENOENT && !cd_deferred(error))
+		return (error);
+	c->retry_count = 0;
+	for (uint_t i = 0; i < count && !cd_stop; i++) {
+		struct cd_retry_file *retry = &c->retry[i];
+		error = cd_catalog_analyze(c, retry->dataset, retry->path, age,
+		    &retry->identity, B_FALSE);
+		if (error != 0)
+			return (error);
+	}
+	return (0);
 }
 
 static int
@@ -1115,9 +1220,10 @@ cd_catalog_init(struct cd_catalog *c, enum cd_method method, boolean_t watch)
 	c->blocks = tmpfile();
 	c->chunks = tmpfile();
 	c->seen = tmpfile();
+	c->retry = calloc(CD_SYNC_BATCH_FILES, sizeof (*c->retry));
 	c->seen_capacity = 1024;
 	if (c->files == NULL || c->blocks == NULL || c->chunks == NULL ||
-	    c->seen == NULL)
+	    c->seen == NULL || c->retry == NULL)
 		return (errno);
 	return (ftruncate(fileno(c->seen), c->seen_capacity *
 	    sizeof (struct cd_catalog_seen)) == 0 ? 0 : errno);
@@ -1126,6 +1232,7 @@ cd_catalog_init(struct cd_catalog *c, enum cd_method method, boolean_t watch)
 static void
 cd_catalog_fini(struct cd_catalog *c)
 {
+	free(c->retry);
 	FILE *streams[] = { c->files, c->blocks, c->chunks,
 	    c->sorted_blocks, c->sorted_chunks, c->seen };
 	for (size_t i = 0; i < ARRAY_SIZE(streams); i++) {
@@ -1147,6 +1254,241 @@ cd_catalog_fini(struct cd_catalog *c)
 		}
 		(void) rmdir(c->directory);
 	}
+}
+
+/*
+ * Workers never seek, truncate or assign IDs in the shared catalog. Each owns
+ * three bounded-count disk spools; the coordinator merges completed jobs in
+ * traversal order, then runs the existing selection and installation paths.
+ */
+struct cd_scan_job {
+	struct cd_catalog local;
+	struct cd_retry_file candidate;
+	uint64_t age;
+	boolean_t active;
+};
+
+struct cd_scan {
+	struct cd_parallel parallel;
+	struct cd_scan_job *jobs;
+	struct cd_catalog *catalog;
+	uint64_t age;
+	atomic_int cancelled;
+};
+
+static int
+cd_scan_work(void *argument)
+{
+	struct cd_scan_job *job = argument;
+	if (cd_stop)
+		return (ECANCELED);
+	int error = cd_catalog_analyze(&job->local, job->candidate.dataset,
+	    job->candidate.path, job->age, &job->candidate.identity, B_FALSE);
+	return (cd_stop ? ECANCELED : error);
+}
+
+static int
+cd_scan_copy(FILE *source, FILE *destination, uint64_t id)
+{
+	if (fseeko(source, 0, SEEK_SET) != 0)
+		return (errno);
+	struct cd_catalog_item item;
+	int error;
+	while ((error = cd_catalog_next(source, &item)) == 0 && !cd_stop) {
+		if (item.file != 0)
+			return (EPROTO);
+		if (fprintf(destination, "%020" PRIu64 " %s %020" PRIu64
+		    " %020" PRIu64 " %020" PRIu64 " %020" PRIu64
+		    " %020" PRIu64 "\n", item.dataset, item.hash, item.length,
+		    id, item.offset, item.bytes, item.object) < 0)
+			return (EIO);
+	}
+	return (cd_stop ? ECANCELED : error == ENOENT ? 0 : error);
+}
+
+static int
+cd_scan_take(struct cd_scan *scan)
+{
+	void *argument;
+	int result;
+	int error = cd_parallel_take(&scan->parallel, &argument, &result);
+	if (error != 0)
+		return (error);
+	struct cd_scan_job *job = argument;
+	job->active = B_FALSE;
+	struct cd_catalog *c = scan->catalog, *local = &job->local;
+	if (cd_stop)
+		return (ECANCELED);
+	if (result == EAGAIN) {
+		struct cd_catalog_file file = { .identity = job->candidate.identity };
+		(void) strlcpy(file.dataset, job->candidate.dataset,
+		    sizeof (file.dataset));
+		(void) strlcpy(file.path, job->candidate.path, sizeof (file.path));
+		return (cd_catalog_enqueue(c, &file, scan->age));
+	}
+	if (cd_deferred(result)) {
+		(void) fprintf(stderr, "%s: deferred (%s)\n",
+		    job->candidate.path, strerror(result));
+		c->skipped++;
+		return (0);
+	}
+	if (result != 0) {
+		(void) fprintf(stderr, "%s: %s\n", job->candidate.path,
+		    strerror(result));
+		return (result);
+	}
+	c->skipped += local->skipped;
+	if (local->count == 0)
+		return (0);
+	if (local->count != 1)
+		return (EPROTO);
+	struct cd_catalog_file file;
+	if ((error = cd_catalog_record(local, 0, &file, B_FALSE)) != 0)
+		return (error);
+	boolean_t duplicate;
+	if ((error = cd_catalog_seen(c, &file.identity, B_FALSE,
+	    &duplicate)) != 0)
+		return (error);
+	if (duplicate) {
+		c->skipped++;
+		return (0);
+	}
+	file.parent = c->count;
+	if ((error = cd_scan_copy(local->blocks, c->blocks, c->count)) != 0 ||
+	    (error = cd_scan_copy(local->chunks, c->chunks, c->count)) != 0 ||
+	    (error = cd_catalog_seen(c, &file.identity, B_TRUE,
+	    &duplicate)) != 0)
+		return (error);
+	if (fseeko(c->files, 0, SEEK_END) != 0 ||
+	    fwrite(&file, sizeof (file), 1, c->files) != 1)
+		return (errno != 0 ? errno : EIO);
+	c->count++;
+	return (0);
+}
+
+static int
+cd_scan_drain(struct cd_scan *scan)
+{
+	while (cd_parallel_count(&scan->parallel) != 0 && !cd_stop) {
+		int error = cd_scan_take(scan);
+		if (error != 0)
+			return (error);
+	}
+	return (cd_stop ? ECANCELED : 0);
+}
+
+static int
+cd_scan_init(struct cd_scan *scan, struct cd_catalog *c, uint64_t age,
+    unsigned int threads)
+{
+	memset(scan, 0, sizeof (*scan));
+	scan->catalog = c;
+	scan->age = age;
+	atomic_init(&scan->cancelled, 0);
+	int error = cd_parallel_init(&scan->parallel, threads, cd_scan_work);
+	if (error != 0)
+		return (error);
+	scan->jobs = calloc(scan->parallel.capacity, sizeof (*scan->jobs));
+	if (scan->jobs == NULL) {
+		cd_parallel_fini(&scan->parallel);
+		return (ENOMEM);
+	}
+	return (0);
+}
+
+static void
+cd_scan_fini(struct cd_scan *scan)
+{
+	unsigned int capacity = scan->parallel.capacity;
+	/* Join before closing any spool or releasing any queued path/identity. */
+	atomic_store(&scan->cancelled, 1);
+	cd_parallel_fini(&scan->parallel);
+	for (unsigned int i = 0; i < capacity; i++)
+		cd_catalog_fini(&scan->jobs[i].local);
+	free(scan->jobs);
+}
+
+static boolean_t
+cd_scan_same(const struct stat *a, const struct stat *b)
+{
+	return (a->st_dev == b->st_dev && a->st_ino == b->st_ino);
+}
+
+static int
+cd_scan_submit(struct cd_scan *scan, const char *dataset, const char *path,
+    const struct stat *identity)
+{
+	struct cd_catalog *c = scan->catalog;
+	/* Hard links must not create competing optimizer opens on one inode. */
+	for (unsigned int i = 0; i < scan->parallel.capacity; i++) {
+		if (!scan->jobs[i].active || !cd_scan_same(identity,
+		    &scan->jobs[i].candidate.identity))
+			continue;
+		while (scan->jobs[i].active && !cd_stop) {
+			int error = cd_scan_take(scan);
+			if (error != 0)
+				return (error);
+		}
+	}
+	for (uint_t i = 0; i < c->retry_count; i++) {
+		if (cd_scan_same(identity, &c->retry[i].identity)) {
+			int error = cd_catalog_retry(c, scan->age);
+			if (error != 0)
+				return (error);
+			break;
+		}
+	}
+	if (cd_stop)
+		return (ECANCELED);
+	boolean_t duplicate;
+	int error = cd_catalog_seen(c, identity, B_FALSE, &duplicate);
+	if (error != 0)
+		return (error);
+	if (duplicate) {
+		c->skipped++;
+		return (0);
+	}
+	if (cd_parallel_full(&scan->parallel) &&
+	    (error = cd_scan_take(scan)) != 0)
+		return (error);
+	struct cd_scan_job *job = NULL;
+	for (unsigned int i = 0; i < scan->parallel.capacity; i++) {
+		if (!scan->jobs[i].active) {
+			job = &scan->jobs[i];
+			break;
+		}
+	}
+	if (job == NULL)
+		return (EPROTO);
+	struct cd_catalog *local = &job->local;
+	local->staging = B_TRUE;
+	local->cancel = &scan->cancelled;
+	local->method = c->method;
+	local->watch = c->watch;
+	local->count = local->skipped = 0;
+	FILE **streams[] = { &local->files, &local->blocks, &local->chunks };
+	for (size_t i = 0; i < ARRAY_SIZE(streams); i++) {
+		if (*streams[i] == NULL)
+			*streams[i] = tmpfile();
+		if (*streams[i] == NULL)
+			return (errno);
+		if (fflush(*streams[i]) != 0 ||
+		    ftruncate(fileno(*streams[i]), 0) != 0 ||
+		    fseeko(*streams[i], 0, SEEK_SET) != 0)
+			return (errno != 0 ? errno : EIO);
+	}
+	if (strlcpy(job->candidate.dataset, dataset,
+	    sizeof (job->candidate.dataset)) >= sizeof (job->candidate.dataset) ||
+	    strlcpy(job->candidate.path, path, sizeof (job->candidate.path)) >=
+	    sizeof (job->candidate.path))
+		return (ENAMETOOLONG);
+	job->candidate.identity = *identity;
+	job->age = scan->age;
+	job->active = B_TRUE;
+	error = cd_parallel_submit(&scan->parallel, job);
+	if (error != 0)
+		job->active = B_FALSE;
+	return (error);
 }
 
 static int
@@ -1271,12 +1613,14 @@ cd_snapshot_path(zfs_handle_t *zhp, char *path, size_t size)
 
 static int
 cd_pass(const char *op, boolean_t recursive, uint64_t age, int argc,
-    char **argv, boolean_t watch, enum cd_method method, boolean_t methods)
+    char **argv, boolean_t watch, enum cd_method method, boolean_t methods,
+    unsigned int threads)
 {
 	uint64_t processed = 0, skipped = 0;
 	int ret = 0;
 	boolean_t optimize = strcmp(op, "optimize") == 0;
 	struct cd_catalog catalog = { 0 };
+	struct cd_scan scan = { 0 };
 	if (optimize) {
 		int error = cd_catalog_init(&catalog, method, watch);
 		if (error != 0) {
@@ -1284,6 +1628,15 @@ cd_pass(const char *op, boolean_t recursive, uint64_t age, int argc,
 			cd_catalog_fini(&catalog);
 			return (1);
 		}
+		error = cd_scan_init(&scan, &catalog, age, threads);
+		if (error != 0) {
+			(void) fprintf(stderr, "scan workers: %s\n", strerror(error));
+			cd_catalog_fini(&catalog);
+			return (1);
+		}
+		(void) printf("optimize: scan_threads=%u max_inflight=%zu\n",
+		    threads, scan.parallel.capacity);
+		(void) fflush(stdout);
 	}
 	boolean_t readonly = strcmp(op, "status") == 0 ||
 	    strcmp(op, "verify") == 0;
@@ -1379,8 +1732,8 @@ cd_pass(const char *op, boolean_t recursive, uint64_t age, int argc,
 			} else if (entry->fts_info == FTS_F) {
 				int e;
 				if (optimize)
-					e = cd_catalog_analyze(&catalog, dataset,
-					    entry->fts_path, age);
+					e = cd_scan_submit(&scan, dataset,
+					    entry->fts_path, entry->fts_statp);
 				else if (methods)
 					e = cd_method_status(dataset,
 					    entry->fts_path);
@@ -1391,6 +1744,8 @@ cd_pass(const char *op, boolean_t recursive, uint64_t age, int argc,
 					(void) fprintf(stderr, "%s: %s\n",
 					    entry->fts_path, strerror(e));
 					error = e;
+					if (optimize)
+						break;
 				}
 			} else if (entry->fts_info == FTS_ERR ||
 			    entry->fts_info == FTS_DNR ||
@@ -1400,6 +1755,8 @@ cd_pass(const char *op, boolean_t recursive, uint64_t age, int argc,
 		}
 		if (fts_close(tree) != 0 && error == 0)
 			error = errno;
+		if (optimize && error == 0)
+			error = cd_scan_drain(&scan);
 target_done:
 		if (error != 0) {
 			(void) fprintf(stderr, "%s: %s\n", argv[i],
@@ -1407,11 +1764,16 @@ target_done:
 			ret = 1;
 		}
 		zfs_close(zhp);
+		if (optimize && error != 0)
+			break;
 	}
 	if (optimize) {
+		cd_scan_fini(&scan);
 		/* Discovery failures never leave a partially selected pass installed. */
 		if (ret == 0 && !cd_stop) {
-			int error = cd_catalog_apply(&catalog, age);
+			int error = cd_catalog_retry(&catalog, age);
+			if (error == 0 && !cd_stop)
+				error = cd_catalog_apply(&catalog, age);
 			if (error != 0) {
 				(void) fprintf(stderr, "optimize: %s\n",
 				    strerror(error));
@@ -1431,7 +1793,7 @@ target_done:
 
 static int
 cd_watch(uint64_t age, uint64_t interval, int argc, char **argv,
-    enum cd_method method)
+    enum cd_method method, unsigned int threads)
 {
 	/* Reject paths and misspelled datasets before entering supervision. */
 	for (int i = 0; i < argc; i++) {
@@ -1456,7 +1818,7 @@ cd_watch(uint64_t age, uint64_t interval, int argc, char **argv,
 	(void) fflush(stdout);
 	while (!cd_stop) {
 		(void) cd_pass("optimize", B_TRUE, age, argc, argv, B_TRUE,
-		    method, B_FALSE);
+		    method, B_FALSE, threads);
 		if (cd_stop)
 			break;
 		struct timespec delay = { .tv_sec = (time_t)interval };
@@ -1484,9 +1846,11 @@ zfs_do_chunkdedup(int argc, char **argv)
 		(void) fprintf(stderr, "usage: zfs chunkdedup "
 		    "<optimize|status|verify|unoptimize> [-r] [--min-age days] "
 		    "[--method auto|block|chunk] [--methods] "
+		    "[--threads 1..64] "
 		    "<dataset|path>...\n"
 		    "       zfs chunkdedup watch [--interval seconds] "
-		    "[--min-age days] [--method auto|block|chunk] <dataset>...\n");
+		    "[--min-age days] [--method auto|block|chunk] "
+		    "[--threads 1..64] <dataset>...\n");
 		return (2);
 	}
 	const char *op = argv[1];
@@ -1498,17 +1862,20 @@ zfs_do_chunkdedup(int argc, char **argv)
 	boolean_t methods = B_FALSE;
 	enum cd_method method = CD_METHOD_AUTO;
 	uint64_t age = 3, interval = 3600;
+	long online = sysconf(_SC_NPROCESSORS_ONLN);
+	unsigned int threads = online > 0 ? MIN(online, 64) : 1;
 	const struct option options[] = {
 		{ "min-age", required_argument, NULL, 'a' },
 		{ "interval", required_argument, NULL, 'i' },
 		{ "recursive", no_argument, NULL, 'r' },
 		{ "method", required_argument, NULL, 'm' },
 		{ "methods", no_argument, NULL, 'M' },
+		{ "threads", required_argument, NULL, 't' },
 		{ NULL, 0, NULL, 0 }
 	};
 	int c;
 	optind = 2;
-	while ((c = getopt_long(argc, argv, "+ra:i:m:M", options, NULL)) != -1) {
+	while ((c = getopt_long(argc, argv, "+ra:i:m:Mt:", options, NULL)) != -1) {
 		if (c == 'r') {
 			if (watch)
 				return (2);
@@ -1528,7 +1895,7 @@ zfs_do_chunkdedup(int argc, char **argv)
 			if (strcmp(op, "status") != 0)
 				return (2);
 			methods = B_TRUE;
-		} else if (c == 'a' || c == 'i') {
+		} else if (c == 'a' || c == 'i' || c == 't') {
 			char *end;
 			errno = 0;
 			uint64_t value = strtoull(optarg, &end, 10);
@@ -1539,10 +1906,15 @@ zfs_do_chunkdedup(int argc, char **argv)
 				if (value > UINT64_MAX / 86400)
 					return (2);
 				age = value;
-			} else {
+			} else if (c == 'i') {
 				if (!watch || value == 0 || value > INT_MAX)
 					return (2);
 				interval = value;
+			} else {
+				if ((!watch && strcmp(op, "optimize") != 0) ||
+				    value == 0 || value > 64)
+					return (2);
+				threads = (unsigned int)value;
 			}
 		} else {
 			return (2);
@@ -1552,7 +1924,26 @@ zfs_do_chunkdedup(int argc, char **argv)
 		return (2);
 	if (watch)
 		return (cd_watch(age, interval, argc - optind, argv + optind,
-		    method));
-	return (cd_pass(op, recursive, age, argc - optind, argv + optind,
-	    B_FALSE, method, methods));
+		    method, threads));
+	struct sigaction action = { 0 }, old_int, old_term;
+	boolean_t optimize = strcmp(op, "optimize") == 0;
+	if (optimize) {
+		action.sa_handler = cd_signal;
+		(void) sigemptyset(&action.sa_mask);
+		if (sigaction(SIGINT, &action, &old_int) != 0)
+			return (1);
+		if (sigaction(SIGTERM, &action, &old_term) != 0) {
+			(void) sigaction(SIGINT, &old_int, NULL);
+			return (1);
+		}
+	}
+	int result = cd_pass(op, recursive, age, argc - optind, argv + optind,
+	    B_FALSE, method, methods, threads);
+	if (optimize) {
+		(void) sigaction(SIGINT, &old_int, NULL);
+		(void) sigaction(SIGTERM, &old_term, NULL);
+		if (cd_stop)
+			return (1);
+	}
+	return (result);
 }

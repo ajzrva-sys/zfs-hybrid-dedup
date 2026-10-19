@@ -170,6 +170,7 @@
 #include <sys/zfs_vfsops.h>
 #include <sys/zfs_znode.h>
 #include <sys/zfs_chunkdedup.h>
+#include <sys/zfs_blockdedup.h>
 #include <sys/zfs_vnops.h>
 #include <sys/zap.h>
 #include <sys/spa.h>
@@ -7645,12 +7646,50 @@ error:
 	return (ret);
 }
 
+/* Standalone verified BRT sharing; no chunk storage ABI or property. */
+static const zfs_ioc_key_t zfs_keys_blockdedup[] = {
+	{"op", DATA_TYPE_STRING, 0},
+	{"object", DATA_TYPE_UINT64, ZK_OPTIONAL},
+	{"generation", DATA_TYPE_UINT64, ZK_OPTIONAL},
+	{"size", DATA_TYPE_UINT64, ZK_OPTIONAL},
+	{"mtime_sec", DATA_TYPE_UINT64, ZK_OPTIONAL},
+	{"mtime_nsec", DATA_TYPE_UINT64, ZK_OPTIONAL},
+	{"offset", DATA_TYPE_UINT64, ZK_OPTIONAL},
+	{"length", DATA_TYPE_UINT64, ZK_OPTIONAL},
+	{"source_object", DATA_TYPE_UINT64, ZK_OPTIONAL},
+	{"source_generation", DATA_TYPE_UINT64, ZK_OPTIONAL},
+	{"source_size", DATA_TYPE_UINT64, ZK_OPTIONAL},
+	{"source_mtime_sec", DATA_TYPE_UINT64, ZK_OPTIONAL},
+	{"source_mtime_nsec", DATA_TYPE_UINT64, ZK_OPTIONAL},
+	{"source_offset", DATA_TYPE_UINT64, ZK_OPTIONAL},
+};
+
+static int
+zfs_ioc_blockdedup(const char *name, nvlist_t *innvl, nvlist_t *outnvl)
+{
+#ifdef __FreeBSD__
+	zfsvfs_t *zfsvfs;
+	int error = getzfsvfs(name, &zfsvfs);
+	if (error != 0)
+		return (error);
+	error = zfs_blockdedup(zfsvfs, innvl, outnvl);
+	zfs_vfs_rele(zfsvfs);
+	return (error);
+#else
+	(void) name;
+	(void) innvl;
+	(void) outnvl;
+	return (SET_ERROR(ENOTSUP));
+#endif
+}
+
 /*
  * Version-one ABI: object identity plus complete Microsoft chunk ranges.
  * The kernel rereads and hashes candidate bytes, never trusting user data.
  */
 static const zfs_ioc_key_t zfs_keys_chunkdedup[] = {
 	{"op", DATA_TYPE_STRING, 0},
+	{"objects", DATA_TYPE_UINT64_ARRAY, ZK_OPTIONAL},
 	{"object", DATA_TYPE_UINT64, ZK_OPTIONAL},
 	{"generation", DATA_TYPE_UINT64, ZK_OPTIONAL},
 	{"size", DATA_TYPE_UINT64, ZK_OPTIONAL},
@@ -7794,12 +7833,7 @@ cd_native_inspect(zfsvfs_t *zfsvfs, nvlist_t *innvl, nvlist_t *outnvl)
 	entered = B_TRUE;
 	if ((error = zfs_zget(zfsvfs, id.object, &zp)) != 0)
 		goto out;
-	/* The initial file query settles writes before per-block inspection. */
-	if (!range && !zfs_is_readonly(zfsvfs)) {
-		if ((error = zil_commit(zfsvfs->z_log, id.object)) != 0)
-			goto out;
-		txg_wait_synced(dmu_objset_pool(zfsvfs->z_os), 0);
-	}
+	/* Dirty block pointers return EAGAIN; inspection never forces a sync. */
 	zfs_exit(zfsvfs, FTAG);
 	entered = B_FALSE;
 	if ((error = vn_lock(ZTOV(zp), LK_SHARED | LK_RETRY)) != 0)
@@ -7818,6 +7852,9 @@ cd_native_inspect(zfsvfs_t *zfsvfs, nvlist_t *innvl, nvlist_t *outnvl)
 	fnvlist_add_uint64(outnvl, "block_size", zp->z_blksz);
 	fnvlist_add_uint64(outnvl, "allocated_bytes",
 	    doi.doi_physical_blocks_512 * SPA_MINBLOCKSIZE);
+	/* Diagnostic only: callers must still revalidate each inspected BP. */
+	fnvlist_add_uint64(outnvl, "synced_txg",
+	    spa_last_synced_txg(dmu_objset_spa(zfsvfs->z_os)));
 	fnvlist_add_boolean_value(outnvl, "chunked", chunked);
 	fnvlist_add_boolean_value(outnvl, "eligible",
 	    cd_native_idle(zp) && !zfsvfs->z_os->os_encrypted &&
@@ -7857,6 +7894,58 @@ out:
 		VOP_UNLOCK(ZTOV(zp));
 	if (zp != NULL)
 		zfs_zrele_async(zp);
+	return (error);
+}
+
+/*
+ * Objects are bounded retry hints, not authority to install references.
+ * Drain their prior DMU writes with one pool barrier, without holding any
+ * vnode, range, or installation locks.  Later inspection and sharing still
+ * validate identity and idle state; dirty writable mappings are excluded.
+ */
+static int
+cd_native_sync_batch(zfsvfs_t *zfsvfs, nvlist_t *innvl, nvlist_t *outnvl)
+{
+	uint64_t *objects;
+	uint_t count;
+	int error;
+
+	if (nvlist_lookup_uint64_array(innvl, "objects", &objects, &count) != 0 ||
+	    count == 0 || count > 256)
+		return (SET_ERROR(EINVAL));
+	if ((error = zfs_enter(zfsvfs, FTAG)) != 0)
+		return (error);
+	if (zfs_is_readonly(zfsvfs)) {
+		error = SET_ERROR(EROFS);
+		goto out;
+	}
+	if (zfsvfs->z_os->os_encrypted ||
+	    (zfsvfs->z_vfs->vfs_flag & MNT_EXPORTED) != 0) {
+		error = SET_ERROR(ENOTSUP);
+		goto out;
+	}
+	for (uint_t i = 0; i < count; i++) {
+		znode_t *zp;
+		if (objects[i] == 0) {
+			error = SET_ERROR(EINVAL);
+			goto out;
+		}
+		if ((error = zfs_zget(zfsvfs, objects[i], &zp)) != 0)
+			goto out;
+		/* Vnode type is immutable; these hints need no identity claim. */
+		boolean_t regular = ZTOV(zp)->v_type == VREG;
+		zfs_zrele_async(zp);
+		if (!regular) {
+			error = SET_ERROR(EINVAL);
+			goto out;
+		}
+	}
+	txg_wait_synced(dmu_objset_pool(zfsvfs->z_os), 0);
+	fnvlist_add_uint64(outnvl, "synced_txg",
+	    spa_last_synced_txg(dmu_objset_spa(zfsvfs->z_os)));
+	error = 0;
+out:
+	zfs_exit(zfsvfs, FTAG);
 	return (error);
 }
 
@@ -8116,7 +8205,7 @@ zfs_ioc_chunkdedup(const char *name, nvlist_t *innvl, nvlist_t *outnvl)
 		error = cd_native_inspect(zfsvfs, innvl, outnvl);
 		goto rele;
 	}
-	if (strcmp(op, "share-blocks") == 0) {
+	if (strcmp(op, "share-blocks") == 0 || strcmp(op, "sync-batch") == 0) {
 		uint64_t enabled;
 		if ((error = dsl_prop_get_integer(name, "chunkdedup", &enabled,
 		    NULL)) != 0 || enabled == 0) {
@@ -8125,6 +8214,11 @@ zfs_ioc_chunkdedup(const char *name, nvlist_t *innvl, nvlist_t *outnvl)
 		}
 		if ((error = zfs_chunkdedup_enable_check(name)) != 0)
 			goto rele;
+		/* A durability barrier does not create BRT references. */
+		if (strcmp(op, "sync-batch") == 0) {
+			error = cd_native_sync_batch(zfsvfs, innvl, outnvl);
+			goto rele;
+		}
 		if (!zfs_bclone_enabled || !spa_feature_is_enabled(
 		    dmu_objset_spa(zfsvfs->z_os), SPA_FEATURE_BLOCK_CLONING)) {
 			error = SET_ERROR(ENOTSUP);
@@ -8706,6 +8800,11 @@ zfs_ioctl_init(void)
 	    zfs_ioc_ddt_prune, zfs_secpolicy_config, POOL_NAME,
 	    POOL_CHECK_SUSPENDED | POOL_CHECK_READONLY, B_TRUE, B_TRUE,
 	    zfs_keys_ddt_prune, ARRAY_SIZE(zfs_keys_ddt_prune));
+
+	zfs_ioctl_register("blockdedup", ZFS_IOC_BLOCKDEDUP,
+	    zfs_ioc_blockdedup, zfs_secpolicy_config, DATASET_NAME,
+	    POOL_CHECK_SUSPENDED, B_FALSE, B_FALSE,
+	    zfs_keys_blockdedup, ARRAY_SIZE(zfs_keys_blockdedup));
 
 	zfs_ioctl_register("chunkdedup", ZFS_IOC_CHUNKDEDUP,
 	    zfs_ioc_chunkdedup, zfs_secpolicy_config, DATASET_NAME,

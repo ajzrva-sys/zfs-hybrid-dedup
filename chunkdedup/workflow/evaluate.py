@@ -578,7 +578,7 @@ class Gate:
             required={'cmd/zfs/chunkdedup_chunker.c','cmd/zfs/chunkdedup_chunker.h',
                       'cmd/zfs/rabin64_table.h','cmd/zfs/zfs_chunkdedup_user.c',
                       'include/sys/zfs_chunkdedup.h','module/zfs/zfs_chunkdedup.c',
-                      'cmd/zfs/chunkdedup_hybrid.h'}
+                      'cmd/zfs/chunkdedup_hybrid.h','cmd/zfs/chunkdedup_parallel.h'}
             self.require(isinstance(tested_files,list) and {x['path'] for x in tested_files}==required,
                          'tested_source_coverage',tested_files,sorted(required),
                          'Include all actual chunker, worker and native-core implementation inputs.')

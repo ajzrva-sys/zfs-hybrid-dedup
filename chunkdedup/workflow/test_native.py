@@ -51,6 +51,75 @@ class NativeTests(unittest.TestCase):
         return native.Runner(SimpleNamespace(run_dir=Path(directory) / 'run',
                     run_id='unit', source_digest='0' * 64, mode='build', host='bsd'))
 
+    def cached_fixture(self):
+        return dict(status='PASS', phase='complete', source_digest='0' * 64, build_run_id='old-build',
+                    prefix='/opt/chunkdedup-workflow/old-build',
+                    binary='/opt/chunkdedup-workflow/old-build/sbin/zfs',
+                    module='/root/lab/workflow/old-build/source/module/openzfs.ko',
+                    binary_sha256='2' * 64, module_sha256='1' * 64, started=1, finished=2)
+
+    def test_cached_receipt_rejects_changed_source_and_unmanaged_paths(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / 'receipt.json'; receipt = self.cached_fixture()
+            path.write_text(json.dumps(receipt))
+            self.assertEqual(native.cached_build_receipt(path, '0' * 64), receipt)
+            for changes in [dict(status='RUNNING'), dict(phase='compile'), dict(source_digest='3' * 64),
+                            dict(prefix='/tmp/other'), dict(binary='/tmp/zfs'), dict(module='/tmp/zfs.ko'),
+                            dict(module_sha256='invalid'), dict(build_run_id='../escape')]:
+                with self.subTest(changes=changes):
+                    path.write_text(json.dumps(dict(receipt, **changes)))
+                    with self.assertRaises((AssertionError, TypeError)):
+                        native.cached_build_receipt(path, '0' * 64)
+
+    def test_smoke_media_freezes_cached_prefix_before_adaptation(self):
+        for mode in ('build', 'smoke'):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary); receipt = self.cached_fixture()
+                path = root / 'receipt.json'; path.write_text(json.dumps(receipt))
+                manifest = root / 'source.json'; manifest.write_text('{}')
+                args = SimpleNamespace(run_dir=root / 'run', run_id='new-run', source_digest='0' * 64,
+                                       mode=mode, host='bsd', repo=root, kit=HERE.parent,
+                                       source_manifest=manifest, build_timeout=60, cached_build_receipt=path)
+                runner = native.Runner(args)
+                adaptation = {'regression.py': {'original_sha256': '4' * 64}}
+                captured = []
+                def capture(path, value):
+                    captured.append(value)
+                    raise RuntimeError('captured config before external actions')
+                with mock.patch.object(native, 'validate_manifest', return_value=[]), \
+                        mock.patch.object(native, 'adapt_tests', return_value=({}, adaptation, [])) as adapt, \
+                        mock.patch.object(native, 'atomic_json', side_effect=capture):
+                    with self.assertRaisesRegex(RuntimeError, 'captured config'):
+                        runner.media()
+                expected = receipt['prefix'] if mode == 'smoke' else '/opt/chunkdedup-workflow/new-run'
+                self.assertEqual(adapt.call_args.args[-1], expected)
+                self.assertEqual(captured[0]['prefix'], expected)
+                if mode == 'smoke': self.assertEqual(captured[0]['build'], receipt)
+                else: self.assertNotIn('build', captured[0])
+
+    def test_smoke_prepare_requires_frozen_cache_and_preserves_receipt(self):
+        tree = ast.parse(native.GUEST_DRIVER)
+        branch = next(node for node in ast.walk(tree) if isinstance(node, ast.If) and
+                      ast.unparse(node.test) == "C['mode'] == 'smoke'")
+        code = compile(ast.fix_missing_locations(ast.Module(body=branch.body, type_ignores=[])), 'smoke', 'exec')
+        for invalid in (None, 'cache', 'prefix', 'hash'):
+            with self.subTest(invalid=invalid):
+                receipt = self.cached_fixture(); actual = dict(receipt)
+                if invalid == 'cache': actual['binary_sha256'] = '3' * 64
+                saved = []
+                config = dict(build=receipt, source_digest='0' * 64, prefix=receipt['prefix'])
+                prefix = '/opt/other' if invalid == 'prefix' else receipt['prefix']
+                namespace = dict(json=json, pathlib=SimpleNamespace(Path=lambda unused: SimpleNamespace(read_text=lambda: json.dumps(actual))),
+                                 C=config, P=prefix, save=lambda name, value: saved.append((name, copy.deepcopy(value))),
+                                 sha=lambda name: ('4' * 64 if invalid == 'hash' else '1' * 64) if name == receipt['module'] else '2' * 64)
+                if invalid:
+                    with self.assertRaises(AssertionError): exec(code, namespace)
+                    self.assertEqual(saved, [])
+                else:
+                    exec(code, namespace)
+                    self.assertEqual(saved, [('build-status.json', receipt)])
+                    self.assertEqual(config, dict(build=receipt, source_digest='0' * 64, prefix=receipt['prefix']))
+
     def test_embedded_scripts_compile(self):
         compile(native.HOST_SNAPSHOT, 'host', 'exec')
         compile(native.GUEST_DRIVER, 'guest', 'exec')

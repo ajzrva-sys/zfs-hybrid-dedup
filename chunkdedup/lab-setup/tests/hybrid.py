@@ -94,10 +94,12 @@ class Suite:
     def data(self, size=2 << 20, seed=981):
         return random.Random(seed).randbytes(size)
 
-    def optimize(self, path, method=None, ok=True):
+    def optimize(self, path, method=None, ok=True, threads=None):
         args = ['chunkdedup', 'optimize', '-r', '--min-age', '0']
         if method is not None:
             args += ['--method=' + method]
+        if threads is not None:
+            args += ['--threads=' + str(threads)]
         return self.m.zfs(*args, path, ok=ok).stdout.decode()
 
     def inspect(self, dataset, path, offset=0):
@@ -136,8 +138,8 @@ class Suite:
         legacy = self.m.zfs('chunkdedup', 'status', ds).stdout.decode()
         fields = re.findall(r'([a-z_]+)=(\d+)', legacy)
         assert {k for k, _ in fields} == {'files', 'records', 'chunks', 'chunk_bytes', 'logical_bytes', 'references'}, legacy
-        default = self.selections(self.optimize(ordinary))
-        forced = self.selections(self.optimize(chunked, 'chunk'))
+        default = self.selections(self.optimize(ordinary, threads=1))
+        forced = self.selections(self.optimize(chunked, 'chunk', threads=4))
         assert default[0]['method'] == 'block' and forced[0]['method'] == 'chunk'
         assert forced[0]['reason'] == 'forced', forced
         self.representation(ordinary, 'ordinary'); self.representation(chunked, 'chunk')
@@ -146,8 +148,12 @@ class Suite:
         assert self.m.digest(ordinary) == expected
         self.m.zfs('chunkdedup', 'optimize', '--method=invalid', ordinary, ok=False)
         self.m.zfs('chunkdedup', 'verify', '--method=block', ordinary, ok=False)
+        for value in ['0', '65', '-1', 'invalid', '4trailing']:
+            self.m.zfs('chunkdedup', 'optimize', '--threads=' + value, ordinary, ok=False)
+        self.m.zfs('chunkdedup', 'verify', '--threads=4', ordinary, ok=False)
         return {'six_field_status_preserved': True, 'default': default, 'forced': forced,
-                'pool_statistics_labeled': True}
+                'pool_statistics_labeled': True, 'explicit_scan_threads': [1, 4],
+                'invalid_scan_threads_rejected': True}
 
     def exact(self):
         ds, directory = self.new('exact')
@@ -158,7 +164,7 @@ class Suite:
             os.chmod(path, 0o640); self.m.xattr(path, b'hybrid-metadata')
             os.utime(path, ns=(1_600_000_000_123456789, 1_600_000_000_123456789))
         before = [self.metadata(p) for p in [source, dest]]
-        text = self.optimize(directory, 'block')
+        text = self.optimize(directory, 'block', threads=4)
         assert all(row['method'] == 'block' for row in self.selections(text))
         self.m.zpool('sync', self.pool)
         assert before == [self.metadata(p) for p in [source, dest]]
@@ -180,7 +186,7 @@ class Suite:
         for i in range(3):
             path = directory / ('unique-' + str(i))
             expected[path] = self.write(path, self.data(seed=990 + i))
-        rows = self.selections(self.optimize(directory))
+        rows = self.selections(self.optimize(directory, threads=4))
         assert len(rows) == 3 and all(row['method'] == 'block' for row in rows), rows
         for path, checksum in expected.items():
             self.representation(path, 'ordinary'); assert self.m.digest(path) == checksum
@@ -193,7 +199,7 @@ class Suite:
         for i in range(4):
             path = directory / ('shift-' + str(i))
             expected[path] = self.write(path, bytes([80 + i]) * (7919 * (i + 1)) + base)
-        rows = self.selections(self.optimize(directory))
+        rows = self.selections(self.optimize(directory, threads=4))
         chunked = [row for row in rows if row['method'] == 'chunk']
         assert len(chunked) >= 2, rows
         assert all(row['chunk'] * 5 <= row['native'] * 4 for row in chunked), rows
@@ -220,13 +226,19 @@ class Suite:
             stream.write(b'head' * 1024); stream.seek((2 << 20) - 4096); stream.write(b'tail' * 1024)
             stream.flush(); os.fsync(stream.fileno())
         checksum = self.m.digest(sparse)
+        # Settle every data record before sampling allocation; a clean hole
+        # inspection does not drain the file's dirty head and tail records.
+        settled = json.loads(self.m.command(self.ctl, 'sync-batch', ds, sparse, 1).stdout)
+        assert settled['error'] == 0, settled
         hole = self.inspect(ds, sparse, block)
         assert hole['error'] == 0 and hole['block_hole'], hole
-        # Inspection settles prior writes before sampling physical allocation.
         allocated = sparse.stat().st_blocks
         self.optimize(directory, 'block')
         assert self.m.digest(source) == self.m.digest(dest) == expected
-        assert self.m.digest(sparse) == checksum and sparse.stat().st_blocks <= allocated + 32
+        assert self.m.digest(sparse) == checksum and sparse.stat().st_blocks <= allocated + 32, {
+            'expected_sha256': checksum, 'actual_sha256': self.m.digest(sparse),
+            'blocks_before': allocated, 'blocks_after': sparse.stat().st_blocks,
+            'maximum_blocks_after': allocated + 32}
         assert self.inspect(ds, sparse, block)['block_hole']
         self.m.zfs('set', 'recordsize=16K', ds)
         small = directory / 'small-record'; self.write(small, source.read_bytes())
@@ -236,6 +248,7 @@ class Suite:
         assert bad['error'] in [errno.EINVAL, errno.ENOTSUP], bad
         return {'short_EOF_shared': result, 'holes_preserved': True,
                 'sparse_blocks_before': allocated, 'sparse_blocks_after': sparse.stat().st_blocks,
+                'sparse_baseline_sync': settled, 'sparse_baseline_synced_txg': hole['synced_txg'],
                 'incompatible_geometry_rejected': bad}
 
     def admission(self):
@@ -243,6 +256,48 @@ class Suite:
         source, dest, unequal = [directory / name for name in ['source', 'dest', 'unequal']]
         expected = self.write(source, self.data(seed=993)); self.write(dest, source.read_bytes())
         self.write(unequal, self.data(seed=994))
+        # A range inspection may report dirty bytes; it must not force a TXG.
+        # Write identical bytes without fsync, then use one explicit barrier for
+        # both objects. A natural background sync may win the immediate probe.
+        for path in [source, dest]:
+            self.m.xattr(path, b'hybrid-metadata')
+            first = path.read_bytes()[:1]
+            fd = os.open(path, os.O_WRONLY)
+            try:
+                assert os.pwrite(fd, first, 0) == 1
+            finally:
+                os.close(fd)
+        before_batch = [self.metadata(path) for path in [source, dest]]
+        dirty = json.loads(self.m.command(self.ctl, 'inspect-raw', ds, source, 0).stdout)
+        assert dirty['error'] in [0, errno.EAGAIN], dirty
+        initial = json.loads(self.m.command(self.ctl, 'inspect-initial', ds, source).stdout)
+        assert initial['error'] == 0, initial
+        invalid_batches = {}
+        for count, variant in [(0, None), (257, None), (1, 'zero-object')]:
+            args = [self.ctl, 'sync-batch', ds, source, count]
+            if variant:
+                args.append(variant)
+            result = json.loads(self.m.command(*args).stdout)
+            assert result['error'] == errno.EINVAL, result
+            invalid_batches[variant or str(count)] = result['error']
+        result = json.loads(self.m.command(self.ctl, 'sync-batch', ds, source, 2, dest).stdout)
+        assert result['error'] == 0, result
+        for path in [source, dest]:
+            result = json.loads(self.m.command(self.ctl, 'inspect-raw', ds, path, 0).stdout)
+            assert result['error'] == 0, result
+        assert before_batch == [self.metadata(path) for path in [source, dest]]
+        assert self.m.digest(source) == self.m.digest(dest) == expected
+        result = json.loads(self.m.command(self.ctl, 'sync-batch', ds, source, 1).stdout)
+        assert result['error'] == 0, result
+        result = json.loads(self.m.command(self.ctl, 'sync-batch', ds, source, 256, dest).stdout)
+        assert result['error'] == 0, result
+        stable = json.loads(self.m.command(self.ctl, 'inspect-loop', ds, source, 32).stdout)
+        assert stable['error'] == 0 and stable['count'] == 32, stable
+        # The former unconditional barrier advanced the TXG on every query.
+        # At least one stable adjacent pair tolerates incidental pool syncing.
+        assert stable['txg_changes'] < 31, stable
+        result = json.loads(self.m.command(self.ctl, 'inspect-stale', ds, source, 0).stdout)
+        assert result['error'] == errno.ESTALE, result
         rejected = {}
         for variant in ['stale-generation', 'stale-mtime', 'stale-source']:
             result = self.share(ds, source, dest, variant=variant)
@@ -263,13 +318,20 @@ class Suite:
                     mapping.close()
         assert self.m.digest(source) == self.m.digest(dest) == expected
         return {'stale_identity_errors': rejected, 'unequal_bytes_rejected': True,
-                'competing_open_and_read_write_mappings_rejected': True}
+                'competing_open_and_read_write_mappings_rejected': True,
+                'sync_batch': {'dirty_range_error': dirty['error'],
+                               'invalid_batches': invalid_batches,
+                               'one_two_and_256_object_batches': True,
+                               'bytes_and_metadata_preserved': True,
+                               'clean_initial_inspections': stable}}
 
     def peer_conversion(self):
         ds, directory = self.new('peer-conversion')
         source, dest = directory / 'source', directory / 'dest'
         expected = self.write(source, self.data(seed=995)); self.write(dest, source.read_bytes())
-        self.optimize(directory, 'block'); assert self.inspect(ds, dest)['block_shared']
+        text = self.optimize(directory, 'block')
+        self.m.zpool('sync', self.pool)
+        assert self.inspect(ds, dest)['block_shared'], text
         self.m.zfs('snapshot', ds + '@native')
         rows = self.selections(self.optimize(dest, 'chunk'))
         self.representation(dest, 'chunk'); self.representation(source, 'ordinary')
@@ -305,7 +367,7 @@ class Suite:
         expected = self.write(source, self.data(seed=997)); self.write(dest, source.read_bytes())
         logfile = self.root / 'hybrid-watch.log'
         with logfile.open('wb') as log:
-            worker = subprocess.Popen([self.m.ZFS, 'chunkdedup', 'watch', '--interval', '1', '--min-age', '0', ds], stdout=log, stderr=log)
+            worker = subprocess.Popen([self.m.ZFS, 'chunkdedup', 'watch', '--threads=4', '--interval', '1', '--min-age', '0', ds], stdout=log, stderr=log)
             try:
                 deadline = time.monotonic() + 45
                 while not self.inspect(ds, dest).get('block_shared', False):

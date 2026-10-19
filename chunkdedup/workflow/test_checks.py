@@ -14,6 +14,7 @@ REQUIRED = (
     'cmd/zfs/rabin64_table.h', 'cmd/zfs/zfs_chunkdedup_user.c',
     'include/sys/zfs_chunkdedup.h', 'module/zfs/zfs_chunkdedup.c',
     'cmd/zfs/chunkdedup_hybrid.h',
+    'cmd/zfs/chunkdedup_parallel.h',
 )
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--repo', type=Path, required=True)

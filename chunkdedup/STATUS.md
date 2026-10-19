@@ -1,44 +1,48 @@
-# Validation status — 18 October 2026
+# Validation status — 19 October 2026
 
-Two fresh isolated VM runs and a dedicated bare-metal rerun passed **21/21
-original cases and 12/12 hybrid cases**, including snapshot/clone independence,
-received-content verification and full/incremental logical replication.
-The latest full native gate remains **INFRA_FAILURE**, with cleanup and host
-state acceptance incomplete. Functional passes are reported separately.
+The latest development source snapshot is
+`833fb482f3675b5ad87e3bbdcb18cca66760de1625ecd219be2c22359724a1ed`.
+Its required local profile **passed**, checking 4,138 source files, 141 immutable
+baseline files and 35 Microsoft conformance fixtures. Strict and ASan/UBSan
+tests cover concurrent execution, bounded admission, ordered catalog merging,
+dirty retries, hardlinks, stale/skipped files and cancellation cleanup.
 
-The replication harness checks whether a received dataset is mounted, mounts
-only when necessary, and asserts the resulting state before continuing. All
-pre-existing hybrid assertions remain present. The evaluator now includes the
-separately pinned hybrid archive in its exact media inventory when hybrid tests
-are declared; archive coverage and hash checks remain enforced. Neither change
-modifies the native implementation, source patch, chunker or immutable fixtures.
+The native CLI build and installation readback passed. A 40-worker deployment
+showed 41 process threads and more than four cores of CPU use, confirming
+multicore activity. These observations are not a matched throughput benchmark.
+Parallel scanning changes only the CLI source, its new executor header and its
+build file relative to the kernel-tested predecessor. Selection, sharing and
+CDC installation remain sequential; kernel and on-disk formats are unchanged
+by this userspace update. The full native suite was not rerun for that update.
 
-The latest VM attempt completed all 33 functional cases and restored the guest
-module and test pools, then its host-cleanup SSH probe exceeded a five-second
-timeout. A separate recovery confirmed the VM stopped, restored its exact
-configuration and released only the run's lock. Configuration, module and pool
-properties matched the baseline. One existing host service was running before
-and after with a different process identity; the strict comparison therefore
-records a state difference. The cause is not established by this evidence.
-Recovery did not target services or interrupt unrelated replication. The
-original failure and recovery evidence remain separate.
+The preceding durability-batching source snapshot,
+`98882f3c8618f31f28dcb7208c0909f78eca5290de029a2763749b7a5bc5ebcc`,
+passed **21 original and 12 hybrid cases** in the isolated guest through the
+`native-smoke` profile. It reused the exact module/tools from an earlier
+successful compilation of the same source, with fresh hash/provenance checks.
+Guest restoration, shutdown and exact host comparison passed. This is fresh
+native test execution with a reused build, not a fresh full-native compilation
+or a relabeling of earlier failed evaluations.
 
-The bare-metal rerun passed on disposable file-backed pools using a dedicated
-SSD. Restoration of the normal installation and original pool/mount intent
-passed. This is functional evidence for that layout, not raw-device or
-production qualification, and does not replace the VM-specific native gate.
+The native cases include snapshots, clones, logical replication, independent
+mutations and reference preservation. New batching checks cover dirty-file
+admission, request bounds, preserved bytes/metadata and repeated clean
+inspections without transaction-group advances. Fixture setup now settles
+allocation and BRT visibility explicitly before measuring their existing
+assertions. All 21 original and 12 hybrid cases and immutable expectations
+remain present. Earlier source, fixture and infrastructure failures remain
+retained in development evidence; the prior public results remain history in
+[VALIDATION.json](VALIDATION.json).
 
-The required local profile passed with **35 Microsoft fixtures and 141 immutable
-baseline files**. The unchanged 4,134-file native source digest and current case
-inventories are recorded in [VALIDATION.json](VALIDATION.json). That file retains
-the earlier failed native evaluation as history. The 17 October report remains
-unchanged in the development evidence.
+The block-only command is also included with its focused scanner tests. It is
+currently serial; parallel `--threads` support belongs to `zfs chunkdedup`.
+Block-only operation needs the matching patched driver and native
+`block_cloning` feature, without enabling the CDC feature.
 
-Matched hybrid allocation, pure-read and RAM comparisons and planned sharing
-power-loss validation remain **NOT_RUN**. The 1.25x foreground-read target is
-unverified. Existing regression timings do not establish a matched hybrid
-performance pass. Experimental modules belong in disposable test environments.
+Current-revision matched allocation, pure-read and RAM comparisons and forced
+sharing power-loss qualification remain **NOT_RUN**. The **1.25x** foreground-read
+target is unqualified. Functional tests and live CPU observations do not prove
+a performance target or production readiness.
 
 This public summary excludes host inventories, private paths, device identities
-and raw operational logs. No full native gate or production-readiness pass is
-claimed.
+and raw operational logs. Use the guarded disposable guest for reproduction.

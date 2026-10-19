@@ -10,21 +10,22 @@ selected per file; existing chunked files retain their format.
 
 ## Current status
 
-Fresh isolated VM and dedicated bare-metal tests passed **21/21 existing
-regression cases and 12/12 hybrid cases**, including snapshot/clone and full/
-incremental replication assertions. The replication mount-state harness error
-and a strict media-inventory mismatch have been corrected; native code is unchanged.
+Scanning and hashing now use multiple cores: `optimize` and `watch` default to
+the online CPU count, capped at 64, with `--threads=1..64` available. Clean-file
+inspection avoids a forced durability wait; dirty files share waits in batches
+of up to 256. Selection and installation remain sequential.
 
-The latest full native gate remains **INFRA_FAILURE** after a host-cleanup
-SSH timeout. Separate recovery confirmed the guest stopped and restored its
-exact VM configuration. A running unrelated service changed process identity,
-so the strict host-state comparison is not a pass. The original failed
-evaluation remains preserved.
+The latest userspace revision passed local checks and focused strict/sanitizer
+tests. Its kernel predecessor passed **21 original and 12 hybrid native cases**
+through `native-smoke`, reusing an exactly verified build with guest and host
+restoration. The full native suite was not rerun after the userspace-only
+parallel scan change. A live 40-worker run confirmed multicore execution;
+it does not establish a matched speedup.
 
-Current-revision matched physical-allocation, pure-read and RAM comparisons,
-and planned forced-power-loss validation, have **not run**. The foreground-read
-target remains 1.25x pristine latency. This is a development prototype; run
-experimental modules only inside a disposable guest.
+Matched allocation, pure-read and RAM comparisons and forced-power-loss
+qualification remain incomplete. The foreground-read target remains 1.25x
+pristine latency and is unqualified. This is a development prototype; reproduce
+native tests in a disposable guest.
 
 See [validation status](chunkdedup/STATUS.md), [saved validation summary](chunkdedup/VALIDATION.json)
 and [command/design documentation](chunkdedup/HYBRID.md).
@@ -38,9 +39,14 @@ and [command/design documentation](chunkdedup/HYBRID.md).
 - CDC preserves the Microsoft-derived regression chunker, chunk identifiers,
   immutable chunk objects and existing on-disk format.
 - The worker analyzes the traversal before conversion, with temporary disk
-  catalogs, bounded memory, allocation estimates and conservative fallbacks.
+  catalogs, bounded parallel admission, allocation estimates and conservative
+  fallbacks.
 - `status --methods` reports per-file representation and labeled pool-wide BRT
   statistics. Plain six-field status remains compatible.
+- `zfs blockdedup` provides the separate block-only optimizer with a matching
+  patched module. It uses native block sharing without enabling the CDC pool
+  feature. That command is currently serial and has no `--threads` option;
+  use `zfs chunkdedup optimize --method=block` for parallel scanning.
 
 ## Verify locally
 
@@ -62,11 +68,11 @@ read the [guarded offline lab recipe](chunkdedup/lab-setup/README.md).
 ## Source and provenance
 
 The fork is based on upstream [`zfs-2.4.4`](https://github.com/openzfs/zfs/commit/71a9f9578616a90c3c14bb59629fb4d31bfd68d1).
-The first feature commit exactly matches the 4,134-file tested source snapshot;
-its digest and file manifest are in [SOURCE.json](chunkdedup/SOURCE.json) and
-[tested-source-files.json](chunkdedup/tested-source-files.json). Later publication
-changes add documentation, tests and a portable verification wrapper. They do
-not change the native implementation.
+The latest tested development snapshot contains 4,138 source files. Its digest
+and file manifest are in [SOURCE.json](chunkdedup/SOURCE.json) and
+[tested-source-files.json](chunkdedup/tested-source-files.json). Publication
+documentation and the portable verification wrapper use this repository's
+layout; validation scope is recorded separately for each source revision.
 
 The complete [source patch](chunkdedup/source.patch) applies to the pinned
 upstream base. The [original upstream README](chunkdedup/upstream/README.md)

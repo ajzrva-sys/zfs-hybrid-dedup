@@ -4,6 +4,7 @@ import importlib.util
 import json
 from pathlib import Path
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 import subprocess
@@ -167,6 +168,86 @@ class RepairBoundaryTests(unittest.TestCase):
         self.assertEqual(calls, {'verify': 4, 'repair': 3})
         self.assertEqual(json.loads((output / 'summary.json').read_text())['status'], 'TEST_FAILURE')
         self.assertEqual(unit.read_text(), '#define VALUE 0\n')
+
+
+class NativeProfileSelectionTests(unittest.TestCase):
+    def test_both_native_profiles_require_explicit_host(self):
+        for profile in ('native', 'native-smoke'):
+            with self.subTest(profile=profile):
+                result = subprocess.run([sys.executable, str(Path(__file__).with_name('run.py')),
+                                         '--repo', '/unused', '--profile', profile],
+                                        capture_output=True, text=True)
+                self.assertEqual(result.returncode, 2)
+                self.assertIn('needs --host', result.stderr)
+
+    def test_cached_receipt_option_is_smoke_only(self):
+        for profile in ('local', 'native'):
+            result = subprocess.run([sys.executable, str(Path(__file__).with_name('run.py')),
+                                     '--repo', '/unused', '--host', 'bsd', '--profile', profile,
+                                     '--cached-build-receipt', '/unused.json'], capture_output=True, text=True)
+            self.assertEqual(result.returncode, 2)
+            self.assertIn('only for native-smoke', result.stderr)
+
+    def test_only_single_smoke_build_skip_is_successful(self):
+        build = dict(name='guest_build', status='SKIPPED', returncode=0, log='build.log')
+        passed = dict(name='guest_regression', status='PASS', returncode=0, log='test.log')
+        variants = [('native-smoke', [build, passed], 0, False),
+                    ('native', [build, passed], 0, True),
+                    ('native-smoke', [build, build, passed], 0, True),
+                    ('native-smoke', [build, dict(passed, status='SKIPPED')], 0, True),
+                    ('native-smoke', [build, dict(passed, returncode=1)], 0, True),
+                    ('native-smoke', [dict(build, returncode=1), passed], 1, True),
+                    ('native-smoke', [build, passed], 124, True),
+                    ('native', [dict(build, status='PASS'), passed], 0, False)]
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); folder = root / 'native'; folder.mkdir()
+            (root / 'native-driver.log').write_text('selection fixture only\n')
+            for profile, rows, code, rejected in variants:
+                with self.subTest(profile=profile, rows=rows, code=code):
+                    runner.write(folder / 'results.json', dict(profile=profile, results=rows))
+                    result = runner.import_stages(root, folder, code)
+                    self.assertEqual(len(result) > len(rows), rejected)
+                    if rejected: self.assertEqual(result[-1]['status'], 'INFRA_FAILURE')
+
+    def test_selected_mode_keeps_same_local_prerequisite_flow(self):
+        for profile, mode in [('local', None), ('native', 'build'), ('native-smoke', 'smoke')]:
+            with self.subTest(profile=profile), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                source, controls, parent = root / 'source', root / 'controls', root / 'run'
+                (source / 'cmd/zfs').mkdir(parents=True)
+                (source / 'cmd/zfs/unit.c').write_text('/* selection fixture */\n')
+                controls.mkdir(); parent.mkdir()
+                for name in ('run.py', 'checks.py', 'native.py', 'evaluate.py', 'policy.json', 'repair-schema.json'):
+                    (controls / name).write_text('{}\n')
+                files = runner.inventory(source, ['cmd/zfs/unit.c'])
+                args = SimpleNamespace(profile=profile, run_id='selection', host='bsd',
+                                       kit=root, check_timeout=60, native_timeout=60,
+                                       cached_build_receipt=root / 'cached-build.json')
+                native_calls, evaluation_profiles = [], []
+
+                def execute(command, log, **kwargs):
+                    log.write_text('Invocation-selection fixture only.\n')
+                    if len(command) > 1 and Path(command[1]).name == 'evaluate.py':
+                        run = parent / 'attempt-00'
+                        evaluation_profiles.append(json.loads((run / 'run.json').read_text())['profile'])
+                        runner.write(run / 'evaluation.json', {'status': 'PASS'})
+                    if len(command) > 1 and Path(command[1]).name == 'native.py':
+                        native_calls.append(command)
+                    return 0, 0
+
+                with mock.patch.object(runner, 'execute', execute), \
+                        mock.patch.object(runner, 'import_stages', return_value=[]):
+                    runner.verify_attempt(source, files, source, parent, 0, args, controls, [])
+                self.assertEqual(evaluation_profiles, ['local'] if mode is None else ['local', profile])
+                self.assertEqual(len(native_calls), 0 if mode is None else 1)
+                if mode is not None:
+                    command = native_calls[0]
+                    self.assertEqual(command[command.index('--mode') + 1], mode)
+                    self.assertEqual(command[command.index('--host') + 1], 'bsd')
+                    if profile == 'native-smoke':
+                        self.assertEqual(command[command.index('--cached-build-receipt') + 1], str(args.cached_build_receipt))
+                    else:
+                        self.assertNotIn('--cached-build-receipt', command)
 
 
 if __name__ == '__main__':

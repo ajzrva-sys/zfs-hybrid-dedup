@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "source_digest": "90ce02dca5f0da9148af08d93f6a517265e9396b91b3bb9f9b24197ced144faf",
+  "source_digest": "833fb482f3675b5ad87e3bbdcb18cca66760de1625ecd219be2c22359724a1ed",
   "files": [
     {
       "path": ".editorconfig",
@@ -743,7 +743,7 @@
     {
       "path": "cmd/zfs/Makefile.am",
       "type": "file",
-      "sha256": "cbb68397c7ccdf51f0508f83b69bcff5483d6f7e01428090f392d3359e0859eb",
+      "sha256": "dd385e2e8b5b23fadeb75d502bf0c9b7ca9d53b71d0f2a03cb1ad17798856f2a",
       "mode": 644
     },
     {
@@ -771,15 +771,27 @@
       "mode": 644
     },
     {
+      "path": "cmd/zfs/chunkdedup_parallel.h",
+      "type": "file",
+      "sha256": "f3f9b4d1bcc01b31e11ad9f5dbf4333b5c45dca4ca6b7e79b784f00fc955c80a",
+      "mode": 644
+    },
+    {
       "path": "cmd/zfs/rabin64_table.h",
       "type": "file",
       "sha256": "92c77f01829bd4735d17abfdf0ebaabc221b5c502677d5e58e3c7d2d610f7bb5",
       "mode": 644
     },
     {
+      "path": "cmd/zfs/zfs_blockdedup.c",
+      "type": "file",
+      "sha256": "74a8828dfbd810ae68174df073290b8c49cd6dd20130da61d051d627aae3bf8f",
+      "mode": 644
+    },
+    {
       "path": "cmd/zfs/zfs_chunkdedup_user.c",
       "type": "file",
-      "sha256": "b40a6c7a495c529e71a8818262703a4de36313ae8929dcd7f838af572eecffc1",
+      "sha256": "7c13a6867661e2f16867bcc70065a8dede500cb5fae999c63e626fd90fdf2384",
       "mode": 644
     },
     {
@@ -797,7 +809,7 @@
     {
       "path": "cmd/zfs/zfs_main.c",
       "type": "file",
-      "sha256": "d0c5d33aa1967182e9082c3117ef7b9a35aa5be8d3adf1597e57fc1418975fa0",
+      "sha256": "7951897ec60b6713b33ea1b32db9644c151c5227b0a37deec3f2bce22228378e",
       "mode": 644
     },
     {
@@ -815,7 +827,7 @@
     {
       "path": "cmd/zfs/zfs_util.h",
       "type": "file",
-      "sha256": "f3e947345d1ec6b63026e5b97207b8661194b5f5f466280844a80a0b30294934",
+      "sha256": "e31504252ab1ea5b4a78b7d51abfc8f21f2a9fe7ed88490659bc65c3cfedd495",
       "mode": 644
     },
     {
@@ -3425,7 +3437,7 @@
     {
       "path": "include/Makefile.am",
       "type": "file",
-      "sha256": "b51f0dbf391104a875213f8890f2a5347e4659c13eb270159406844c4de8f836",
+      "sha256": "d39f9ec2c8b87d4bbc3de0e12392405dc8b509585e6f74e7761b9542e8ddead4",
       "mode": 644
     },
     {
@@ -3473,7 +3485,7 @@
     {
       "path": "include/libzfs_core.h",
       "type": "file",
-      "sha256": "641988141a953ade2b2c78e1838e0713141301a29e8e343b3de951f7b56054b9",
+      "sha256": "0835f70d11620fc9d87ab7bb889574cc4fbc8d42d508c9a728c29345585979b2",
       "mode": 644
     },
     {
@@ -4985,7 +4997,7 @@
     {
       "path": "include/sys/fs/zfs.h",
       "type": "file",
-      "sha256": "77330f1044c3269b51acc7b366a8a6bde39b5e7b950dd34921c59a8031d94599",
+      "sha256": "7ad2813cfaee1c60df17e709257aeee7c8828b1543aec34ce14e873513b2f1dc",
       "mode": 644
     },
     {
@@ -5370,6 +5382,12 @@
       "path": "include/sys/zfs_acl.h",
       "type": "file",
       "sha256": "af741717053c8dd3a5531fa24efa88d0c57fe36482430a93340cf98572ce1364",
+      "mode": 644
+    },
+    {
+      "path": "include/sys/zfs_blockdedup.h",
+      "type": "file",
+      "sha256": "6e24cc9227a6fdcc9f5817021020012a3de024125fcce2edbd226676dd78fb04",
       "mode": 644
     },
     {
@@ -6623,7 +6641,7 @@
     {
       "path": "lib/libzfs_core/libzfs_core.c",
       "type": "file",
-      "sha256": "f5a57b157b1d074d52fa7a2745b64a80a514786c56e5046cad44c39c6875ef5a",
+      "sha256": "9eed112ec747057153f0040dcfafa86245077659cc31d5719cd9b697d22fc7f3",
       "mode": 644
     },
     {
@@ -7475,13 +7493,13 @@
     {
       "path": "module/Kbuild.in",
       "type": "file",
-      "sha256": "38a46ae24417eb06ebf70e7cda0cffa5bd15cfe4547536ecab7999d0ca14cbc9",
+      "sha256": "41424542557a8dda2c9af4242b10021d66d44b17f40f97c431d6336e52b41b5f",
       "mode": 644
     },
     {
       "path": "module/Makefile.bsd",
       "type": "file",
-      "sha256": "cdc62148d75e55196a31d2a7c4f494b4a07193a848908b02b13f26e06fdb17a7",
+      "sha256": "5acb79964792d71a4c512b08ddb7d8de667ba8923c0ec64e65b5ce7e3ba2b8a2",
       "mode": 644
     },
     {
@@ -9765,6 +9783,12 @@
       "mode": 644
     },
     {
+      "path": "module/zfs/zfs_blockdedup.c",
+      "type": "file",
+      "sha256": "08cabc088ab67c85cfe34011181ad77ce5c9d03d01dafe1099b9f163408f3b8c",
+      "mode": 644
+    },
+    {
       "path": "module/zfs/zfs_byteswap.c",
       "type": "file",
       "sha256": "0c6e036c98581f40326b0be6304ce742d2eedc9444b159844866309cf2acd1c1",
@@ -9815,7 +9839,7 @@
     {
       "path": "module/zfs/zfs_ioctl.c",
       "type": "file",
-      "sha256": "414f2d3a89adecfb2e4ea5483f924df582635af7fc108281acb381b2e58c6b1f",
+      "sha256": "3a8b2d1c8326fd3e49051d544f3ae785beafefe41052f905376ada0c5b8f78dd",
       "mode": 644
     },
     {

@@ -26,23 +26,32 @@ index 0000000..de43774
 +OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 +SOFTWARE.
 diff --git a/cmd/zfs/Makefile.am b/cmd/zfs/Makefile.am
-index 357b5b3..9a9af1f 100644
+index 357b5b3..a8c37a9 100644
 --- a/cmd/zfs/Makefile.am
 +++ b/cmd/zfs/Makefile.am
-@@ -6,6 +6,12 @@ zfs_SOURCES = \
+@@ -6,10 +6,21 @@ zfs_SOURCES = \
  	%D%/zfs_iter.c \
  	%D%/zfs_iter.h \
  	%D%/zfs_main.c \
++	%D%/zfs_blockdedup.c \
 +	%D%/zfs_chunkdedup_user.c \
 +	%D%/chunkdedup_hybrid.c \
 +	%D%/chunkdedup_hybrid.h \
++	%D%/chunkdedup_parallel.h \
 +	%D%/chunkdedup_chunker.c \
 +	%D%/chunkdedup_chunker.h \
 +	%D%/rabin64_table.h \
  	%D%/zfs_project.c \
  	%D%/zfs_projectutil.h \
  	%D%/zfs_util.h
-@@ -21,3 +27,7 @@ zfs_LDADD += $(LTLIBINTL)
+ 
++zfs_CFLAGS = $(AM_CFLAGS) -pthread
++zfs_LDFLAGS = -pthread
++
+ zfs_LDADD = \
+ 	libzfs.la \
+ 	libzfs_core.la \
+@@ -21,3 +32,7 @@ zfs_LDADD += $(LTLIBINTL)
  if BUILD_FREEBSD
  zfs_LDADD += -lgeom -ljail
  endif
@@ -571,6 +580,207 @@ index 0000000..fba4c24
 +int cd_hybrid_alloc(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t,
 +    uint64_t *);
 +#endif
+diff --git a/cmd/zfs/chunkdedup_parallel.h b/cmd/zfs/chunkdedup_parallel.h
+new file mode 100644
+index 0000000..0ef47dd
+--- /dev/null
++++ b/cmd/zfs/chunkdedup_parallel.h
+@@ -0,0 +1,195 @@
++/* SPDX-License-Identifier: CDDL-1.0 */
++#ifndef _CHUNKDEDUP_PARALLEL_H
++#define _CHUNKDEDUP_PARALLEL_H
++
++#include <errno.h>
++#include <pthread.h>
++#include <stddef.h>
++#include <stdlib.h>
++#include <string.h>
++
++/*
++ * A bounded, ordered worker pool. Only the coordinator submits, takes and
++ * destroys the pool. Callbacks own no queue state and run without its mutex.
++ * Items always remain caller-owned, including untaken items after fini().
++ */
++#define	CD_PARALLEL_MAX_THREADS	64
++
++enum cd_parallel_state {
++	CD_PARALLEL_EMPTY, CD_PARALLEL_QUEUED,
++	CD_PARALLEL_RUNNING, CD_PARALLEL_DONE
++};
++
++struct cd_parallel_slot {
++	void *item;
++	int error;
++	enum cd_parallel_state state;
++};
++
++struct cd_parallel {
++	pthread_mutex_t lock;
++	pthread_cond_t work_ready, result_ready;
++	pthread_t *threads;
++	struct cd_parallel_slot *slots;
++	size_t capacity, count, head, tail, next;
++	unsigned int created;
++	int stopping, initialized;
++	int (*work)(void *);
++};
++
++static void *
++cd_parallel_worker(void *argument)
++{
++	struct cd_parallel *pool = argument;
++	(void) pthread_mutex_lock(&pool->lock);
++	for (;;) {
++		while (!pool->stopping &&
++		    pool->slots[pool->next].state != CD_PARALLEL_QUEUED)
++			(void) pthread_cond_wait(&pool->work_ready, &pool->lock);
++		if (pool->stopping)
++			break;
++		struct cd_parallel_slot *slot = &pool->slots[pool->next];
++		pool->next = (pool->next + 1) % pool->capacity;
++		slot->state = CD_PARALLEL_RUNNING;
++		void *item = slot->item;
++		(void) pthread_mutex_unlock(&pool->lock);
++		int error = pool->work(item);
++		(void) pthread_mutex_lock(&pool->lock);
++		slot->error = error;
++		slot->state = CD_PARALLEL_DONE;
++		(void) pthread_cond_broadcast(&pool->result_ready);
++	}
++	(void) pthread_mutex_unlock(&pool->lock);
++	return (NULL);
++}
++
++static inline void
++cd_parallel_fini(struct cd_parallel *pool)
++{
++	if (pool == NULL || !pool->initialized)
++		return;
++	(void) pthread_mutex_lock(&pool->lock);
++	pool->stopping = 1;
++	(void) pthread_cond_broadcast(&pool->work_ready);
++	(void) pthread_cond_broadcast(&pool->result_ready);
++	(void) pthread_mutex_unlock(&pool->lock);
++	for (unsigned int i = 0; i < pool->created; i++)
++		(void) pthread_join(pool->threads[i], NULL);
++	(void) pthread_cond_destroy(&pool->result_ready);
++	(void) pthread_cond_destroy(&pool->work_ready);
++	(void) pthread_mutex_destroy(&pool->lock);
++	free(pool->slots);
++	free(pool->threads);
++	memset(pool, 0, sizeof (*pool));
++}
++
++static inline int
++cd_parallel_init(struct cd_parallel *pool, unsigned int threads,
++    int (*work)(void *))
++{
++	if (pool == NULL || work == NULL || threads == 0 ||
++	    threads > CD_PARALLEL_MAX_THREADS)
++		return (EINVAL);
++	memset(pool, 0, sizeof (*pool));
++	pool->capacity = (size_t)threads * 2;
++	pool->work = work;
++	pool->threads = calloc(threads, sizeof (*pool->threads));
++	pool->slots = calloc(pool->capacity, sizeof (*pool->slots));
++	int error = ENOMEM;
++	if (pool->threads == NULL || pool->slots == NULL)
++		goto free_storage;
++	if ((error = pthread_mutex_init(&pool->lock, NULL)) != 0)
++		goto free_storage;
++	if ((error = pthread_cond_init(&pool->work_ready, NULL)) != 0)
++		goto destroy_lock;
++	if ((error = pthread_cond_init(&pool->result_ready, NULL)) != 0)
++		goto destroy_work;
++	pool->initialized = 1;
++	for (unsigned int i = 0; i < threads; i++) {
++		error = pthread_create(&pool->threads[i], NULL,
++		    cd_parallel_worker, pool);
++		if (error != 0) {
++			cd_parallel_fini(pool);
++			return (error);
++		}
++		pool->created++;
++	}
++	return (0);
++
++destroy_work:
++	(void) pthread_cond_destroy(&pool->work_ready);
++destroy_lock:
++	(void) pthread_mutex_destroy(&pool->lock);
++free_storage:
++	free(pool->slots);
++	free(pool->threads);
++	memset(pool, 0, sizeof (*pool));
++	return (error);
++}
++
++static inline size_t
++cd_parallel_count(struct cd_parallel *pool)
++{
++	(void) pthread_mutex_lock(&pool->lock);
++	size_t count = pool->count;
++	(void) pthread_mutex_unlock(&pool->lock);
++	return (count);
++}
++
++static inline int
++cd_parallel_full(struct cd_parallel *pool)
++{
++	return (cd_parallel_count(pool) == pool->capacity);
++}
++
++static inline int
++cd_parallel_submit(struct cd_parallel *pool, void *item)
++{
++	(void) pthread_mutex_lock(&pool->lock);
++	int error = 0;
++	if (pool->stopping) {
++		error = ECANCELED;
++	} else if (pool->count == pool->capacity) {
++		error = EAGAIN;
++	} else {
++		struct cd_parallel_slot *slot = &pool->slots[pool->tail];
++		slot->item = item;
++		slot->error = 0;
++		slot->state = CD_PARALLEL_QUEUED;
++		pool->tail = (pool->tail + 1) % pool->capacity;
++		pool->count++;
++		(void) pthread_cond_signal(&pool->work_ready);
++	}
++	(void) pthread_mutex_unlock(&pool->lock);
++	return (error);
++}
++
++/* Results leave the pool in dispatch order, regardless of completion order. */
++static inline int
++cd_parallel_take(struct cd_parallel *pool, void **item, int *work_error)
++{
++	if (item == NULL || work_error == NULL)
++		return (EINVAL);
++	(void) pthread_mutex_lock(&pool->lock);
++	int error = 0;
++	if (pool->count == 0) {
++		error = ENOENT;
++	} else {
++		struct cd_parallel_slot *slot = &pool->slots[pool->head];
++		while (slot->state != CD_PARALLEL_DONE && !pool->stopping)
++			(void) pthread_cond_wait(&pool->result_ready, &pool->lock);
++		if (slot->state != CD_PARALLEL_DONE) {
++			error = ECANCELED;
++		} else {
++			*item = slot->item;
++			*work_error = slot->error;
++			memset(slot, 0, sizeof (*slot));
++			pool->head = (pool->head + 1) % pool->capacity;
++			pool->count--;
++		}
++	}
++	(void) pthread_mutex_unlock(&pool->lock);
++	return (error);
++}
++
++#endif /* _CHUNKDEDUP_PARALLEL_H */
 diff --git a/cmd/zfs/rabin64_table.h b/cmd/zfs/rabin64_table.h
 new file mode 100644
 index 0000000..b0e5b5a
@@ -1095,12 +1305,819 @@ index 0000000..b0e5b5a
 +    UINT64_C(4232344276098637031),
 +    UINT64_C(76385176676938777),
 +};
+diff --git a/cmd/zfs/zfs_blockdedup.c b/cmd/zfs/zfs_blockdedup.c
+new file mode 100644
+index 0000000..ca61947
+--- /dev/null
++++ b/cmd/zfs/zfs_blockdedup.c
+@@ -0,0 +1,801 @@
++/* SPDX-License-Identifier: CDDL-1.0 */
++/* Background, verified sharing of ordinary native ZFS blocks. */
++#ifdef BLOCKDEDUP_TEST_HEADER
++#include BLOCKDEDUP_TEST_HEADER
++#else
++#include <sys/types.h>
++#include <sys/stat.h>
++#include <libzfs.h>
++#include <libzfs_core.h>
++#include <libnvpair.h>
++#include "zfs_util.h"
++#endif
++#include <sys/wait.h>
++#include <dirent.h>
++#include <errno.h>
++#include <fcntl.h>
++#include <fts.h>
++#include <getopt.h>
++#include <inttypes.h>
++#include <limits.h>
++#include <signal.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <time.h>
++#include <unistd.h>
++#ifdef __APPLE__
++#include <CommonCrypto/CommonDigest.h>
++#else
++#include <openssl/evp.h>
++#endif
++
++#define BD_READ_SIZE (256U << 10)
++#define BD_MAX_BLOCK (16U << 20)
++
++static volatile sig_atomic_t bd_stop;
++
++struct bd_file {
++	struct stat identity;
++	char dataset[ZFS_MAX_DATASET_NAME_LEN];
++	char path[PATH_MAX];
++};
++
++struct bd_item {
++	uint64_t device, block, length, file, offset;
++	char hash[65];
++};
++
++struct bd_seen {
++	uint64_t device, object, occupied;
++};
++
++struct bd_catalog {
++	FILE *files, *blocks, *sorted, *seen;
++	char directory[PATH_MAX];
++	uint64_t capacity, count, block_count, candidates, shared, already;
++	uint64_t skipped, deferred;
++	boolean_t dry_run;
++};
++
++static boolean_t
++bd_deferred(int error)
++{
++	return (error == EBUSY || error == EAGAIN || error == ESTALE ||
++	    error == ENOENT);
++}
++
++static void
++bd_signal(int signo)
++{
++	(void) signo;
++	bd_stop = 1;
++}
++
++static void
++bd_identity(nvlist_t *args, const struct stat *st, boolean_t source)
++{
++	const char *object = source ? "source_object" : "object";
++	const char *generation = source ? "source_generation" : "generation";
++	const char *size = source ? "source_size" : "size";
++	fnvlist_add_uint64(args, object, st->st_ino);
++	fnvlist_add_uint64(args, size, st->st_size);
++#ifdef __FreeBSD__
++	fnvlist_add_uint64(args, generation, st->st_gen);
++	fnvlist_add_uint64(args, source ? "source_mtime_sec" : "mtime_sec",
++	    st->st_mtim.tv_sec);
++	fnvlist_add_uint64(args, source ? "source_mtime_nsec" : "mtime_nsec",
++	    st->st_mtim.tv_nsec);
++#else
++	fnvlist_add_uint64(args, generation, 0);
++#endif
++}
++
++static boolean_t
++bd_same_identity(const struct stat *a, const struct stat *b)
++{
++	return (a->st_dev == b->st_dev && a->st_ino == b->st_ino &&
++	    a->st_size == b->st_size && a->st_mtime == b->st_mtime
++#ifdef __FreeBSD__
++	    && a->st_gen == b->st_gen &&
++	    a->st_mtim.tv_nsec == b->st_mtim.tv_nsec
++#endif
++	    );
++}
++
++/* All catalog data and sort spills reside in the selected temporary area. */
++static FILE *
++bd_tempfile(struct bd_catalog *c)
++{
++	char path[PATH_MAX];
++	if (snprintf(path, sizeof (path), "%s/catalog.XXXXXX", c->directory) >=
++	    (int)sizeof (path)) {
++		errno = ENAMETOOLONG;
++		return (NULL);
++	}
++	int fd = mkstemp(path);
++	if (fd < 0)
++		return (NULL);
++	(void) unlink(path);
++	(void) fcntl(fd, F_SETFD, FD_CLOEXEC);
++	FILE *fp = fdopen(fd, "w+");
++	if (fp == NULL) {
++		int error = errno;
++		(void) close(fd);
++		errno = error;
++	}
++	return (fp);
++}
++
++static int
++bd_init(struct bd_catalog *c, const char *tmpdir, boolean_t dry_run)
++{
++	memset(c, 0, sizeof (*c));
++	c->dry_run = dry_run;
++	if (snprintf(c->directory, sizeof (c->directory),
++	    "%s/zfs-blockdedup.XXXXXX", tmpdir) >= (int)sizeof (c->directory))
++		return (ENAMETOOLONG);
++	if (mkdtemp(c->directory) == NULL) {
++		c->directory[0] = '\0';
++		return (errno);
++	}
++	c->files = bd_tempfile(c);
++	c->blocks = bd_tempfile(c);
++	c->seen = bd_tempfile(c);
++	if (c->files == NULL || c->blocks == NULL || c->seen == NULL)
++		return (errno);
++	c->capacity = 1024;
++	return (ftruncate(fileno(c->seen), c->capacity *
++	    sizeof (struct bd_seen)) == 0 ? 0 : errno);
++}
++
++static void
++bd_fini(struct bd_catalog *c)
++{
++	FILE *files[] = { c->files, c->blocks, c->sorted, c->seen };
++	for (size_t i = 0; i < sizeof (files) / sizeof (files[0]); i++)
++		if (files[i] != NULL)
++			(void) fclose(files[i]);
++	if (c->directory[0] != '\0') {
++		DIR *dir = opendir(c->directory);
++		if (dir != NULL) {
++			struct dirent *entry;
++			while ((entry = readdir(dir)) != NULL)
++				if (strcmp(entry->d_name, ".") != 0 &&
++				    strcmp(entry->d_name, "..") != 0)
++					(void) unlinkat(dirfd(dir), entry->d_name, 0);
++			(void) closedir(dir);
++		}
++		(void) rmdir(c->directory);
++	}
++}
++
++/* A disk-backed identity set prevents aliases/hardlinks entering twice. */
++static int
++bd_seen_slot(FILE *fp, uint64_t capacity, uint64_t device, uint64_t object,
++    boolean_t insert, boolean_t *found)
++{
++	uint64_t hash = (object ^ (device * UINT64_C(0x9e3779b97f4a7c15))) *
++	    UINT64_C(0xbf58476d1ce4e5b9);
++	for (uint64_t i = 0; i < capacity; i++) {
++		uint64_t slot = (hash + i) & (capacity - 1);
++		if (fseeko(fp, slot * sizeof (struct bd_seen), SEEK_SET) != 0)
++			return (errno);
++		struct bd_seen seen;
++		if (fread(&seen, sizeof (seen), 1, fp) != 1)
++			return (EIO);
++		if (seen.occupied && seen.device == device &&
++		    seen.object == object) {
++			*found = B_TRUE;
++			return (0);
++		}
++		if (!seen.occupied) {
++			*found = B_FALSE;
++			if (insert) {
++				seen = (struct bd_seen){ device, object, 1 };
++				if (fseeko(fp, slot * sizeof (seen), SEEK_SET) != 0 ||
++				    fwrite(&seen, sizeof (seen), 1, fp) != 1)
++					return (EIO);
++			}
++			return (0);
++		}
++	}
++	return (EOVERFLOW);
++}
++
++static int
++bd_seen(struct bd_catalog *c, const struct stat *st, boolean_t insert,
++    boolean_t *found)
++{
++	if (insert && c->count >= c->capacity / 2) {
++		if (c->capacity > INT64_MAX / 2 / sizeof (struct bd_seen))
++			return (EOVERFLOW);
++		uint64_t capacity = c->capacity * 2;
++		FILE *larger = bd_tempfile(c);
++		if (larger == NULL)
++			return (errno);
++		int error = 0;
++		if (ftruncate(fileno(larger), capacity * sizeof (struct bd_seen))
++		    != 0 || fseeko(c->seen, 0, SEEK_SET) != 0)
++			error = errno;
++		for (uint64_t i = 0; i < c->capacity && error == 0; i++) {
++			struct bd_seen seen;
++			if (fread(&seen, sizeof (seen), 1, c->seen) != 1) {
++				error = EIO;
++				break;
++			}
++			if (seen.occupied) {
++				boolean_t duplicate;
++				error = bd_seen_slot(larger, capacity, seen.device,
++				    seen.object, B_TRUE, &duplicate);
++			}
++		}
++		if (error != 0) {
++			(void) fclose(larger);
++			return (error);
++		}
++		(void) fclose(c->seen);
++		c->seen = larger;
++		c->capacity = capacity;
++	}
++	return (bd_seen_slot(c->seen, c->capacity, st->st_dev, st->st_ino,
++	    insert, found));
++}
++
++static int
++bd_inspect(const struct bd_file *file, boolean_t range, uint64_t offset,
++    nvlist_t **result)
++{
++	nvlist_t *args = fnvlist_alloc();
++	fnvlist_add_string(args, "op", "inspect");
++	bd_identity(args, &file->identity, B_FALSE);
++	if (range)
++		fnvlist_add_uint64(args, "offset", offset);
++	int error = lzc_blockdedup(file->dataset, args, result);
++	fnvlist_free(args);
++	return (error);
++}
++
++static int
++bd_read(const struct bd_file *file, uint64_t offset, uint64_t length,
++    uint8_t *buffer)
++{
++	nvlist_t *args = fnvlist_alloc(), *result = NULL;
++	fnvlist_add_string(args, "op", "read");
++	bd_identity(args, &file->identity, B_FALSE);
++	fnvlist_add_uint64(args, "offset", offset);
++	fnvlist_add_uint64(args, "length", length);
++	int error = lzc_blockdedup(file->dataset, args, &result);
++	fnvlist_free(args);
++	uint8_t *bytes;
++	uint_t count;
++	if (error == 0) {
++		if (result == NULL || nvlist_lookup_uint8_array(result, "bytes",
++		    &bytes, &count) != 0 || count != length)
++			error = EPROTO;
++		else
++			memcpy(buffer, bytes, count);
++	}
++	nvlist_free(result);
++	return (error);
++}
++
++static int
++bd_hash(const struct bd_file *file, uint64_t offset, uint64_t length,
++    uint8_t *buffer, char hash[65])
++{
++	int error = 0;
++	uint8_t digest[32];
++#ifdef __APPLE__
++	CC_SHA256_CTX ctx;
++	CC_SHA256_Init(&ctx);
++#else
++	EVP_MD_CTX *ctx = EVP_MD_CTX_new();
++	if (ctx == NULL)
++		return (ENOMEM);
++	if (EVP_DigestInit_ex(ctx, EVP_sha256(), NULL) != 1)
++		error = EIO;
++#endif
++	for (uint64_t part = 0; error == 0 && part < length; ) {
++		if (bd_stop) {
++			error = ECANCELED;
++			break;
++		}
++		uint64_t count = MIN(length - part, BD_READ_SIZE);
++		error = bd_read(file, offset + part, count, buffer);
++		if (error != 0)
++			break;
++#ifdef __APPLE__
++		CC_SHA256_Update(&ctx, buffer, (CC_LONG)count);
++#else
++		if (EVP_DigestUpdate(ctx, buffer, count) != 1)
++			error = EIO;
++#endif
++		part += count;
++	}
++#ifdef __APPLE__
++	CC_SHA256_Final(digest, &ctx);
++#else
++	unsigned int size;
++	if (error == 0 && (EVP_DigestFinal_ex(ctx, digest, &size) != 1 ||
++	    size != sizeof (digest)))
++		error = EIO;
++	EVP_MD_CTX_free(ctx);
++#endif
++	if (error == 0)
++		for (size_t i = 0; i < sizeof (digest); i++)
++			(void) snprintf(hash + i * 2, 3, "%02x", digest[i]);
++	return (error);
++}
++
++static int
++bd_analyze(struct bd_catalog *c, const char *dataset, const char *path,
++    uint64_t age)
++{
++	struct bd_file file;
++	if (strlcpy(file.path, path, sizeof (file.path)) >= sizeof (file.path) ||
++	    strlcpy(file.dataset, dataset, sizeof (file.dataset)) >=
++	    sizeof (file.dataset))
++		return (ENAMETOOLONG);
++	int fd = open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
++	if (fd < 0)
++		return (errno);
++	int error = fstat(fd, &file.identity) != 0 ? errno : 0;
++	nvlist_t *info = NULL;
++	uint8_t *buffer = NULL;
++	off_t start = ftello(c->blocks);
++	uint64_t blocks = 0;
++	if (start < 0 && error == 0)
++		error = errno;
++	if (error != 0)
++		goto out;
++	time_t now = time(NULL);
++	if (now == (time_t)-1) {
++		error = EIO;
++		goto out;
++	}
++	if (!S_ISREG(file.identity.st_mode) || file.identity.st_size == 0 ||
++	    now < file.identity.st_mtime ||
++	    difftime(now, file.identity.st_mtime) < (double)age * 86400) {
++		c->skipped++;
++		goto out;
++	}
++	boolean_t duplicate;
++	if ((error = bd_seen(c, &file.identity, B_FALSE, &duplicate)) != 0)
++		goto out;
++	if (duplicate) {
++		c->skipped++;
++		goto out;
++	}
++	if ((error = bd_inspect(&file, B_FALSE, 0, &info)) != 0)
++		goto out;
++	uint64_t block;
++	boolean_t eligible;
++	if (info == NULL || nvlist_lookup_uint64(info, "block_size", &block)
++	    != 0 || nvlist_lookup_boolean_value(info, "eligible", &eligible)
++	    != 0 || block == 0 || block > BD_MAX_BLOCK) {
++		error = EPROTO;
++		goto out;
++	}
++	if (!eligible) {
++		c->skipped++;
++		goto out;
++	}
++	buffer = malloc(BD_READ_SIZE);
++	if (buffer == NULL) {
++		error = ENOMEM;
++		goto out;
++	}
++	for (uint64_t offset = 0; offset < (uint64_t)file.identity.st_size &&
++	    error == 0 && !bd_stop; offset += block) {
++		nvlist_t *range = NULL;
++		error = bd_inspect(&file, B_TRUE, offset, &range);
++		uint64_t length;
++		boolean_t hole, embedded;
++		if (error == 0 && (range == NULL ||
++		    nvlist_lookup_uint64(range, "block_length", &length) != 0 ||
++		    nvlist_lookup_boolean_value(range, "block_hole", &hole) != 0 ||
++		    nvlist_lookup_boolean_value(range, "block_embedded", &embedded)
++		    != 0 || length != MIN(block,
++		    (uint64_t)file.identity.st_size - offset)))
++			error = EPROTO;
++		nvlist_free(range);
++		if (error != 0)
++			break;
++		if (hole || embedded)
++			continue;
++		char hash[65];
++		if ((error = bd_hash(&file, offset, length, buffer, hash)) != 0)
++			break;
++		if (fprintf(c->blocks, "%020" PRIu64 " %020" PRIu64
++		    " %020" PRIu64 " %s %020" PRIu64 " %020" PRIu64 "\n",
++		    (uint64_t)file.identity.st_dev, block, length, hash, c->count,
++		    offset) < 0)
++			error = EIO;
++		blocks++;
++	}
++	/* A file racing discovery contributes no partially hashed candidates. */
++	struct stat final;
++	if (error == 0 && (fstat(fd, &final) != 0 ||
++	    !bd_same_identity(&file.identity, &final)))
++		error = ESTALE;
++	if (error == 0 && !bd_stop) {
++		if ((error = bd_seen(c, &file.identity, B_TRUE, &duplicate)) == 0 &&
++		    (fseeko(c->files, 0, SEEK_END) != 0 ||
++		    fwrite(&file, sizeof (file), 1, c->files) != 1))
++			error = EIO;
++		if (error == 0) {
++			c->count++;
++			c->block_count += blocks;
++		}
++	}
++out:
++	free(buffer);
++	nvlist_free(info);
++	(void) close(fd);
++	if ((error != 0 || bd_stop) && start >= 0) {
++		if (fflush(c->blocks) != 0 || ftruncate(fileno(c->blocks), start)
++		    != 0 || fseeko(c->blocks, start, SEEK_SET) != 0)
++			return (EIO);
++	}
++	if (bd_deferred(error)) {
++		(void) fprintf(stderr, "%s: deferred (%s)\n", path, strerror(error));
++		c->deferred++;
++		return (0);
++	}
++	return (error);
++}
++
++static int
++bd_sort(struct bd_catalog *c)
++{
++	if (fflush(c->blocks) != 0 || fseeko(c->blocks, 0, SEEK_SET) != 0)
++		return (errno);
++	c->sorted = bd_tempfile(c);
++	if (c->sorted == NULL)
++		return (errno);
++	pid_t pid = fork();
++	if (pid < 0)
++		return (errno);
++	if (pid == 0) {
++		if (dup2(fileno(c->blocks), STDIN_FILENO) < 0 ||
++		    dup2(fileno(c->sorted), STDOUT_FILENO) < 0 ||
++		    setenv("LC_ALL", "C", 1) != 0 ||
++		    setenv("TMPDIR", c->directory, 1) != 0)
++			_exit(126);
++		execl("/usr/bin/sort", "sort", "-S", "4M", (char *)NULL);
++		_exit(127);
++	}
++	int status;
++	while (waitpid(pid, &status, 0) < 0) {
++		if (errno != EINTR)
++			return (errno);
++		if (bd_stop)
++			(void) kill(pid, SIGTERM);
++	}
++	if (!WIFEXITED(status) || WEXITSTATUS(status) != 0)
++		return (bd_stop ? ECANCELED : EIO);
++	return (fseeko(c->sorted, 0, SEEK_SET) == 0 ? 0 : errno);
++}
++
++static int
++bd_next(FILE *fp, struct bd_item *item)
++{
++	char line[256];
++	if (fgets(line, sizeof (line), fp) == NULL)
++		return (ferror(fp) ? EIO : ENOENT);
++	char extra;
++	return (sscanf(line, "%" SCNu64 " %" SCNu64 " %" SCNu64
++	    " %64[0123456789abcdef] %" SCNu64 " %" SCNu64 " %c",
++	    &item->device, &item->block, &item->length, item->hash,
++	    &item->file, &item->offset, &extra) == 6 &&
++	    strlen(item->hash) == 64 ? 0 : EPROTO);
++}
++
++static boolean_t
++bd_same_item(const struct bd_item *a, const struct bd_item *b)
++{
++	return (a->device == b->device && a->block == b->block &&
++	    a->length == b->length && strcmp(a->hash, b->hash) == 0);
++}
++
++static int
++bd_get_file(struct bd_catalog *c, uint64_t id, struct bd_file *file)
++{
++	if (id >= c->count || id > INT64_MAX / sizeof (*file))
++		return (EPROTO);
++	if (fseeko(c->files, id * sizeof (*file), SEEK_SET) != 0 ||
++	    fread(file, sizeof (*file), 1, c->files) != 1)
++		return (EIO);
++	return (0);
++}
++
++static int
++bd_open_file(const struct bd_file *file, int *fd)
++{
++	*fd = open(file->path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
++	if (*fd < 0)
++		return (errno);
++	struct stat st;
++	if (fstat(*fd, &st) != 0)
++		return (errno);
++	return (bd_same_identity(&file->identity, &st) ? 0 : ESTALE);
++}
++
++static int
++bd_apply(struct bd_catalog *c)
++{
++	int error = bd_sort(c);
++	if (error != 0)
++		return (error);
++	struct bd_item canonical = { 0 }, item;
++	struct bd_file source;
++	boolean_t have = B_FALSE;
++	int source_fd = -1;
++	while (!bd_stop && (error = bd_next(c->sorted, &item)) == 0) {
++		struct bd_file destination;
++		if ((error = bd_get_file(c, item.file, &destination)) != 0)
++			break;
++		if (!have || !bd_same_item(&canonical, &item)) {
++			if (source_fd >= 0)
++				(void) close(source_fd);
++			source_fd = -1;
++			have = B_FALSE;
++			error = bd_open_file(&destination, &source_fd);
++			if (bd_deferred(error)) {
++				c->deferred++;
++				continue;
++			}
++			if (error != 0)
++				break;
++			canonical = item;
++			source = destination;
++			have = B_TRUE;
++			continue;
++		}
++		if (canonical.file == item.file && canonical.offset == item.offset)
++			continue;
++		c->candidates++;
++		if (c->dry_run)
++			continue;
++		int fd = -1;
++		error = canonical.file == item.file ? 0 :
++		    bd_open_file(&destination, &fd);
++		if (error == 0) {
++			nvlist_t *args = fnvlist_alloc(), *result = NULL;
++			fnvlist_add_string(args, "op", "share-blocks");
++			bd_identity(args, &destination.identity, B_FALSE);
++			bd_identity(args, &source.identity, B_TRUE);
++			fnvlist_add_uint64(args, "offset", item.offset);
++			fnvlist_add_uint64(args, "source_offset", canonical.offset);
++			fnvlist_add_uint64(args, "length", item.length);
++			error = lzc_blockdedup(destination.dataset, args, &result);
++			if (error == 0) {
++				uint64_t shared, already;
++				if (result == NULL || nvlist_lookup_uint64(result,
++				    "shared_bytes", &shared) != 0 ||
++				    nvlist_lookup_uint64(result, "already_shared_bytes",
++				    &already) != 0 || shared > item.length ||
++				    already != item.length - shared)
++					error = EPROTO;
++				else if (shared != 0)
++					c->shared++;
++				else
++					c->already++;
++			}
++			fnvlist_free(args);
++			nvlist_free(result);
++		}
++		if (fd >= 0)
++			(void) close(fd);
++		if (bd_deferred(error)) {
++			(void) fprintf(stderr, "%s: deferred (%s)\n",
++			    destination.path, strerror(error));
++			c->deferred++;
++			/* The source may be stale; allow a fresh representative. */
++			have = B_FALSE;
++			error = 0;
++		} else if (error == EILSEQ || error == ENOTSUP) {
++			(void) fprintf(stderr, "%s: candidate left ordinary (%s)\n",
++			    destination.path, strerror(error));
++			c->skipped++;
++			error = 0;
++		}
++		if (error != 0)
++			break;
++	}
++	if (source_fd >= 0)
++		(void) close(source_fd);
++	return (error == ENOENT ? 0 : error);
++}
++
++static int
++bd_pass(uint64_t age, const char *tmpdir, boolean_t recursive,
++    boolean_t dry_run, int argc, char **argv)
++{
++	struct bd_catalog c;
++	int error = bd_init(&c, tmpdir, dry_run);
++	if (error != 0) {
++		(void) fprintf(stderr, "blockdedup catalog: %s\n", strerror(error));
++		bd_fini(&c);
++		return (1);
++	}
++	int ret = 0;
++	for (int i = 0; i < argc && !bd_stop; i++) {
++		struct stat st;
++		boolean_t dataset_target = lstat(argv[i], &st) != 0;
++		zfs_handle_t *zhp = dataset_target ?
++		    zfs_open(g_zfs, argv[i], ZFS_TYPE_FILESYSTEM) :
++		    zfs_path_to_zhandle(g_zfs, argv[i], ZFS_TYPE_FILESYSTEM);
++		if (zhp == NULL) {
++			ret = 1;
++			continue;
++		}
++		char path[PATH_MAX];
++		char *mountpoint = NULL;
++		error = 0;
++		if (zfs_get_type(zhp) != ZFS_TYPE_FILESYSTEM ||
++		    strchr(zfs_get_name(zhp), '@') != NULL) {
++			error = ENOTSUP;
++			goto target_done;
++		}
++		if (dataset_target) {
++			if (!zfs_is_mounted(zhp, &mountpoint)) {
++				error = ENOENT;
++				goto target_done;
++			}
++			if (strlcpy(path, mountpoint, sizeof (path)) >= sizeof (path)) {
++				error = ENAMETOOLONG;
++				goto target_done;
++			}
++		} else if (strlcpy(path, argv[i], sizeof (path)) >= sizeof (path)) {
++			error = ENAMETOOLONG;
++			goto target_done;
++		}
++		char *paths[] = { path, NULL };
++		FTS *tree = fts_open(paths, FTS_PHYSICAL | FTS_NOCHDIR | FTS_XDEV,
++		    NULL);
++		if (tree == NULL) {
++			error = errno;
++			goto target_done;
++		}
++		FTSENT *entry;
++		while (!bd_stop) {
++			errno = 0;
++			entry = fts_read(tree);
++			if (entry == NULL) {
++				if (errno != 0)
++					error = errno;
++				break;
++			}
++			if (entry->fts_info == FTS_D &&
++			    (strcmp(entry->fts_name, ".zfs") == 0 ||
++			    (entry->fts_level > 0 && !recursive && !dataset_target))) {
++				(void) fts_set(tree, entry, FTS_SKIP);
++			} else if (entry->fts_info == FTS_F) {
++				int e = bd_analyze(&c, zfs_get_name(zhp),
++				    entry->fts_path, age);
++				if (e != 0) {
++					(void) fprintf(stderr, "%s: %s\n", entry->fts_path,
++					    strerror(e));
++					error = e;
++				}
++			} else if (entry->fts_info == FTS_ERR ||
++			    entry->fts_info == FTS_DNR || entry->fts_info == FTS_NS) {
++				error = entry->fts_errno;
++			}
++		}
++		if (fts_close(tree) != 0 && error == 0)
++			error = errno;
++target_done:
++		free(mountpoint);
++		zfs_close(zhp);
++		if (error != 0) {
++			(void) fprintf(stderr, "%s: %s\n", argv[i], strerror(error));
++			ret = 1;
++		}
++	}
++	/* Discovery must finish successfully before installing any sharing. */
++	if (ret == 0 && !bd_stop && (error = bd_apply(&c)) != 0) {
++		(void) fprintf(stderr, "blockdedup optimize: %s\n", strerror(error));
++		ret = 1;
++	}
++	(void) printf("blockdedup: files=%" PRIu64 " blocks=%" PRIu64
++	    " candidates=%" PRIu64 " shared=%" PRIu64
++	    " already_shared=%" PRIu64 " deferred=%" PRIu64
++	    " skipped=%" PRIu64 " dry_run=%u\n", c.count, c.block_count,
++	    c.candidates, c.shared, c.already, c.deferred, c.skipped,
++	    dry_run ? 1U : 0U);
++	(void) fflush(stdout);
++	bd_fini(&c);
++	return (ret);
++}
++
++int
++zfs_do_blockdedup(int argc, char **argv)
++{
++	bd_stop = 0;
++	if (argc < 3)
++		return (2);
++	boolean_t watch = strcmp(argv[1], "watch") == 0;
++	if (!watch && strcmp(argv[1], "optimize") != 0)
++		return (2);
++	if (geteuid() != 0) {
++		(void) fprintf(stderr, "blockdedup requires root\n");
++		return (1);
++	}
++	boolean_t recursive = B_FALSE, dry_run = B_FALSE, once = B_FALSE;
++	uint64_t age = 3, interval = 3600;
++	const char *tmpdir = "/tmp";
++	const struct option options[] = {
++		{ "min-age", required_argument, NULL, 'a' },
++		{ "interval", required_argument, NULL, 'i' },
++		{ "tmpdir", required_argument, NULL, 't' },
++		{ "recursive", no_argument, NULL, 'r' },
++		{ "dry-run", no_argument, NULL, 'n' },
++		{ "once", no_argument, NULL, '1' },
++		{ NULL, 0, NULL, 0 }
++	};
++	optind = 2;
++	int option;
++	while ((option = getopt_long(argc, argv, "+rna:i:t:1", options, NULL))
++	    != -1) {
++		if (option == 'r')
++			recursive = B_TRUE;
++		else if (option == 'n')
++			dry_run = B_TRUE;
++		else if (option == 't')
++			tmpdir = optarg;
++		else if (option == '1') {
++			if (!watch)
++				return (2);
++			once = B_TRUE;
++		} else if (option == 'a' || option == 'i') {
++			char *end;
++			errno = 0;
++			uint64_t value = strtoull(optarg, &end, 10);
++			if (errno != 0 || *end != '\0' || optarg[0] < '0' ||
++			    optarg[0] > '9')
++				return (2);
++			if (option == 'a') {
++				if (value > UINT64_MAX / 86400)
++					return (2);
++				age = value;
++			} else {
++				if (!watch || value == 0 || value > INT_MAX)
++					return (2);
++				interval = value;
++			}
++		} else
++			return (2);
++	}
++	if (optind == argc)
++		return (2);
++	struct sigaction action = { 0 }, old_int, old_term;
++	action.sa_handler = bd_signal;
++	(void) sigemptyset(&action.sa_mask);
++	if (sigaction(SIGINT, &action, &old_int) != 0)
++		return (1);
++	if (sigaction(SIGTERM, &action, &old_term) != 0) {
++		(void) sigaction(SIGINT, &old_int, NULL);
++		return (1);
++	}
++	int ret;
++	do {
++		ret = bd_pass(age, tmpdir, recursive, dry_run, argc - optind,
++		    argv + optind);
++		/* A failed pass must be surfaced, never hidden by supervision. */
++		if (!watch || once || bd_stop || ret != 0)
++			break;
++		struct timespec delay = { .tv_sec = (time_t)interval };
++		while (!bd_stop && nanosleep(&delay, &delay) != 0) {
++			if (errno != EINTR) {
++				ret = 1;
++				bd_stop = 1;
++			}
++		}
++	} while (!bd_stop);
++	(void) sigaction(SIGINT, &old_int, NULL);
++	(void) sigaction(SIGTERM, &old_term, NULL);
++	return (ret);
++}
 diff --git a/cmd/zfs/zfs_chunkdedup_user.c b/cmd/zfs/zfs_chunkdedup_user.c
 new file mode 100644
-index 0000000..96642bf
+index 0000000..e273156
 --- /dev/null
 +++ b/cmd/zfs/zfs_chunkdedup_user.c
-@@ -0,0 +1,1558 @@
+@@ -0,0 +1,1949 @@
 +/* SPDX-License-Identifier: CDDL-1.0 */
 +/* Native, bounded, post-process chunk deduplication worker. */
 +#include <sys/types.h>
@@ -1117,6 +2134,7 @@ index 0000000..96642bf
 +#include <inttypes.h>
 +#include <limits.h>
 +#include <signal.h>
++#include <stdatomic.h>
 +#include <stdio.h>
 +#include <stdlib.h>
 +#include <string.h>
@@ -1124,6 +2142,7 @@ index 0000000..96642bf
 +#include <unistd.h>
 +#include "chunkdedup_chunker.h"
 +#include "chunkdedup_hybrid.h"
++#include "chunkdedup_parallel.h"
 +#ifdef __APPLE__
 +#include <CommonCrypto/CommonDigest.h>
 +#else
@@ -1131,7 +2150,9 @@ index 0000000..96642bf
 +#endif
 +#include "zfs_util.h"
 +
-+static volatile sig_atomic_t cd_stop;
++/* A signal may arrive on any scan thread. Keep the handler lock-free. */
++_Static_assert(ATOMIC_INT_LOCK_FREE == 2, "lock-free signal flag required");
++static atomic_int cd_stop;
 +
 +static void
 +cd_signal(int signal)
@@ -1400,6 +2421,14 @@ index 0000000..96642bf
 +	enum cd_method method;
 +};
 +
++#define	CD_SYNC_BATCH_FILES	256
++
++struct cd_retry_file {
++	char dataset[ZFS_MAX_DATASET_NAME_LEN];
++	char path[PATH_MAX];
++	struct stat identity;
++};
++
 +struct cd_catalog {
 +	FILE *files, *blocks, *chunks, *sorted_blocks, *sorted_chunks, *seen;
 +	char directory[PATH_MAX];
@@ -1407,6 +2436,11 @@ index 0000000..96642bf
 +	uint64_t seen_capacity;
 +	enum cd_method method;
 +	boolean_t watch;
++	/* Worker-private spools; only the coordinator owns seen/retry/IDs. */
++	boolean_t staging;
++	atomic_int *cancel;
++	struct cd_retry_file *retry;
++	uint_t retry_count;
 +};
 +
 +struct cd_catalog_item {
@@ -1415,6 +2449,12 @@ index 0000000..96642bf
 +};
 +
 +static boolean_t cd_deferred(int);
++
++static boolean_t
++cd_catalog_stopped(const struct cd_catalog *c)
++{
++	return (cd_stop || (c->cancel != NULL && atomic_load(c->cancel)));
++}
 +
 +struct cd_catalog_seen {
 +	uint64_t device, object, occupied;
@@ -1634,6 +2674,29 @@ index 0000000..96642bf
 +	uint64_t id;
 +};
 +
++static int cd_catalog_retry(struct cd_catalog *, uint64_t);
++
++static int
++cd_catalog_enqueue(struct cd_catalog *c, const struct cd_catalog_file *file,
++    uint64_t age)
++{
++	if (cd_stop)
++		return (ECANCELED);
++	if (c->retry_count != 0 && (c->retry_count == CD_SYNC_BATCH_FILES ||
++	    strcmp(c->retry[0].dataset, file->dataset) != 0)) {
++		int error = cd_catalog_retry(c, age);
++		if (error != 0)
++			return (error);
++	}
++	if (cd_stop)
++		return (ECANCELED);
++	struct cd_retry_file *retry = &c->retry[c->retry_count++];
++	(void) strlcpy(retry->dataset, file->dataset, sizeof (retry->dataset));
++	(void) strlcpy(retry->path, file->path, sizeof (retry->path));
++	retry->identity = file->identity;
++	return (0);
++}
++
 +static int
 +cd_catalog_chunk(void *argument, const struct chunkdedup_chunk *chunk,
 +    const uint8_t *bytes)
@@ -1641,6 +2704,8 @@ index 0000000..96642bf
 +	struct cd_catalog_chunker *arg = argument;
 +	struct cd_catalog_file *file = arg->file;
 +	(void) bytes;
++	if (cd_catalog_stopped(arg->catalog))
++		return (ECANCELED);
 +	uint64_t allocation = 0;
 +	int error = cd_hybrid_alloc(chunk->length, file->ashift,
 +	    file->parity, file->columns, file->copies, &allocation);
@@ -1686,7 +2751,8 @@ index 0000000..96642bf
 +
 +static int
 +cd_catalog_analyze(struct cd_catalog *c, const char *dataset,
-+    const char *path, uint64_t age)
++    const char *path, uint64_t age, const struct stat *expected,
++    boolean_t retryable)
 +{
 +	off_t block_start = ftello(c->blocks), chunk_start = ftello(c->chunks);
 +	if (block_start < 0 || chunk_start < 0)
@@ -1699,12 +2765,29 @@ index 0000000..96642bf
 +	    sizeof (file.path)) >= sizeof (file.path))
 +		return (ENAMETOOLONG);
 +	int fd = open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
++	if (fd < 0 && expected != NULL &&
++	    (errno == ENOENT || errno == ELOOP || errno == ESTALE)) {
++		c->skipped++;
++		return (0);
++	}
 +	if (fd < 0)
 +		return (errno);
 +	int error = fstat(fd, &file.identity) != 0 ? errno : 0;
 +	nvlist_t *info = NULL;
 +	if (error != 0)
 +		goto done;
++	if (expected != NULL && (file.identity.st_dev != expected->st_dev ||
++	    file.identity.st_ino != expected->st_ino ||
++	    file.identity.st_size != expected->st_size ||
++	    file.identity.st_mtime != expected->st_mtime
++#ifdef __FreeBSD__
++	    || file.identity.st_gen != expected->st_gen ||
++	    file.identity.st_mtim.tv_nsec != expected->st_mtim.tv_nsec
++#endif
++	    )) {
++		error = ESTALE;
++		goto done;
++	}
 +	time_t now = time(NULL);
 +	if (now == (time_t)-1) {
 +		error = EIO;
@@ -1719,10 +2802,10 @@ index 0000000..96642bf
 +	/* Mounted datasets have distinct device ids; hard links share one inode. */
 +	file.dataset_id = (uint64_t)file.identity.st_dev;
 +	boolean_t duplicate;
-+	if ((error = cd_catalog_seen(c, &file.identity, B_FALSE,
++	if (!c->staging && (error = cd_catalog_seen(c, &file.identity, B_FALSE,
 +	    &duplicate)) != 0)
 +		goto done;
-+	if (duplicate) {
++	if (!c->staging && duplicate) {
 +		c->skipped++;
 +		goto done;
 +	}
@@ -1799,7 +2882,7 @@ index 0000000..96642bf
 +	}
 +	uint64_t native_bytes = 0;
 +	for (uint64_t offset = 0; offset < (uint64_t)file.identity.st_size &&
-+	    error == 0 && !cd_stop; offset += file.block_size) {
++	    error == 0 && !cd_catalog_stopped(c); offset += file.block_size) {
 +		nvlist_t *block = NULL;
 +		error = cd_inspect(dataset, &file.identity, B_TRUE, offset,
 +		    &block);
@@ -1863,11 +2946,11 @@ index 0000000..96642bf
 +			    hash, length, c->count, offset, asize,
 +			    file.block_size);
 +	}
-+	if (error == 0 && !cd_stop)
++	if (error == 0 && !cd_catalog_stopped(c))
 +		error = chunkdedup_chunker_finish(chunker);
 +	free(buffer);
 +	chunkdedup_chunker_destroy(chunker);
-+	if (error != 0 || cd_stop)
++	if (error != 0 || cd_catalog_stopped(c))
 +		goto done;
 +	if (native_bytes > allocated) {
 +		file.uncertain = B_TRUE;
@@ -1876,7 +2959,7 @@ index 0000000..96642bf
 +		file.native_base = allocated - native_bytes;
 +	}
 +append:
-+	if ((error = cd_catalog_seen(c, &file.identity, B_TRUE,
++	if (!c->staging && (error = cd_catalog_seen(c, &file.identity, B_TRUE,
 +	    &duplicate)) != 0)
 +		goto done;
 +	if (fseeko(c->files, 0, SEEK_END) != 0 ||
@@ -1902,13 +2985,52 @@ index 0000000..96642bf
 +			}
 +		}
 +	}
-+	if (error == EBUSY || error == ESTALE || error == EAGAIN) {
++	if (c->staging && cd_deferred(error))
++		return (error);
++	if (error == EAGAIN && retryable)
++		return (cd_catalog_enqueue(c, &file, age));
++	if (error == EBUSY || error == ESTALE || error == EAGAIN ||
++	    (error == ENOENT && expected != NULL)) {
 +		(void) fprintf(stderr, "%s: deferred (%s)\n", path,
 +		    strerror(error));
 +		c->skipped++;
 +		return (0);
 +	}
 +	return (error);
++}
++
++/* One pool barrier for a bounded set of dirty candidates, then one retry.
++ * Saved identities prevent a changed or replaced file joining the old pass.
++ */
++static int
++cd_catalog_retry(struct cd_catalog *c, uint64_t age)
++{
++	uint_t count = c->retry_count;
++	if (count == 0 || cd_stop)
++		return (0);
++	uint64_t objects[CD_SYNC_BATCH_FILES];
++	for (uint_t i = 0; i < count; i++)
++		objects[i] = c->retry[i].identity.st_ino;
++	nvlist_t *args = fnvlist_alloc(), *result = NULL;
++	fnvlist_add_string(args, "op", "sync-batch");
++	fnvlist_add_uint64_array(args, "objects", objects, count);
++	int error = lzc_chunkdedup(c->retry[0].dataset, args, &result);
++	nvlist_free(result);
++	fnvlist_free(args);
++	/* A vanished/busy hint need not invalidate other discovery results.
++	 * Retrying without its barrier remains safe: dirty BPs defer again.
++	 */
++	if (error != 0 && error != ENOENT && !cd_deferred(error))
++		return (error);
++	c->retry_count = 0;
++	for (uint_t i = 0; i < count && !cd_stop; i++) {
++		struct cd_retry_file *retry = &c->retry[i];
++		error = cd_catalog_analyze(c, retry->dataset, retry->path, age,
++		    &retry->identity, B_FALSE);
++		if (error != 0)
++			return (error);
++	}
++	return (0);
 +}
 +
 +static int
@@ -2218,9 +3340,10 @@ index 0000000..96642bf
 +	c->blocks = tmpfile();
 +	c->chunks = tmpfile();
 +	c->seen = tmpfile();
++	c->retry = calloc(CD_SYNC_BATCH_FILES, sizeof (*c->retry));
 +	c->seen_capacity = 1024;
 +	if (c->files == NULL || c->blocks == NULL || c->chunks == NULL ||
-+	    c->seen == NULL)
++	    c->seen == NULL || c->retry == NULL)
 +		return (errno);
 +	return (ftruncate(fileno(c->seen), c->seen_capacity *
 +	    sizeof (struct cd_catalog_seen)) == 0 ? 0 : errno);
@@ -2229,6 +3352,7 @@ index 0000000..96642bf
 +static void
 +cd_catalog_fini(struct cd_catalog *c)
 +{
++	free(c->retry);
 +	FILE *streams[] = { c->files, c->blocks, c->chunks,
 +	    c->sorted_blocks, c->sorted_chunks, c->seen };
 +	for (size_t i = 0; i < ARRAY_SIZE(streams); i++) {
@@ -2250,6 +3374,241 @@ index 0000000..96642bf
 +		}
 +		(void) rmdir(c->directory);
 +	}
++}
++
++/*
++ * Workers never seek, truncate or assign IDs in the shared catalog. Each owns
++ * three bounded-count disk spools; the coordinator merges completed jobs in
++ * traversal order, then runs the existing selection and installation paths.
++ */
++struct cd_scan_job {
++	struct cd_catalog local;
++	struct cd_retry_file candidate;
++	uint64_t age;
++	boolean_t active;
++};
++
++struct cd_scan {
++	struct cd_parallel parallel;
++	struct cd_scan_job *jobs;
++	struct cd_catalog *catalog;
++	uint64_t age;
++	atomic_int cancelled;
++};
++
++static int
++cd_scan_work(void *argument)
++{
++	struct cd_scan_job *job = argument;
++	if (cd_stop)
++		return (ECANCELED);
++	int error = cd_catalog_analyze(&job->local, job->candidate.dataset,
++	    job->candidate.path, job->age, &job->candidate.identity, B_FALSE);
++	return (cd_stop ? ECANCELED : error);
++}
++
++static int
++cd_scan_copy(FILE *source, FILE *destination, uint64_t id)
++{
++	if (fseeko(source, 0, SEEK_SET) != 0)
++		return (errno);
++	struct cd_catalog_item item;
++	int error;
++	while ((error = cd_catalog_next(source, &item)) == 0 && !cd_stop) {
++		if (item.file != 0)
++			return (EPROTO);
++		if (fprintf(destination, "%020" PRIu64 " %s %020" PRIu64
++		    " %020" PRIu64 " %020" PRIu64 " %020" PRIu64
++		    " %020" PRIu64 "\n", item.dataset, item.hash, item.length,
++		    id, item.offset, item.bytes, item.object) < 0)
++			return (EIO);
++	}
++	return (cd_stop ? ECANCELED : error == ENOENT ? 0 : error);
++}
++
++static int
++cd_scan_take(struct cd_scan *scan)
++{
++	void *argument;
++	int result;
++	int error = cd_parallel_take(&scan->parallel, &argument, &result);
++	if (error != 0)
++		return (error);
++	struct cd_scan_job *job = argument;
++	job->active = B_FALSE;
++	struct cd_catalog *c = scan->catalog, *local = &job->local;
++	if (cd_stop)
++		return (ECANCELED);
++	if (result == EAGAIN) {
++		struct cd_catalog_file file = { .identity = job->candidate.identity };
++		(void) strlcpy(file.dataset, job->candidate.dataset,
++		    sizeof (file.dataset));
++		(void) strlcpy(file.path, job->candidate.path, sizeof (file.path));
++		return (cd_catalog_enqueue(c, &file, scan->age));
++	}
++	if (cd_deferred(result)) {
++		(void) fprintf(stderr, "%s: deferred (%s)\n",
++		    job->candidate.path, strerror(result));
++		c->skipped++;
++		return (0);
++	}
++	if (result != 0) {
++		(void) fprintf(stderr, "%s: %s\n", job->candidate.path,
++		    strerror(result));
++		return (result);
++	}
++	c->skipped += local->skipped;
++	if (local->count == 0)
++		return (0);
++	if (local->count != 1)
++		return (EPROTO);
++	struct cd_catalog_file file;
++	if ((error = cd_catalog_record(local, 0, &file, B_FALSE)) != 0)
++		return (error);
++	boolean_t duplicate;
++	if ((error = cd_catalog_seen(c, &file.identity, B_FALSE,
++	    &duplicate)) != 0)
++		return (error);
++	if (duplicate) {
++		c->skipped++;
++		return (0);
++	}
++	file.parent = c->count;
++	if ((error = cd_scan_copy(local->blocks, c->blocks, c->count)) != 0 ||
++	    (error = cd_scan_copy(local->chunks, c->chunks, c->count)) != 0 ||
++	    (error = cd_catalog_seen(c, &file.identity, B_TRUE,
++	    &duplicate)) != 0)
++		return (error);
++	if (fseeko(c->files, 0, SEEK_END) != 0 ||
++	    fwrite(&file, sizeof (file), 1, c->files) != 1)
++		return (errno != 0 ? errno : EIO);
++	c->count++;
++	return (0);
++}
++
++static int
++cd_scan_drain(struct cd_scan *scan)
++{
++	while (cd_parallel_count(&scan->parallel) != 0 && !cd_stop) {
++		int error = cd_scan_take(scan);
++		if (error != 0)
++			return (error);
++	}
++	return (cd_stop ? ECANCELED : 0);
++}
++
++static int
++cd_scan_init(struct cd_scan *scan, struct cd_catalog *c, uint64_t age,
++    unsigned int threads)
++{
++	memset(scan, 0, sizeof (*scan));
++	scan->catalog = c;
++	scan->age = age;
++	atomic_init(&scan->cancelled, 0);
++	int error = cd_parallel_init(&scan->parallel, threads, cd_scan_work);
++	if (error != 0)
++		return (error);
++	scan->jobs = calloc(scan->parallel.capacity, sizeof (*scan->jobs));
++	if (scan->jobs == NULL) {
++		cd_parallel_fini(&scan->parallel);
++		return (ENOMEM);
++	}
++	return (0);
++}
++
++static void
++cd_scan_fini(struct cd_scan *scan)
++{
++	unsigned int capacity = scan->parallel.capacity;
++	/* Join before closing any spool or releasing any queued path/identity. */
++	atomic_store(&scan->cancelled, 1);
++	cd_parallel_fini(&scan->parallel);
++	for (unsigned int i = 0; i < capacity; i++)
++		cd_catalog_fini(&scan->jobs[i].local);
++	free(scan->jobs);
++}
++
++static boolean_t
++cd_scan_same(const struct stat *a, const struct stat *b)
++{
++	return (a->st_dev == b->st_dev && a->st_ino == b->st_ino);
++}
++
++static int
++cd_scan_submit(struct cd_scan *scan, const char *dataset, const char *path,
++    const struct stat *identity)
++{
++	struct cd_catalog *c = scan->catalog;
++	/* Hard links must not create competing optimizer opens on one inode. */
++	for (unsigned int i = 0; i < scan->parallel.capacity; i++) {
++		if (!scan->jobs[i].active || !cd_scan_same(identity,
++		    &scan->jobs[i].candidate.identity))
++			continue;
++		while (scan->jobs[i].active && !cd_stop) {
++			int error = cd_scan_take(scan);
++			if (error != 0)
++				return (error);
++		}
++	}
++	for (uint_t i = 0; i < c->retry_count; i++) {
++		if (cd_scan_same(identity, &c->retry[i].identity)) {
++			int error = cd_catalog_retry(c, scan->age);
++			if (error != 0)
++				return (error);
++			break;
++		}
++	}
++	if (cd_stop)
++		return (ECANCELED);
++	boolean_t duplicate;
++	int error = cd_catalog_seen(c, identity, B_FALSE, &duplicate);
++	if (error != 0)
++		return (error);
++	if (duplicate) {
++		c->skipped++;
++		return (0);
++	}
++	if (cd_parallel_full(&scan->parallel) &&
++	    (error = cd_scan_take(scan)) != 0)
++		return (error);
++	struct cd_scan_job *job = NULL;
++	for (unsigned int i = 0; i < scan->parallel.capacity; i++) {
++		if (!scan->jobs[i].active) {
++			job = &scan->jobs[i];
++			break;
++		}
++	}
++	if (job == NULL)
++		return (EPROTO);
++	struct cd_catalog *local = &job->local;
++	local->staging = B_TRUE;
++	local->cancel = &scan->cancelled;
++	local->method = c->method;
++	local->watch = c->watch;
++	local->count = local->skipped = 0;
++	FILE **streams[] = { &local->files, &local->blocks, &local->chunks };
++	for (size_t i = 0; i < ARRAY_SIZE(streams); i++) {
++		if (*streams[i] == NULL)
++			*streams[i] = tmpfile();
++		if (*streams[i] == NULL)
++			return (errno);
++		if (fflush(*streams[i]) != 0 ||
++		    ftruncate(fileno(*streams[i]), 0) != 0 ||
++		    fseeko(*streams[i], 0, SEEK_SET) != 0)
++			return (errno != 0 ? errno : EIO);
++	}
++	if (strlcpy(job->candidate.dataset, dataset,
++	    sizeof (job->candidate.dataset)) >= sizeof (job->candidate.dataset) ||
++	    strlcpy(job->candidate.path, path, sizeof (job->candidate.path)) >=
++	    sizeof (job->candidate.path))
++		return (ENAMETOOLONG);
++	job->candidate.identity = *identity;
++	job->age = scan->age;
++	job->active = B_TRUE;
++	error = cd_parallel_submit(&scan->parallel, job);
++	if (error != 0)
++		job->active = B_FALSE;
++	return (error);
 +}
 +
 +static int
@@ -2374,12 +3733,14 @@ index 0000000..96642bf
 +
 +static int
 +cd_pass(const char *op, boolean_t recursive, uint64_t age, int argc,
-+    char **argv, boolean_t watch, enum cd_method method, boolean_t methods)
++    char **argv, boolean_t watch, enum cd_method method, boolean_t methods,
++    unsigned int threads)
 +{
 +	uint64_t processed = 0, skipped = 0;
 +	int ret = 0;
 +	boolean_t optimize = strcmp(op, "optimize") == 0;
 +	struct cd_catalog catalog = { 0 };
++	struct cd_scan scan = { 0 };
 +	if (optimize) {
 +		int error = cd_catalog_init(&catalog, method, watch);
 +		if (error != 0) {
@@ -2387,6 +3748,15 @@ index 0000000..96642bf
 +			cd_catalog_fini(&catalog);
 +			return (1);
 +		}
++		error = cd_scan_init(&scan, &catalog, age, threads);
++		if (error != 0) {
++			(void) fprintf(stderr, "scan workers: %s\n", strerror(error));
++			cd_catalog_fini(&catalog);
++			return (1);
++		}
++		(void) printf("optimize: scan_threads=%u max_inflight=%zu\n",
++		    threads, scan.parallel.capacity);
++		(void) fflush(stdout);
 +	}
 +	boolean_t readonly = strcmp(op, "status") == 0 ||
 +	    strcmp(op, "verify") == 0;
@@ -2482,8 +3852,8 @@ index 0000000..96642bf
 +			} else if (entry->fts_info == FTS_F) {
 +				int e;
 +				if (optimize)
-+					e = cd_catalog_analyze(&catalog, dataset,
-+					    entry->fts_path, age);
++					e = cd_scan_submit(&scan, dataset,
++					    entry->fts_path, entry->fts_statp);
 +				else if (methods)
 +					e = cd_method_status(dataset,
 +					    entry->fts_path);
@@ -2494,6 +3864,8 @@ index 0000000..96642bf
 +					(void) fprintf(stderr, "%s: %s\n",
 +					    entry->fts_path, strerror(e));
 +					error = e;
++					if (optimize)
++						break;
 +				}
 +			} else if (entry->fts_info == FTS_ERR ||
 +			    entry->fts_info == FTS_DNR ||
@@ -2503,6 +3875,8 @@ index 0000000..96642bf
 +		}
 +		if (fts_close(tree) != 0 && error == 0)
 +			error = errno;
++		if (optimize && error == 0)
++			error = cd_scan_drain(&scan);
 +target_done:
 +		if (error != 0) {
 +			(void) fprintf(stderr, "%s: %s\n", argv[i],
@@ -2510,11 +3884,16 @@ index 0000000..96642bf
 +			ret = 1;
 +		}
 +		zfs_close(zhp);
++		if (optimize && error != 0)
++			break;
 +	}
 +	if (optimize) {
++		cd_scan_fini(&scan);
 +		/* Discovery failures never leave a partially selected pass installed. */
 +		if (ret == 0 && !cd_stop) {
-+			int error = cd_catalog_apply(&catalog, age);
++			int error = cd_catalog_retry(&catalog, age);
++			if (error == 0 && !cd_stop)
++				error = cd_catalog_apply(&catalog, age);
 +			if (error != 0) {
 +				(void) fprintf(stderr, "optimize: %s\n",
 +				    strerror(error));
@@ -2534,7 +3913,7 @@ index 0000000..96642bf
 +
 +static int
 +cd_watch(uint64_t age, uint64_t interval, int argc, char **argv,
-+    enum cd_method method)
++    enum cd_method method, unsigned int threads)
 +{
 +	/* Reject paths and misspelled datasets before entering supervision. */
 +	for (int i = 0; i < argc; i++) {
@@ -2559,7 +3938,7 @@ index 0000000..96642bf
 +	(void) fflush(stdout);
 +	while (!cd_stop) {
 +		(void) cd_pass("optimize", B_TRUE, age, argc, argv, B_TRUE,
-+		    method, B_FALSE);
++		    method, B_FALSE, threads);
 +		if (cd_stop)
 +			break;
 +		struct timespec delay = { .tv_sec = (time_t)interval };
@@ -2587,9 +3966,11 @@ index 0000000..96642bf
 +		(void) fprintf(stderr, "usage: zfs chunkdedup "
 +		    "<optimize|status|verify|unoptimize> [-r] [--min-age days] "
 +		    "[--method auto|block|chunk] [--methods] "
++		    "[--threads 1..64] "
 +		    "<dataset|path>...\n"
 +		    "       zfs chunkdedup watch [--interval seconds] "
-+		    "[--min-age days] [--method auto|block|chunk] <dataset>...\n");
++		    "[--min-age days] [--method auto|block|chunk] "
++		    "[--threads 1..64] <dataset>...\n");
 +		return (2);
 +	}
 +	const char *op = argv[1];
@@ -2601,17 +3982,20 @@ index 0000000..96642bf
 +	boolean_t methods = B_FALSE;
 +	enum cd_method method = CD_METHOD_AUTO;
 +	uint64_t age = 3, interval = 3600;
++	long online = sysconf(_SC_NPROCESSORS_ONLN);
++	unsigned int threads = online > 0 ? MIN(online, 64) : 1;
 +	const struct option options[] = {
 +		{ "min-age", required_argument, NULL, 'a' },
 +		{ "interval", required_argument, NULL, 'i' },
 +		{ "recursive", no_argument, NULL, 'r' },
 +		{ "method", required_argument, NULL, 'm' },
 +		{ "methods", no_argument, NULL, 'M' },
++		{ "threads", required_argument, NULL, 't' },
 +		{ NULL, 0, NULL, 0 }
 +	};
 +	int c;
 +	optind = 2;
-+	while ((c = getopt_long(argc, argv, "+ra:i:m:M", options, NULL)) != -1) {
++	while ((c = getopt_long(argc, argv, "+ra:i:m:Mt:", options, NULL)) != -1) {
 +		if (c == 'r') {
 +			if (watch)
 +				return (2);
@@ -2631,7 +4015,7 @@ index 0000000..96642bf
 +			if (strcmp(op, "status") != 0)
 +				return (2);
 +			methods = B_TRUE;
-+		} else if (c == 'a' || c == 'i') {
++		} else if (c == 'a' || c == 'i' || c == 't') {
 +			char *end;
 +			errno = 0;
 +			uint64_t value = strtoull(optarg, &end, 10);
@@ -2642,10 +4026,15 @@ index 0000000..96642bf
 +				if (value > UINT64_MAX / 86400)
 +					return (2);
 +				age = value;
-+			} else {
++			} else if (c == 'i') {
 +				if (!watch || value == 0 || value > INT_MAX)
 +					return (2);
 +				interval = value;
++			} else {
++				if ((!watch && strcmp(op, "optimize") != 0) ||
++				    value == 0 || value > 64)
++					return (2);
++				threads = (unsigned int)value;
 +			}
 +		} else {
 +			return (2);
@@ -2655,31 +4044,52 @@ index 0000000..96642bf
 +		return (2);
 +	if (watch)
 +		return (cd_watch(age, interval, argc - optind, argv + optind,
-+		    method));
-+	return (cd_pass(op, recursive, age, argc - optind, argv + optind,
-+	    B_FALSE, method, methods));
++		    method, threads));
++	struct sigaction action = { 0 }, old_int, old_term;
++	boolean_t optimize = strcmp(op, "optimize") == 0;
++	if (optimize) {
++		action.sa_handler = cd_signal;
++		(void) sigemptyset(&action.sa_mask);
++		if (sigaction(SIGINT, &action, &old_int) != 0)
++			return (1);
++		if (sigaction(SIGTERM, &action, &old_term) != 0) {
++			(void) sigaction(SIGINT, &old_int, NULL);
++			return (1);
++		}
++	}
++	int result = cd_pass(op, recursive, age, argc - optind, argv + optind,
++	    B_FALSE, method, methods, threads);
++	if (optimize) {
++		(void) sigaction(SIGINT, &old_int, NULL);
++		(void) sigaction(SIGTERM, &old_term, NULL);
++		if (cd_stop)
++			return (1);
++	}
++	return (result);
 +}
 diff --git a/cmd/zfs/zfs_main.c b/cmd/zfs/zfs_main.c
-index 9b58286..2f75033 100644
+index 9b58286..8f3a56b 100644
 --- a/cmd/zfs/zfs_main.c
 +++ b/cmd/zfs/zfs_main.c
-@@ -197,6 +197,7 @@ typedef enum {
+@@ -197,6 +197,8 @@ typedef enum {
  	HELP_VERSION,
  	HELP_REDACT,
  	HELP_REWRITE,
 +	HELP_CHUNKDEDUP,
++	HELP_BLOCKDEDUP,
  	HELP_JAIL,
  	HELP_UNJAIL,
  	HELP_WAIT,
-@@ -268,6 +269,7 @@ static zfs_command_t command_table[] = {
+@@ -268,6 +270,8 @@ static zfs_command_t command_table[] = {
  	{ NULL },
  	{ "program",	zfs_do_channel_program,	HELP_CHANNEL_PROGRAM	},
  	{ "rewrite",	zfs_do_rewrite,		HELP_REWRITE		},
 +	{ "chunkdedup", zfs_do_chunkdedup, HELP_CHUNKDEDUP },
++	{ "blockdedup", zfs_do_blockdedup, HELP_BLOCKDEDUP },
  	{ "wait",	zfs_do_wait,		HELP_WAIT		},
  
  #ifdef __FreeBSD__
-@@ -440,6 +442,12 @@ get_usage(zfs_help_t idx)
+@@ -440,6 +444,17 @@ get_usage(zfs_help_t idx)
  	case HELP_REDACT:
  		return (gettext("\tredact <snapshot> <bookmark> "
  		    "<redaction_snapshot> ...\n"));
@@ -2689,43 +4099,52 @@ index 9b58286..2f75033 100644
 +		    "[--methods] <dataset|path>...\n"
 +		    "\tchunkdedup watch [--interval seconds] [--min-age days] "
 +		    "[--method auto|block|chunk] <dataset>...\n"));
++	case HELP_BLOCKDEDUP:
++		return (gettext("\tblockdedup optimize [-rn] [--min-age days] "
++		    "[--tmpdir directory] <dataset|path>...\n"
++		    "\tblockdedup watch [-rn] [--once] [--interval seconds] "
++		    "[--min-age days] [--tmpdir directory] <dataset|path>...\n"));
  	case HELP_REWRITE:
  		return (gettext("\trewrite [-Prvx] [-o <offset>] [-l <length>] "
  		    "<directory|file ...>\n"));
 diff --git a/cmd/zfs/zfs_util.h b/cmd/zfs/zfs_util.h
-index b6611b7..5892f8a 100644
+index b6611b7..c805bc2 100644
 --- a/cmd/zfs/zfs_util.h
 +++ b/cmd/zfs/zfs_util.h
-@@ -34,6 +34,7 @@ extern "C" {
+@@ -34,6 +34,8 @@ extern "C" {
  
  void *safe_malloc(size_t size);
  void nomem(void);
 +int zfs_do_chunkdedup(int, char **);
++int zfs_do_blockdedup(int, char **);
  extern libzfs_handle_t *g_zfs;
  
  #ifdef	__cplusplus
 diff --git a/include/Makefile.am b/include/Makefile.am
-index c171249..11ebb8b 100644
+index c171249..ddc2d76 100644
 --- a/include/Makefile.am
 +++ b/include/Makefile.am
-@@ -143,6 +143,7 @@ COMMON_H = \
+@@ -143,6 +143,8 @@ COMMON_H = \
  	sys/zfs_sysfs.h \
  	sys/zfs_vfsops.h \
  	sys/zfs_vnops.h \
 +	sys/zfs_chunkdedup.h \
++	sys/zfs_blockdedup.h \
  	sys/zfs_znode.h \
  	sys/zil.h \
  	sys/zil_impl.h \
 diff --git a/include/libzfs_core.h b/include/libzfs_core.h
-index 231beaa..11e8a73 100644
+index 231beaa..53746b5 100644
 --- a/include/libzfs_core.h
 +++ b/include/libzfs_core.h
-@@ -79,6 +79,8 @@ _LIBZFS_CORE_H int lzc_hold(nvlist_t *, int, nvlist_t **);
+@@ -79,6 +79,10 @@ _LIBZFS_CORE_H int lzc_hold(nvlist_t *, int, nvlist_t **);
  _LIBZFS_CORE_H int lzc_release(nvlist_t *, nvlist_t **);
  _LIBZFS_CORE_H int lzc_get_holds(const char *, nvlist_t **);
  _LIBZFS_CORE_H int lzc_get_props(const char *, nvlist_t **);
 +/* Experimental native post-process chunk deduplication. */
 +_LIBZFS_CORE_H int lzc_chunkdedup(const char *, nvlist_t *, nvlist_t **);
++/* Verified ordinary-block sharing; no additional on-disk format. */
++_LIBZFS_CORE_H int lzc_blockdedup(const char *, nvlist_t *, nvlist_t **);
  
  enum lzc_send_flags {
  	LZC_SEND_FLAG_EMBED_DATA = 1 << 0,
@@ -2802,7 +4221,7 @@ index 81c293e..efc31e8 100644
  
  /*
 diff --git a/include/sys/fs/zfs.h b/include/sys/fs/zfs.h
-index 7517f5a..77c979c 100644
+index 7517f5a..24eaf6a 100644
 --- a/include/sys/fs/zfs.h
 +++ b/include/sys/fs/zfs.h
 @@ -203,6 +203,7 @@ typedef enum {
@@ -2813,14 +4232,36 @@ index 7517f5a..77c979c 100644
  	ZFS_NUM_PROPS
  } zfs_prop_t;
  
-@@ -1571,6 +1572,7 @@ typedef enum zfs_ioc {
+@@ -1571,6 +1572,8 @@ typedef enum zfs_ioc {
  	ZFS_IOC_POOL_SCRUB,			/* 0x5a57 */
  	ZFS_IOC_POOL_PREFETCH,			/* 0x5a58 */
  	ZFS_IOC_DDT_PRUNE,			/* 0x5a59 */
 +	ZFS_IOC_CHUNKDEDUP,			/* 0x5a5a */
++	ZFS_IOC_BLOCKDEDUP = ZFS_IOC_FIRST + 0x5b,	/* 0x5a5b */
  
  	/*
  	 * Per-platform (Optional) - 8/128 numbers reserved.
+diff --git a/include/sys/zfs_blockdedup.h b/include/sys/zfs_blockdedup.h
+new file mode 100644
+index 0000000..14b45e1
+--- /dev/null
++++ b/include/sys/zfs_blockdedup.h
+@@ -0,0 +1,15 @@
++/* SPDX-License-Identifier: CDDL-1.0 */
++#ifndef _SYS_ZFS_BLOCKDEDUP_H
++#define	_SYS_ZFS_BLOCKDEDUP_H
++
++#define	ZFS_BLOCKDEDUP_MAX_READ (256U << 10)
++
++#ifdef _KERNEL
++#include <sys/zfs_vfsops.h>
++#include <sys/nvpair.h>
++
++/* Caller holds a mounted-filesystem reference; operation takes file locks. */
++int zfs_blockdedup(zfsvfs_t *, nvlist_t *, nvlist_t *);
++#endif
++
++#endif /* _SYS_ZFS_BLOCKDEDUP_H */
 diff --git a/include/sys/zfs_chunkdedup.h b/include/sys/zfs_chunkdedup.h
 new file mode 100644
 index 0000000..00e74ef
@@ -2981,7 +4422,7 @@ index dcc3896..90902f4 100644
  
  /*
 diff --git a/lib/libzfs_core/libzfs_core.c b/lib/libzfs_core/libzfs_core.c
-index 9347aa7..2f738ef 100644
+index 9347aa7..ef43d06 100644
 --- a/lib/libzfs_core/libzfs_core.c
 +++ b/lib/libzfs_core/libzfs_core.c
 @@ -88,6 +88,7 @@
@@ -2992,7 +4433,7 @@ index 9347aa7..2f738ef 100644
  #include <sys/param.h>
  #include <sys/types.h>
  #include <sys/stat.h>
-@@ -1994,3 +1995,10 @@ lzc_ddt_prune(const char *pool, zpool_ddt_prune_unit_t unit, uint64_t amount)
+@@ -1994,3 +1995,17 @@ lzc_ddt_prune(const char *pool, zpool_ddt_prune_unit_t unit, uint64_t amount)
  
  	return (error);
  }
@@ -3003,27 +4444,36 @@ index 9347aa7..2f738ef 100644
 +{
 +	return (lzc_ioctl(ZFS_IOC_CHUNKDEDUP, dataset, args, result));
 +}
++
++/* Verified ordinary-block sharing; no additional on-disk format. */
++int
++lzc_blockdedup(const char *dataset, nvlist_t *args, nvlist_t **result)
++{
++	return (lzc_ioctl(ZFS_IOC_BLOCKDEDUP, dataset, args, result));
++}
 diff --git a/module/Kbuild.in b/module/Kbuild.in
-index cf31a86..1db4817 100644
+index cf31a86..0923e73 100644
 --- a/module/Kbuild.in
 +++ b/module/Kbuild.in
-@@ -433,6 +433,7 @@ ZFS_OBJS := \
+@@ -433,6 +433,8 @@ ZFS_OBJS := \
  	zfs_rlock.o \
  	zfs_sa.o \
  	zfs_vnops.o \
 +	zfs_chunkdedup.o \
++	zfs_blockdedup.o \
  	zfs_znode.o \
  	zil.o \
  	zio.o \
 diff --git a/module/Makefile.bsd b/module/Makefile.bsd
-index c62935f..8011258 100644
+index c62935f..24edb4c 100644
 --- a/module/Makefile.bsd
 +++ b/module/Makefile.bsd
-@@ -373,6 +373,7 @@ SRCS+=	abd.c \
+@@ -373,6 +373,8 @@ SRCS+=	abd.c \
  	zfs_rlock.c \
  	zfs_sa.c \
  	zfs_vnops.c \
 +	zfs_chunkdedup.c \
++	zfs_blockdedup.c \
  	zfs_znode.c \
  	zil.c \
  	zio.c \
@@ -3825,6 +5275,588 @@ index 4c35472..5daa085 100644
  	if (dsl_dataset_feature_is_active(to_ds, SPA_FEATURE_LONGNAME)) {
  		*featureflags |= DMU_BACKUP_FEATURE_LONGNAME;
  	}
+diff --git a/module/zfs/zfs_blockdedup.c b/module/zfs/zfs_blockdedup.c
+new file mode 100644
+index 0000000..d665fc6
+--- /dev/null
++++ b/module/zfs/zfs_blockdedup.c
+@@ -0,0 +1,576 @@
++/* SPDX-License-Identifier: CDDL-1.0 */
++/*
++ * FreeBSD verified background block sharing.
++ *
++ * The caller supplies stable file identities and candidate ranges. Only the
++ * kernel's current byte comparison authorizes a share. Transactions use the
++ * existing BRT format: no file layout, feature flag or persistent index is
++ * introduced, and ordinary ZFS implementations retain normal access.
++ */
++#include <sys/zfs_context.h>
++#include <sys/zfs_blockdedup.h>
++
++#ifdef __FreeBSD__
++#include <sys/zfs_znode.h>
++#include <sys/zfs_vnops.h>
++#include <sys/dmu_objset.h>
++#include <sys/dmu_impl.h>
++#include <sys/dmu_tx.h>
++#include <sys/dbuf.h>
++#include <sys/dsl_dataset.h>
++#include <sys/spa_impl.h>
++#include <sys/vdev_impl.h>
++#include <sys/brt.h>
++#include <sys/zfeature.h>
++#include <sys/zap.h>
++#include <sys/sa.h>
++#include <sys/txg.h>
++#include <sys/vm.h>
++#include <vm/vm.h>
++#include <vm/vm_object.h>
++
++static int
++bd_dataset_check(zfsvfs_t *zfsvfs, boolean_t mutate)
++{
++	objset_t *os = zfsvfs->z_os;
++	if (dmu_objset_type(os) != DMU_OST_ZFS || os->os_encrypted ||
++	    os->os_dedup_checksum != ZIO_CHECKSUM_OFF)
++		return (SET_ERROR(ENOTSUP));
++	if (mutate && zfs_is_readonly(zfsvfs))
++		return (SET_ERROR(EROFS));
++	if (mutate && (zfsvfs->z_vfs->vfs_flag & MNT_EXPORTED) != 0)
++		return (SET_ERROR(ENOTSUP));
++	return (0);
++}
++
++/*
++ * A combined experimental build must not mistake a non-native file's backing
++ * records for its logical contents. This guard has no helper/link dependency;
++ * a clean upstream build has neither the marker nor the alternate format.
++ * Refuse the entire alternate-format dataset, including malformed recipes.
++ */
++static int
++bd_ordinary(znode_t *zp)
++{
++#ifdef ZFS_CHUNKDEDUP
++	if ((zp->z_pflags & ZFS_CHUNKDEDUP) != 0)
++		return (SET_ERROR(ENOTSUP));
++	int error = zap_contains(ZTOZSB(zp)->z_os, MASTER_NODE_OBJ,
++	    "CHUNKDEDUP");
++	if (error != ENOENT)
++		return (error == 0 ? SET_ERROR(ENOTSUP) : error);
++#else
++	(void) zp;
++#endif
++	return (0);
++}
++
++typedef struct bd_identity {
++	uint64_t object;
++	uint64_t generation;
++	uint64_t size;
++	uint64_t mtime[2];
++} bd_identity_t;
++
++static int
++bd_identity_get(nvlist_t *nvl, const char *prefix,
++    bd_identity_t *id)
++{
++	const char *names[] = { "object", "generation", "size", "mtime_sec",
++	    "mtime_nsec" };
++	uint64_t *values[] = { &id->object, &id->generation, &id->size,
++	    &id->mtime[0], &id->mtime[1] };
++	for (uint_t i = 0; i < ARRAY_SIZE(names); i++) {
++		char key[64];
++		(void) snprintf(key, sizeof (key), "%s%s", prefix, names[i]);
++		if (nvlist_lookup_uint64(nvl, key, values[i]) != 0)
++			return (SET_ERROR(EINVAL));
++	}
++	return (0);
++}
++
++/* Caller holds the vnode lock and filesystem teardown reader. */
++static int
++bd_identity_check(znode_t *zp, const bd_identity_t *id)
++{
++	uint64_t mtime[2];
++	if (ZTOV(zp)->v_type != VREG || zp->z_unlinked ||
++	    zp->z_gen != id->generation || zp->z_size != id->size)
++		return (SET_ERROR(ESTALE));
++	int error = sa_lookup(zp->z_sa_hdl, SA_ZPL_MTIME(ZTOZSB(zp)), mtime,
++	    sizeof (mtime));
++	if (error != 0)
++		return (error);
++	return (memcmp(mtime, id->mtime, sizeof (mtime)) == 0 ? 0 :
++	    SET_ERROR(ESTALE));
++}
++
++static boolean_t
++bd_idle(znode_t *zp)
++{
++	vm_object_t vmobj = ZTOV(zp)->v_object;
++	/* One scanner descriptor and one ioctl vnode reference. */
++	return (ZTOV(zp)->v_usecount <= 2 && ZTOV(zp)->v_writecount == 0 &&
++	    (vmobj == NULL || (vmobj->ref_count <= 1 &&
++	    !vm_object_mightbedirty(vmobj))));
++}
++
++static int
++bd_bp(znode_t *zp, uint64_t offset, blkptr_t *bp)
++{
++	uint64_t block = zp->z_blksz;
++	if (block == 0 || block > SPA_MAXBLOCKSIZE || offset >= zp->z_size ||
++	    offset % block != 0 || (!ISP2(block) && zp->z_size > block))
++		return (SET_ERROR(EINVAL));
++	size_t count = 1;
++	int error = dmu_read_l0_bps(ZTOZSB(zp)->z_os, zp->z_id, offset,
++	    MIN(block, zp->z_size - offset), bp, &count);
++	if (error == 0 && count != 1)
++		error = SET_ERROR(EIO);
++	return (error);
++}
++
++static void
++bd_geometry(objset_t *os, nvlist_t *outnvl)
++{
++	spa_t *spa = dmu_objset_spa(os);
++	uint64_t ashift = SPA_MINBLOCKSHIFT, parity = 0, columns = UINT64_MAX;
++	boolean_t supported = B_TRUE, found = B_FALSE;
++	spa_config_enter(spa, SCL_CONFIG, FTAG, RW_READER);
++	vdev_t *root = spa->spa_root_vdev;
++	for (uint64_t i = 0; i < root->vdev_children; i++) {
++		vdev_t *vd = root->vdev_child[i];
++		if (!vdev_is_concrete(vd) || vd->vdev_islog ||
++		    vd->vdev_alloc_bias == VDEV_BIAS_DEDUP)
++			continue;
++		found = B_TRUE;
++		ashift = MAX(ashift, vd->vdev_ashift);
++		if (vd->vdev_ops == &vdev_raidz_ops) {
++			uint64_t p = vdev_get_nparity(vd);
++			parity = MAX(parity, p);
++			if (vd->vdev_children <= p)
++				supported = B_FALSE;
++			else
++				columns = MIN(columns, vd->vdev_children - p);
++		} else if (vd->vdev_ops != &vdev_mirror_ops &&
++		    vd->vdev_ops != &vdev_disk_ops &&
++		    vd->vdev_ops != &vdev_file_ops) {
++			supported = B_FALSE;
++		}
++	}
++	spa_config_exit(spa, SCL_CONFIG, FTAG);
++	fnvlist_add_uint64(outnvl, "ashift", ashift);
++	fnvlist_add_uint64(outnvl, "parity", parity);
++	fnvlist_add_uint64(outnvl, "data_columns",
++	    columns == UINT64_MAX ? 1 : columns);
++	fnvlist_add_boolean_value(outnvl, "geometry_supported",
++	    supported && found);
++	fnvlist_add_uint64(outnvl, "copies", os->os_copies);
++	fnvlist_add_uint64(outnvl, "compression", os->os_compress);
++}
++
++static int
++bd_inspect(zfsvfs_t *zfsvfs, nvlist_t *innvl, nvlist_t *outnvl)
++{
++	bd_identity_t id;
++	znode_t *zp = NULL;
++	zfs_locked_range_t *lr = NULL;
++	boolean_t entered = B_FALSE, locked = B_FALSE;
++	uint64_t offset;
++	boolean_t range = nvlist_lookup_uint64(innvl, "offset", &offset) == 0;
++	int error = bd_identity_get(innvl, "", &id);
++	if (error != 0)
++		return (error);
++	if ((error = zfs_enter(zfsvfs, FTAG)) != 0)
++		return (error);
++	entered = B_TRUE;
++	if ((error = zfs_zget(zfsvfs, id.object, &zp)) != 0)
++		goto out;
++	if ((error = bd_dataset_check(zfsvfs, B_FALSE)) != 0)
++		goto out;
++	/* The initial file query settles writes before per-block inspection. */
++	if (!range && !zfs_is_readonly(zfsvfs)) {
++		if ((error = zil_commit(zfsvfs->z_log, id.object)) != 0)
++			goto out;
++		txg_wait_synced(dmu_objset_pool(zfsvfs->z_os), 0);
++	}
++	zfs_exit(zfsvfs, FTAG);
++	entered = B_FALSE;
++	if ((error = vn_lock(ZTOV(zp), LK_SHARED | LK_RETRY)) != 0)
++		goto out;
++	locked = B_TRUE;
++	if ((error = zfs_enter_verify_zp(zfsvfs, zp, FTAG)) != 0)
++		goto out;
++	entered = B_TRUE;
++	if ((error = bd_identity_check(zp, &id)) != 0 ||
++	    (error = bd_dataset_check(zfsvfs, B_FALSE)) != 0)
++		goto out;
++	lr = zfs_rangelock_enter(&zp->z_rangelock, 0, UINT64_MAX, RL_READER);
++	int ordinary = bd_ordinary(zp);
++	if (ordinary != 0) {
++		error = ordinary;
++		goto out;
++	}
++	dmu_object_info_t doi;
++	if ((error = dmu_object_info(zfsvfs->z_os, zp->z_id, &doi)) != 0)
++		goto out;
++	fnvlist_add_uint64(outnvl, "block_size", zp->z_blksz);
++	fnvlist_add_uint64(outnvl, "allocated_bytes",
++	    doi.doi_physical_blocks_512 * SPA_MINBLOCKSIZE);
++	fnvlist_add_boolean_value(outnvl, "chunked", B_FALSE);
++	fnvlist_add_boolean_value(outnvl, "eligible",
++	    bd_idle(zp) && !zfsvfs->z_os->os_encrypted &&
++	    !zfs_is_readonly(zfsvfs) &&
++	    (zfsvfs->z_vfs->vfs_flag & MNT_EXPORTED) == 0);
++	bd_geometry(zfsvfs->z_os, outnvl);
++	if (range) {
++		blkptr_t bp;
++		if ((error = bd_bp(zp, offset, &bp)) != 0)
++			goto out;
++		boolean_t real = !BP_IS_HOLE(&bp) && !BP_IS_EMBEDDED(&bp);
++		fnvlist_add_uint64(outnvl, "block_length",
++		    MIN(zp->z_blksz, zp->z_size - offset));
++		fnvlist_add_uint64(outnvl, "block_asize", BP_GET_ASIZE(&bp));
++		fnvlist_add_boolean_value(outnvl, "block_hole",
++		    BP_IS_HOLE(&bp));
++		fnvlist_add_boolean_value(outnvl, "block_embedded",
++		    BP_IS_EMBEDDED(&bp));
++		/* Conservative region hint, including an absent BRT. */
++		fnvlist_add_boolean_value(outnvl, "block_shared", real &&
++		    (BP_GET_DEDUP(&bp) || brt_maybe_exists(
++		    dmu_objset_spa(zfsvfs->z_os), &bp)));
++		if (real) {
++			uint64_t birth = BP_GET_PHYSICAL_BIRTH(&bp);
++			BP_SET_BIRTH(&bp, 0, birth);
++			BP_SET_REWRITE(&bp, 0);
++		} else {
++			BP_ZERO(&bp);
++		}
++		fnvlist_add_uint8_array(outnvl, "block_identity",
++		    (uint8_t *)&bp, sizeof (bp));
++	}
++out:
++	if (lr != NULL)
++		zfs_rangelock_exit(lr);
++	if (entered)
++		zfs_exit(zfsvfs, FTAG);
++	if (locked)
++		VOP_UNLOCK(ZTOV(zp));
++	if (zp != NULL)
++		zfs_zrele_async(zp);
++	return (error);
++}
++
++static int
++bd_lock_pair(znode_t *src, znode_t *dst)
++{
++	if (src == dst) {
++		return (vn_lock(ZTOV(dst), LK_EXCLUSIVE | LK_RETRY));
++	}
++#if (__FreeBSD_version >= 1302506 && __FreeBSD_version < 1400000) || \
++	__FreeBSD_version >= 1400086
++	vn_lock_pair(ZTOV(src), false, LK_EXCLUSIVE, ZTOV(dst), false,
++	    LK_EXCLUSIVE);
++#else
++	vn_lock_pair(ZTOV(src), false, ZTOV(dst), false);
++#endif
++	return (0);
++}
++
++static void
++bd_unlock_pair(znode_t *src, znode_t *dst)
++{
++	VOP_UNLOCK(ZTOV(dst));
++	if (src != dst)
++		VOP_UNLOCK(ZTOV(src));
++}
++
++/*
++ * Metadata-neutral, one-block deduplication. Like upstream afb4010's dedupe
++ * path, it neither logs a content change nor refreshes file pages: the bytes
++ * are unchanged, and a crash may lose only optimization progress. Existing
++ * clone_range and its content-changing ZIL replay remain untouched.
++ */
++static int
++bd_share(zfsvfs_t *zfsvfs, nvlist_t *innvl, nvlist_t *outnvl)
++{
++	bd_identity_t source, target;
++	znode_t *src = NULL, *dst = NULL;
++	zfs_locked_range_t *slr = NULL, *dlr = NULL;
++	boolean_t entered = B_FALSE, locked = B_FALSE;
++	uint64_t inoff, outoff, length;
++	uint_t srcseq, dstseq;
++	int error = bd_identity_get(innvl, "", &target);
++	if (error == 0)
++		error = bd_identity_get(innvl, "source_", &source);
++	if (error != 0)
++		return (error);
++	if (nvlist_lookup_uint64(innvl, "source_offset", &inoff) != 0 ||
++	    nvlist_lookup_uint64(innvl, "offset", &outoff) != 0 ||
++	    nvlist_lookup_uint64(innvl, "length", &length) != 0 ||
++	    length == 0 || length > SPA_MAXBLOCKSIZE)
++		return (SET_ERROR(EINVAL));
++	if ((error = zfs_enter(zfsvfs, FTAG)) != 0)
++		return (error);
++	entered = B_TRUE;
++	if ((error = bd_dataset_check(zfsvfs, B_TRUE)) != 0)
++		goto out;
++	if ((error = zfs_zget(zfsvfs, target.object, &dst)) != 0)
++		goto out;
++	if (source.object == target.object)
++		src = dst;
++	else if ((error = zfs_zget(zfsvfs, source.object, &src)) != 0)
++		goto out;
++	zfs_exit(zfsvfs, FTAG);
++	entered = B_FALSE;
++	if ((error = bd_lock_pair(src, dst)) != 0)
++		goto out;
++	locked = B_TRUE;
++	if ((error = zfs_enter_verify_zp(zfsvfs, dst, FTAG)) != 0)
++		goto out;
++	entered = B_TRUE;
++	if ((error = zfs_verify_zp(src)) != 0 ||
++	    (error = bd_identity_check(src, &source)) != 0 ||
++	    (error = bd_identity_check(dst, &target)) != 0)
++		goto out;
++	if (!bd_idle(src) || !bd_idle(dst)) {
++		error = SET_ERROR(EBUSY);
++		goto out;
++	}
++	if ((error = bd_ordinary(src)) != 0 ||
++	    (error = bd_ordinary(dst)) != 0)
++		goto out;
++	srcseq = src->z_seq;
++	dstseq = dst->z_seq;
++	/* A clean BP already proves durability; avoid a TXG wait per block. */
++	blkptr_t probe;
++	boolean_t drain = B_FALSE;
++	error = bd_bp(src, inoff, &probe);
++	if (error == EAGAIN)
++		drain = B_TRUE;
++	else if (error != 0)
++		goto out;
++	error = bd_bp(dst, outoff, &probe);
++	if (error == EAGAIN)
++		drain = B_TRUE;
++	else if (error != 0)
++		goto out;
++	/* Drain dirty files without vnode, range, or installation locks. */
++	zfs_exit(zfsvfs, FTAG);
++	entered = B_FALSE;
++	bd_unlock_pair(src, dst);
++	locked = B_FALSE;
++	if (drain) {
++		if ((error = zfs_enter(zfsvfs, FTAG)) != 0)
++			goto out;
++		entered = B_TRUE;
++		if ((error = zil_commit(zfsvfs->z_log, source.object)) != 0 ||
++		    (src != dst && (error = zil_commit(zfsvfs->z_log,
++		    target.object)) != 0))
++			goto out;
++		txg_wait_synced(dmu_objset_pool(zfsvfs->z_os), 0);
++		zfs_exit(zfsvfs, FTAG);
++		entered = B_FALSE;
++	}
++	if ((error = bd_lock_pair(src, dst)) != 0)
++		goto out;
++	locked = B_TRUE;
++	if ((error = zfs_enter_verify_zp(zfsvfs, dst, FTAG)) != 0)
++		goto out;
++	entered = B_TRUE;
++	if ((error = zfs_verify_zp(src)) != 0 ||
++	    (error = bd_identity_check(src, &source)) != 0 ||
++	    (error = bd_identity_check(dst, &target)) != 0)
++		goto out;
++	if (src->z_seq != srcseq || dst->z_seq != dstseq) {
++		error = SET_ERROR(EAGAIN);
++		goto out;
++	}
++	if (!bd_idle(src) || !bd_idle(dst)) {
++		error = SET_ERROR(EBUSY);
++		goto out;
++	}
++	if ((error = bd_dataset_check(zfsvfs, B_TRUE)) != 0)
++		goto out;
++	if ((error = bd_ordinary(src)) != 0 ||
++	    (error = bd_ordinary(dst)) != 0)
++		goto out;
++	if ((src->z_pflags & ZFS_AV_QUARANTINED) ||
++	    (dst->z_pflags & (ZFS_IMMUTABLE | ZFS_APPENDONLY | ZFS_READONLY))) {
++		error = SET_ERROR(EPERM);
++		goto out;
++	}
++	uint64_t block = src->z_blksz;
++	if (block == 0 || block > SPA_MAXBLOCKSIZE ||
++	    block != dst->z_blksz || inoff >= src->z_size ||
++	    outoff >= dst->z_size || length > src->z_size - inoff ||
++	    length > dst->z_size - outoff || inoff % block != 0 ||
++	    outoff % block != 0 || length > block ||
++	    (length != block && (length != src->z_size - inoff ||
++	    length != dst->z_size - outoff)) ||
++	    (!ISP2(block) && (src->z_size > block || dst->z_size > block)) ||
++	    (src == dst && inoff < outoff + length &&
++	    outoff < inoff + length)) {
++		error = SET_ERROR(EINVAL);
++		goto out;
++	}
++	/* Whole-file locks preserve a simple range-lock order. */
++	if (src == dst) {
++		dlr = zfs_rangelock_enter(&dst->z_rangelock, 0, UINT64_MAX,
++		    RL_WRITER);
++	} else if (src < dst) {
++		slr = zfs_rangelock_enter(&src->z_rangelock, 0, UINT64_MAX,
++		    RL_WRITER);
++		dlr = zfs_rangelock_enter(&dst->z_rangelock, 0, UINT64_MAX,
++		    RL_WRITER);
++	} else {
++		dlr = zfs_rangelock_enter(&dst->z_rangelock, 0, UINT64_MAX,
++		    RL_WRITER);
++		slr = zfs_rangelock_enter(&src->z_rangelock, 0, UINT64_MAX,
++		    RL_WRITER);
++	}
++	blkptr_t inbp, outbp;
++	if ((error = bd_bp(src, inoff, &inbp)) != 0 ||
++	    (error = bd_bp(dst, outoff, &outbp)) != 0)
++		goto out;
++	if (BP_IS_HOLE(&inbp) || BP_IS_EMBEDDED(&inbp) ||
++	    BP_IS_HOLE(&outbp) || BP_IS_EMBEDDED(&outbp) ||
++	    BP_GET_DEDUP(&inbp) || BP_GET_DEDUP(&outbp)) {
++		error = SET_ERROR(ENOTSUP);
++		goto out;
++	}
++	if (BP_GET_PHYSICAL_BIRTH(&inbp) == BP_GET_PHYSICAL_BIRTH(&outbp) &&
++	    DVA_EQUAL(&inbp.blk_dva[0], &outbp.blk_dva[0])) {
++		fnvlist_add_uint64(outnvl, "already_shared_bytes", length);
++		fnvlist_add_uint64(outnvl, "shared_bytes", 0);
++		fnvlist_add_uint64(outnvl, "compared_bytes", 0);
++		goto out;
++	}
++	uint8_t *bytes = vmem_alloc(2 * length, KM_SLEEP);
++	error = dmu_read(zfsvfs->z_os, src->z_id, inoff, length, bytes,
++	    DMU_READ_PREFETCH);
++	if (error == 0)
++		error = dmu_read(zfsvfs->z_os, dst->z_id, outoff, length,
++		    bytes + length, DMU_READ_PREFETCH);
++	if (error == 0 && memcmp(bytes, bytes + length, length) != 0)
++		error = SET_ERROR(EILSEQ);
++	vmem_free(bytes, 2 * length);
++	if (error != 0)
++		goto out;
++	dmu_tx_t *tx = dmu_tx_create(zfsvfs->z_os);
++	dmu_buf_impl_t *db = (dmu_buf_impl_t *)sa_get_db(dst->z_sa_hdl);
++	DB_DNODE_ENTER(db);
++	dmu_tx_hold_clone_by_dnode(tx, DB_DNODE(db), outoff, length, block);
++	DB_DNODE_EXIT(db);
++	error = dmu_tx_assign(tx, DMU_TX_WAIT);
++	if (error != 0) {
++		dmu_tx_abort(tx);
++		goto out;
++	}
++	error = dmu_brt_clone(zfsvfs->z_os, dst->z_id, outoff, length, tx,
++	    &inbp, 1);
++	dmu_tx_commit(tx);
++	if (error == 0) {
++		fnvlist_add_uint64(outnvl, "shared_bytes", length);
++		fnvlist_add_uint64(outnvl, "already_shared_bytes", 0);
++		fnvlist_add_uint64(outnvl, "compared_bytes", length);
++	}
++out:
++	if (dlr != NULL)
++		zfs_rangelock_exit(dlr);
++	if (slr != NULL)
++		zfs_rangelock_exit(slr);
++	if (entered)
++		zfs_exit(zfsvfs, FTAG);
++	if (locked)
++		bd_unlock_pair(src, dst);
++	if (src != NULL && src != dst)
++		zfs_zrele_async(src);
++	if (dst != NULL)
++		zfs_zrele_async(dst);
++	return (error);
++}
++
++/* Atime-neutral candidate hashing; sharing rechecks current bytes. */
++static int
++bd_read(zfsvfs_t *zfsvfs, nvlist_t *innvl, nvlist_t *outnvl)
++{
++	bd_identity_t id;
++	znode_t *zp = NULL;
++	zfs_locked_range_t *lr = NULL;
++	boolean_t entered = B_FALSE, locked = B_FALSE;
++	uint8_t *bytes = NULL;
++	uint64_t offset, length;
++	int error = bd_identity_get(innvl, "", &id);
++	if (error != 0)
++		return (error);
++	if (nvlist_lookup_uint64(innvl, "offset", &offset) != 0 ||
++	    nvlist_lookup_uint64(innvl, "length", &length) != 0 ||
++	    length == 0 || length > ZFS_BLOCKDEDUP_MAX_READ)
++		return (SET_ERROR(EINVAL));
++	if ((error = zfs_enter(zfsvfs, FTAG)) != 0)
++		return (error);
++	entered = B_TRUE;
++	if ((error = zfs_zget(zfsvfs, id.object, &zp)) != 0)
++		goto out;
++	zfs_exit(zfsvfs, FTAG);
++	entered = B_FALSE;
++	if ((error = vn_lock(ZTOV(zp), LK_SHARED | LK_RETRY)) != 0)
++		goto out;
++	locked = B_TRUE;
++	if ((error = zfs_enter_verify_zp(zfsvfs, zp, FTAG)) != 0)
++		goto out;
++	entered = B_TRUE;
++	if ((error = bd_identity_check(zp, &id)) != 0 ||
++	    (error = bd_dataset_check(zfsvfs, B_FALSE)) != 0 ||
++	    (error = bd_ordinary(zp)) != 0)
++		goto out;
++	if (offset >= zp->z_size || length > zp->z_size - offset) {
++		error = SET_ERROR(EINVAL);
++		goto out;
++	}
++	lr = zfs_rangelock_enter(&zp->z_rangelock, offset, length, RL_READER);
++	bytes = vmem_alloc(length, KM_SLEEP);
++	error = dmu_read(zfsvfs->z_os, zp->z_id, offset, length, bytes,
++	    DMU_READ_PREFETCH);
++	if (error == 0)
++		fnvlist_add_uint8_array(outnvl, "bytes", bytes, length);
++out:
++	if (bytes != NULL)
++		vmem_free(bytes, length);
++	if (lr != NULL)
++		zfs_rangelock_exit(lr);
++	if (entered)
++		zfs_exit(zfsvfs, FTAG);
++	if (locked)
++		VOP_UNLOCK(ZTOV(zp));
++	if (zp != NULL)
++		zfs_zrele_async(zp);
++	return (error);
++}
++#endif /* __FreeBSD__ */
++
++int
++zfs_blockdedup(zfsvfs_t *zfsvfs, nvlist_t *innvl, nvlist_t *outnvl)
++{
++#ifndef __FreeBSD__
++	(void) zfsvfs;
++	(void) innvl;
++	(void) outnvl;
++	return (SET_ERROR(ENOTSUP));
++#else
++	const char *op;
++	if (nvlist_lookup_string(innvl, "op", &op) != 0)
++		return (SET_ERROR(EINVAL));
++	if (strcmp(op, "inspect") == 0)
++		return (bd_inspect(zfsvfs, innvl, outnvl));
++	if (strcmp(op, "read") == 0)
++		return (bd_read(zfsvfs, innvl, outnvl));
++	if (strcmp(op, "share-blocks") != 0)
++		return (SET_ERROR(EINVAL));
++	if (!zfs_bclone_enabled || !spa_feature_is_enabled(
++	    dmu_objset_spa(zfsvfs->z_os), SPA_FEATURE_BLOCK_CLONING))
++		return (SET_ERROR(ENOTSUP));
++	return (bd_share(zfsvfs, innvl, outnvl));
++#endif
++}
 diff --git a/module/zfs/zfs_chunkdedup.c b/module/zfs/zfs_chunkdedup.c
 new file mode 100644
 index 0000000..0d2603f
@@ -6236,19 +8268,20 @@ index 0000000..0d2603f
 +	return (error == ENOENT ? SET_ERROR(EIO) : error);
 +}
 diff --git a/module/zfs/zfs_ioctl.c b/module/zfs/zfs_ioctl.c
-index 6922631..1e2025a 100644
+index 6922631..2d02129 100644
 --- a/module/zfs/zfs_ioctl.c
 +++ b/module/zfs/zfs_ioctl.c
-@@ -169,6 +169,8 @@
+@@ -169,6 +169,9 @@
  #include <sys/zfs_quota.h>
  #include <sys/zfs_vfsops.h>
  #include <sys/zfs_znode.h>
 +#include <sys/zfs_chunkdedup.h>
++#include <sys/zfs_blockdedup.h>
 +#include <sys/zfs_vnops.h>
  #include <sys/zap.h>
  #include <sys/spa.h>
  #include <sys/spa_impl.h>
-@@ -206,6 +208,11 @@
+@@ -206,6 +209,11 @@
  #include <sys/dsl_bookmark.h>
  #include <sys/dsl_userhold.h>
  #include <sys/zfeature.h>
@@ -6260,7 +8293,7 @@ index 6922631..1e2025a 100644
  #include <sys/zcp.h>
  #include <sys/zio_checksum.h>
  #include <sys/vdev_removal.h>
-@@ -279,6 +286,7 @@ static int zfs_ioc_userspace_upgrade(zfs_cmd_t *zc);
+@@ -279,6 +287,7 @@ static int zfs_ioc_userspace_upgrade(zfs_cmd_t *zc);
  static int zfs_ioc_id_quota_upgrade(zfs_cmd_t *zc);
  static int zfs_check_settable(const char *name, nvpair_t *property,
      cred_t *cr);
@@ -6268,7 +8301,7 @@ index 6922631..1e2025a 100644
  static int zfs_check_clearable(const char *dataset, nvlist_t *props,
      nvlist_t **errors);
  static int zfs_fill_zplprops_root(uint64_t, nvlist_t *, nvlist_t *,
-@@ -2822,6 +2830,42 @@ zfs_is_namespace_prop(zfs_prop_t prop)
+@@ -2822,6 +2831,42 @@ zfs_is_namespace_prop(zfs_prop_t prop)
  	}
  }
  
@@ -6311,7 +8344,7 @@ index 6922631..1e2025a 100644
  /*
   * This function is best effort. If it fails to set any of the given properties,
   * it continues to set as many as it can and returns the last error
-@@ -2830,7 +2874,7 @@ zfs_is_namespace_prop(zfs_prop_t prop)
+@@ -2830,7 +2875,7 @@ zfs_is_namespace_prop(zfs_prop_t prop)
   * corresponding error numbers.
   *
   * If every property is set successfully, zero is returned and errlist is not
@@ -6320,7 +8353,7 @@ index 6922631..1e2025a 100644
   */
  int
  zfs_set_prop_nvlist(const char *dsname, zprop_source_t source, nvlist_t *nvl,
-@@ -2844,6 +2888,28 @@ zfs_set_prop_nvlist(const char *dsname, zprop_source_t source, nvlist_t *nvl,
+@@ -2844,6 +2889,28 @@ zfs_set_prop_nvlist(const char *dsname, zprop_source_t source, nvlist_t *nvl,
  	const char *strval;
  	boolean_t should_update_mount_cache = B_FALSE;
  
@@ -6349,7 +8382,7 @@ index 6922631..1e2025a 100644
  	nvlist_t *genericnvl = fnvlist_alloc();
  	nvlist_t *retrynvl = fnvlist_alloc();
  retry:
-@@ -3135,6 +3201,12 @@ zfs_ioc_inherit_prop(zfs_cmd_t *zc)
+@@ -3135,6 +3202,12 @@ zfs_ioc_inherit_prop(zfs_cmd_t *zc)
  	nvpair_t *pair;
  	zprop_type_t type;
  	int err;
@@ -6362,7 +8395,7 @@ index 6922631..1e2025a 100644
  
  	if (!received) {
  		/*
-@@ -4950,6 +5022,113 @@ zfs_ioc_rename(zfs_cmd_t *zc)
+@@ -4950,6 +5023,113 @@ zfs_ioc_rename(zfs_cmd_t *zc)
  	}
  }
  
@@ -6476,7 +8509,7 @@ index 6922631..1e2025a 100644
  static int
  zfs_check_settable(const char *dsname, nvpair_t *pair, cred_t *cr)
  {
-@@ -5026,6 +5205,33 @@ zfs_check_settable(const char *dsname, nvpair_t *pair, cred_t *cr)
+@@ -5026,6 +5206,33 @@ zfs_check_settable(const char *dsname, nvpair_t *pair, cred_t *cr)
  		VERIFY0(nvlist_lookup_nvpair(attrs, ZPROP_VALUE, &pair));
  	}
  
@@ -6510,16 +8543,54 @@ index 6922631..1e2025a 100644
  	/*
  	 * Check that this value is valid for this pool version
  	 */
-@@ -7439,6 +7645,762 @@ error:
+@@ -7439,6 +7646,855 @@ error:
  	return (ret);
  }
  
++/* Standalone verified BRT sharing; no chunk storage ABI or property. */
++static const zfs_ioc_key_t zfs_keys_blockdedup[] = {
++	{"op", DATA_TYPE_STRING, 0},
++	{"object", DATA_TYPE_UINT64, ZK_OPTIONAL},
++	{"generation", DATA_TYPE_UINT64, ZK_OPTIONAL},
++	{"size", DATA_TYPE_UINT64, ZK_OPTIONAL},
++	{"mtime_sec", DATA_TYPE_UINT64, ZK_OPTIONAL},
++	{"mtime_nsec", DATA_TYPE_UINT64, ZK_OPTIONAL},
++	{"offset", DATA_TYPE_UINT64, ZK_OPTIONAL},
++	{"length", DATA_TYPE_UINT64, ZK_OPTIONAL},
++	{"source_object", DATA_TYPE_UINT64, ZK_OPTIONAL},
++	{"source_generation", DATA_TYPE_UINT64, ZK_OPTIONAL},
++	{"source_size", DATA_TYPE_UINT64, ZK_OPTIONAL},
++	{"source_mtime_sec", DATA_TYPE_UINT64, ZK_OPTIONAL},
++	{"source_mtime_nsec", DATA_TYPE_UINT64, ZK_OPTIONAL},
++	{"source_offset", DATA_TYPE_UINT64, ZK_OPTIONAL},
++};
++
++static int
++zfs_ioc_blockdedup(const char *name, nvlist_t *innvl, nvlist_t *outnvl)
++{
++#ifdef __FreeBSD__
++	zfsvfs_t *zfsvfs;
++	int error = getzfsvfs(name, &zfsvfs);
++	if (error != 0)
++		return (error);
++	error = zfs_blockdedup(zfsvfs, innvl, outnvl);
++	zfs_vfs_rele(zfsvfs);
++	return (error);
++#else
++	(void) name;
++	(void) innvl;
++	(void) outnvl;
++	return (SET_ERROR(ENOTSUP));
++#endif
++}
++
 +/*
 + * Version-one ABI: object identity plus complete Microsoft chunk ranges.
 + * The kernel rereads and hashes candidate bytes, never trusting user data.
 + */
 +static const zfs_ioc_key_t zfs_keys_chunkdedup[] = {
 +	{"op", DATA_TYPE_STRING, 0},
++	{"objects", DATA_TYPE_UINT64_ARRAY, ZK_OPTIONAL},
 +	{"object", DATA_TYPE_UINT64, ZK_OPTIONAL},
 +	{"generation", DATA_TYPE_UINT64, ZK_OPTIONAL},
 +	{"size", DATA_TYPE_UINT64, ZK_OPTIONAL},
@@ -6663,12 +8734,7 @@ index 6922631..1e2025a 100644
 +	entered = B_TRUE;
 +	if ((error = zfs_zget(zfsvfs, id.object, &zp)) != 0)
 +		goto out;
-+	/* The initial file query settles writes before per-block inspection. */
-+	if (!range && !zfs_is_readonly(zfsvfs)) {
-+		if ((error = zil_commit(zfsvfs->z_log, id.object)) != 0)
-+			goto out;
-+		txg_wait_synced(dmu_objset_pool(zfsvfs->z_os), 0);
-+	}
++	/* Dirty block pointers return EAGAIN; inspection never forces a sync. */
 +	zfs_exit(zfsvfs, FTAG);
 +	entered = B_FALSE;
 +	if ((error = vn_lock(ZTOV(zp), LK_SHARED | LK_RETRY)) != 0)
@@ -6687,6 +8753,9 @@ index 6922631..1e2025a 100644
 +	fnvlist_add_uint64(outnvl, "block_size", zp->z_blksz);
 +	fnvlist_add_uint64(outnvl, "allocated_bytes",
 +	    doi.doi_physical_blocks_512 * SPA_MINBLOCKSIZE);
++	/* Diagnostic only: callers must still revalidate each inspected BP. */
++	fnvlist_add_uint64(outnvl, "synced_txg",
++	    spa_last_synced_txg(dmu_objset_spa(zfsvfs->z_os)));
 +	fnvlist_add_boolean_value(outnvl, "chunked", chunked);
 +	fnvlist_add_boolean_value(outnvl, "eligible",
 +	    cd_native_idle(zp) && !zfsvfs->z_os->os_encrypted &&
@@ -6726,6 +8795,58 @@ index 6922631..1e2025a 100644
 +		VOP_UNLOCK(ZTOV(zp));
 +	if (zp != NULL)
 +		zfs_zrele_async(zp);
++	return (error);
++}
++
++/*
++ * Objects are bounded retry hints, not authority to install references.
++ * Drain their prior DMU writes with one pool barrier, without holding any
++ * vnode, range, or installation locks.  Later inspection and sharing still
++ * validate identity and idle state; dirty writable mappings are excluded.
++ */
++static int
++cd_native_sync_batch(zfsvfs_t *zfsvfs, nvlist_t *innvl, nvlist_t *outnvl)
++{
++	uint64_t *objects;
++	uint_t count;
++	int error;
++
++	if (nvlist_lookup_uint64_array(innvl, "objects", &objects, &count) != 0 ||
++	    count == 0 || count > 256)
++		return (SET_ERROR(EINVAL));
++	if ((error = zfs_enter(zfsvfs, FTAG)) != 0)
++		return (error);
++	if (zfs_is_readonly(zfsvfs)) {
++		error = SET_ERROR(EROFS);
++		goto out;
++	}
++	if (zfsvfs->z_os->os_encrypted ||
++	    (zfsvfs->z_vfs->vfs_flag & MNT_EXPORTED) != 0) {
++		error = SET_ERROR(ENOTSUP);
++		goto out;
++	}
++	for (uint_t i = 0; i < count; i++) {
++		znode_t *zp;
++		if (objects[i] == 0) {
++			error = SET_ERROR(EINVAL);
++			goto out;
++		}
++		if ((error = zfs_zget(zfsvfs, objects[i], &zp)) != 0)
++			goto out;
++		/* Vnode type is immutable; these hints need no identity claim. */
++		boolean_t regular = ZTOV(zp)->v_type == VREG;
++		zfs_zrele_async(zp);
++		if (!regular) {
++			error = SET_ERROR(EINVAL);
++			goto out;
++		}
++	}
++	txg_wait_synced(dmu_objset_pool(zfsvfs->z_os), 0);
++	fnvlist_add_uint64(outnvl, "synced_txg",
++	    spa_last_synced_txg(dmu_objset_spa(zfsvfs->z_os)));
++	error = 0;
++out:
++	zfs_exit(zfsvfs, FTAG);
 +	return (error);
 +}
 +
@@ -6985,7 +9106,7 @@ index 6922631..1e2025a 100644
 +		error = cd_native_inspect(zfsvfs, innvl, outnvl);
 +		goto rele;
 +	}
-+	if (strcmp(op, "share-blocks") == 0) {
++	if (strcmp(op, "share-blocks") == 0 || strcmp(op, "sync-batch") == 0) {
 +		uint64_t enabled;
 +		if ((error = dsl_prop_get_integer(name, "chunkdedup", &enabled,
 +		    NULL)) != 0 || enabled == 0) {
@@ -6994,6 +9115,11 @@ index 6922631..1e2025a 100644
 +		}
 +		if ((error = zfs_chunkdedup_enable_check(name)) != 0)
 +			goto rele;
++		/* A durability barrier does not create BRT references. */
++		if (strcmp(op, "sync-batch") == 0) {
++			error = cd_native_sync_batch(zfsvfs, innvl, outnvl);
++			goto rele;
++		}
 +		if (!zfs_bclone_enabled || !spa_feature_is_enabled(
 +		    dmu_objset_spa(zfsvfs->z_os), SPA_FEATURE_BLOCK_CLONING)) {
 +			error = SET_ERROR(ENOTSUP);
@@ -7273,10 +9399,15 @@ index 6922631..1e2025a 100644
  static zfs_ioc_vec_t zfs_ioc_vec[ZFS_IOC_LAST - ZFS_IOC_FIRST];
  
  static void
-@@ -7745,6 +8707,11 @@ zfs_ioctl_init(void)
+@@ -7745,6 +8801,16 @@ zfs_ioctl_init(void)
  	    POOL_CHECK_SUSPENDED | POOL_CHECK_READONLY, B_TRUE, B_TRUE,
  	    zfs_keys_ddt_prune, ARRAY_SIZE(zfs_keys_ddt_prune));
  
++	zfs_ioctl_register("blockdedup", ZFS_IOC_BLOCKDEDUP,
++	    zfs_ioc_blockdedup, zfs_secpolicy_config, DATASET_NAME,
++	    POOL_CHECK_SUSPENDED, B_FALSE, B_FALSE,
++	    zfs_keys_blockdedup, ARRAY_SIZE(zfs_keys_blockdedup));
++
 +	zfs_ioctl_register("chunkdedup", ZFS_IOC_CHUNKDEDUP,
 +	    zfs_ioc_chunkdedup, zfs_secpolicy_config, DATASET_NAME,
 +	    POOL_CHECK_SUSPENDED, B_FALSE, B_FALSE,

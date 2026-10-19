@@ -146,8 +146,16 @@ def import_stages(run, folder, code):
         item['log'] = (folder / item['log']).relative_to(run).as_posix()
         # Evidence paths in helpers are relative to their own result directory.
         item['evidence_root'] = folder.relative_to(run).as_posix()
-    successful = results and all(item['status'] == 'PASS' for item in results)
-    if (code != 0 and successful) or (code == 0 and not successful):
+    smoke_skip = (report.get('profile') == 'native-smoke' and
+                  sum(item['name'] == 'guest_build' for item in results) == 1 and
+                  sum(item['name'] == 'guest_build' and item['status'] == 'SKIPPED'
+                      for item in results) == 1)
+    successful = results and all(item.get('returncode') == 0 and
+                (item['status'] == 'PASS' or
+                 (smoke_skip and item['name'] == 'guest_build' and item['status'] == 'SKIPPED'))
+                for item in results)
+    invalid_pass = any(item['status'] in ('PASS', 'SKIPPED') and item.get('returncode') != 0 for item in results)
+    if invalid_pass or (code != 0 and successful) or (code == 0 and not successful):
         log = folder.parent / (folder.name + '-driver.log')
         results.append(stage(folder.name + '_driver', run, [], code or 2, 0, log,
                              {'error': 'helper exit contradicts structured outcomes'}, infra=True))
@@ -200,7 +208,7 @@ def verify_attempt(source, files, original, parent, number, args, controls, repa
                     policy_sha256=sha(controls / 'policy.json'),
                     helpers={p.name: sha(p) for p in controls.iterdir() if p.is_file()},
                     stages=stages, repair_history=repairs)
-    if args.profile == 'native' and all(s['status'] == 'PASS' for s in stages):
+    if args.profile in ('native', 'native-smoke') and all(s['status'] == 'PASS' for s in stages):
         # Independent source/test/control acceptance must precede any VM writes.
         write(run / 'run.json', dict(manifest, profile='local'))
         evaluator = [sys.executable, str(run / 'control/evaluate.py'), '--run-dir', str(run),
@@ -214,7 +222,10 @@ def verify_attempt(source, files, original, parent, number, args, controls, repa
             command = [sys.executable, str(run / 'control/native.py'), '--repo', str(frozen),
                        '--kit', str(args.kit), '--run-dir', str(run / 'native'),
                        '--source-manifest', str(run / 'source-files.json'), '--source-digest', digest,
-                       '--run-id', nonce, '--host', args.host, '--mode', 'build']
+                       '--run-id', nonce, '--host', args.host,
+                       '--mode', 'smoke' if args.profile == 'native-smoke' else 'build']
+            if args.profile == 'native-smoke':
+                command += ['--cached-build-receipt', str(args.cached_build_receipt)]
             code, _ = execute(command, run / 'native-driver.log', timeout=args.native_timeout, grace=180)
             stages.extend(import_stages(run, run / 'native', code))
     write(run / 'run.json', manifest)
@@ -343,8 +354,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--repo', type=Path, required=True)
     parser.add_argument('--kit', type=Path, default=HERE.parent)
-    parser.add_argument('--profile', choices=('local', 'native'), default='local')
+    parser.add_argument('--profile', choices=('local', 'native', 'native-smoke'), default='local')
     parser.add_argument('--host', help='explicit SSH host for the isolated bhyve lab')
+    parser.add_argument('--cached-build-receipt', type=Path, help='prior PASS build receipt; native-smoke only')
     parser.add_argument('--output', type=Path, help='new run directory; defaults to REPO_PARENT/verification')
     parser.add_argument('--repair', action='store_true', help='request at most three evidence-based repair proposals')
     parser.add_argument('--repair-command', help='JSON argv for a custom proposal provider; implies --repair')
@@ -353,8 +365,14 @@ def main():
     parser.add_argument('--repair-timeout', type=int, default=600)
     args = parser.parse_args()
     args.repo, args.kit = args.repo.resolve(), args.kit.resolve()
-    if args.profile == 'native' and not args.host:
+    if args.profile in ('native', 'native-smoke') and not args.host:
         parser.error('native verification needs --host; no host is selected implicitly')
+    if args.cached_build_receipt and args.profile != 'native-smoke':
+        parser.error('--cached-build-receipt is accepted only for native-smoke')
+    if args.profile == 'native-smoke' and not args.cached_build_receipt:
+        parser.error('native-smoke needs --cached-build-receipt to freeze the actual cached prefix')
+    if args.cached_build_receipt:
+        args.cached_build_receipt = args.cached_build_receipt.resolve()
     run_id = datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dT%H%M%SZ').lower() + '-' + uuid.uuid4().hex[:8]
     args.run_id = run_id
     parent = (args.output or args.repo.parent / 'verification' / run_id).resolve()

@@ -434,6 +434,7 @@ ZFS_OBJS := \
 	zfs_sa.o \
 	zfs_vnops.o \
 	zfs_chunkdedup.o \
+	zfs_blockdedup.o \
 	zfs_znode.o \
 	zil.o \
 	zio.o \

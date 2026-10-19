@@ -26,6 +26,7 @@ REQUIRED = (
     'cmd/zfs/rabin64_table.h', 'cmd/zfs/zfs_chunkdedup_user.c',
     'include/sys/zfs_chunkdedup.h', 'module/zfs/zfs_chunkdedup.c',
     'cmd/zfs/chunkdedup_hybrid.h',
+    'cmd/zfs/chunkdedup_parallel.h',
 )
 MINIMUM_ASSERTIONS = {'chunker_api': 26, 'core_model': 104,
                       'worker_batches': 26, 'packaging': 8}
@@ -506,6 +507,12 @@ sys.exit(status)
                      env=dict(self.environment, CC=shlex.join(self.cc)))
         self.current['evidence']['artifacts'].append(self.artifact(policy))
         self.current['evidence']['hybrid_policy'] = json.loads(policy.read_text())
+
+        self.execute(['sh', self.args.kit / 'lab-setup/tests/test_parallel_scan.sh',
+                      self.snapshot], env=dict(self.environment, CC=shlex.join(self.cc)))
+        self.current['evidence']['parallel_scan'] = (
+            'Actual bounded pthread pool; concurrent callbacks, ordered merge, '
+            'backpressure, slot reuse and joined shutdown; strict and ASan/UBSan')
 
         if runtime_error:
             raise runtime_error

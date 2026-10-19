@@ -144,6 +144,7 @@ COMMON_H = \
 	sys/zfs_vfsops.h \
 	sys/zfs_vnops.h \
 	sys/zfs_chunkdedup.h \
+	sys/zfs_blockdedup.h \
 	sys/zfs_znode.h \
 	sys/zil.h \
 	sys/zil_impl.h \
