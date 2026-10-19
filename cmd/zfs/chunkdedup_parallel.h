@@ -9,7 +9,8 @@
 #include <string.h>
 
 /*
- * A bounded, ordered worker pool. Only the coordinator submits, takes and
+ * A bounded worker pool, ordered unless initialized for ready results.
+ * Only the coordinator submits, takes and
  * destroys the pool. Callbacks own no queue state and run without its mutex.
  * Items always remain caller-owned, including untaken items after fini().
  */
@@ -33,9 +34,22 @@ struct cd_parallel {
 	struct cd_parallel_slot *slots;
 	size_t capacity, count, head, tail, next;
 	unsigned int created;
-	int stopping, initialized;
+	int stopping, initialized, unordered;
 	int (*work)(void *);
 };
+
+/* Called with the pool mutex held; all searches are bounded by capacity. */
+static inline size_t
+cd_parallel_find(struct cd_parallel *pool, size_t start,
+    enum cd_parallel_state state)
+{
+	for (size_t i = 0; i < pool->capacity; i++) {
+		size_t index = (start + i) % pool->capacity;
+		if (pool->slots[index].state == state)
+			return (index);
+	}
+	return (pool->capacity);
+}
 
 static void *
 cd_parallel_worker(void *argument)
@@ -43,9 +57,16 @@ cd_parallel_worker(void *argument)
 	struct cd_parallel *pool = argument;
 	(void) pthread_mutex_lock(&pool->lock);
 	for (;;) {
-		while (!pool->stopping &&
-		    pool->slots[pool->next].state != CD_PARALLEL_QUEUED)
+		while (!pool->stopping) {
+			size_t index = pool->unordered ? cd_parallel_find(pool,
+			    pool->next, CD_PARALLEL_QUEUED) : pool->next;
+			if (index < pool->capacity &&
+			    pool->slots[index].state == CD_PARALLEL_QUEUED) {
+				pool->next = index;
+				break;
+			}
 			(void) pthread_cond_wait(&pool->work_ready, &pool->lock);
+		}
 		if (pool->stopping)
 			break;
 		struct cd_parallel_slot *slot = &pool->slots[pool->next];
@@ -84,8 +105,8 @@ cd_parallel_fini(struct cd_parallel *pool)
 }
 
 static inline int
-cd_parallel_init(struct cd_parallel *pool, unsigned int threads,
-    int (*work)(void *))
+cd_parallel_init_mode(struct cd_parallel *pool, unsigned int threads,
+    int (*work)(void *), int unordered)
 {
 	if (pool == NULL || work == NULL || threads == 0 ||
 	    threads > CD_PARALLEL_MAX_THREADS)
@@ -93,6 +114,7 @@ cd_parallel_init(struct cd_parallel *pool, unsigned int threads,
 	memset(pool, 0, sizeof (*pool));
 	pool->capacity = (size_t)threads * 2;
 	pool->work = work;
+	pool->unordered = unordered;
 	pool->threads = calloc(threads, sizeof (*pool->threads));
 	pool->slots = calloc(pool->capacity, sizeof (*pool->slots));
 	int error = ENOMEM;
@@ -127,6 +149,20 @@ free_storage:
 	return (error);
 }
 
+static inline int
+cd_parallel_init(struct cd_parallel *pool, unsigned int threads,
+    int (*work)(void *))
+{
+	return (cd_parallel_init_mode(pool, threads, work, 0));
+}
+
+static inline int
+cd_parallel_init_unordered(struct cd_parallel *pool, unsigned int threads,
+    int (*work)(void *))
+{
+	return (cd_parallel_init_mode(pool, threads, work, 1));
+}
+
 static inline size_t
 cd_parallel_count(struct cd_parallel *pool)
 {
@@ -152,11 +188,13 @@ cd_parallel_submit(struct cd_parallel *pool, void *item)
 	} else if (pool->count == pool->capacity) {
 		error = EAGAIN;
 	} else {
-		struct cd_parallel_slot *slot = &pool->slots[pool->tail];
+		size_t index = pool->unordered ? cd_parallel_find(pool,
+		    pool->tail, CD_PARALLEL_EMPTY) : pool->tail;
+		struct cd_parallel_slot *slot = &pool->slots[index];
 		slot->item = item;
 		slot->error = 0;
 		slot->state = CD_PARALLEL_QUEUED;
-		pool->tail = (pool->tail + 1) % pool->capacity;
+		pool->tail = (index + 1) % pool->capacity;
 		pool->count++;
 		(void) pthread_cond_signal(&pool->work_ready);
 	}
@@ -164,7 +202,7 @@ cd_parallel_submit(struct cd_parallel *pool, void *item)
 	return (error);
 }
 
-/* Results leave the pool in dispatch order, regardless of completion order. */
+/* Ordered pools retain dispatch order; unordered pools reclaim any ready job. */
 static inline int
 cd_parallel_take(struct cd_parallel *pool, void **item, int *work_error)
 {
@@ -175,16 +213,25 @@ cd_parallel_take(struct cd_parallel *pool, void **item, int *work_error)
 	if (pool->count == 0) {
 		error = ENOENT;
 	} else {
-		struct cd_parallel_slot *slot = &pool->slots[pool->head];
-		while (slot->state != CD_PARALLEL_DONE && !pool->stopping)
+		size_t index;
+		for (;;) {
+			index = pool->unordered ? cd_parallel_find(pool,
+			    pool->head, CD_PARALLEL_DONE) : pool->head;
+			if ((index < pool->capacity &&
+			    pool->slots[index].state == CD_PARALLEL_DONE) ||
+			    pool->stopping)
+				break;
 			(void) pthread_cond_wait(&pool->result_ready, &pool->lock);
-		if (slot->state != CD_PARALLEL_DONE) {
+		}
+		if (index == pool->capacity ||
+		    pool->slots[index].state != CD_PARALLEL_DONE) {
 			error = ECANCELED;
 		} else {
+			struct cd_parallel_slot *slot = &pool->slots[index];
 			*item = slot->item;
 			*work_error = slot->error;
 			memset(slot, 0, sizeof (*slot));
-			pool->head = (pool->head + 1) % pool->capacity;
+			pool->head = (index + 1) % pool->capacity;
 			pool->count--;
 		}
 	}

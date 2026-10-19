@@ -1258,8 +1258,9 @@ cd_catalog_fini(struct cd_catalog *c)
 
 /*
  * Workers never seek, truncate or assign IDs in the shared catalog. Each owns
- * three bounded-count disk spools; the coordinator merges completed jobs in
- * traversal order, then runs the existing selection and installation paths.
+ * three bounded-count disk spools; the coordinator merges any completed job
+ * and assigns its shared IDs before selection and installation. A slow file
+ * must not prevent finished slots from being reused by the other workers.
  */
 struct cd_scan_job {
 	struct cd_catalog local;
@@ -1385,7 +1386,8 @@ cd_scan_init(struct cd_scan *scan, struct cd_catalog *c, uint64_t age,
 	scan->catalog = c;
 	scan->age = age;
 	atomic_init(&scan->cancelled, 0);
-	int error = cd_parallel_init(&scan->parallel, threads, cd_scan_work);
+	int error = cd_parallel_init_unordered(&scan->parallel, threads,
+	    cd_scan_work);
 	if (error != 0)
 		return (error);
 	scan->jobs = calloc(scan->parallel.capacity, sizeof (*scan->jobs));

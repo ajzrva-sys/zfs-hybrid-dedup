@@ -2622,13 +2622,21 @@ int
 dmu_read_l0_bps(objset_t *os, uint64_t object, uint64_t offset, uint64_t length,
     blkptr_t *bps, size_t *nbpsp)
 {
+	return (dmu_read_l0_bps_flags(os, object, offset, length, bps, nbpsp,
+	    DMU_READ_PREFETCH));
+}
+
+int
+dmu_read_l0_bps_flags(objset_t *os, uint64_t object, uint64_t offset,
+    uint64_t length, blkptr_t *bps, size_t *nbpsp, dmu_flags_t flags)
+{
 	dmu_buf_t **dbp, *dbuf;
 	dmu_buf_impl_t *db;
 	blkptr_t *bp;
 	int error, numbufs;
 
 	error = dmu_buf_hold_array(os, object, offset, length, FALSE, FTAG,
-	    &numbufs, &dbp, DMU_READ_PREFETCH);
+	    &numbufs, &dbp, flags);
 	if (error != 0) {
 		if (error == ESRCH) {
 			error = SET_ERROR(ENXIO);

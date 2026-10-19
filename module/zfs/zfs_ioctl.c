@@ -7771,8 +7771,9 @@ cd_native_bp(znode_t *zp, uint64_t offset, blkptr_t *bp)
 	    offset % block != 0 || (!ISP2(block) && zp->z_size > block))
 		return (SET_ERROR(EINVAL));
 	size_t count = 1;
-	int error = dmu_read_l0_bps(ZTOZSB(zp)->z_os, zp->z_id, offset,
-	    MIN(block, zp->z_size - offset), bp, &count);
+	/* Inspection must not consume the following data read's zfetch stream. */
+	int error = dmu_read_l0_bps_flags(ZTOZSB(zp)->z_os, zp->z_id, offset,
+	    MIN(block, zp->z_size - offset), bp, &count, DMU_READ_NO_PREFETCH);
 	if (error == 0 && count != 1)
 		error = SET_ERROR(EIO);
 	return (error);

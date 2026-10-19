@@ -147,13 +147,24 @@ identity(unsigned inode)
 }
 
 static void
-check_rows(FILE *stream, unsigned count)
+check_rows(FILE *stream, struct cd_catalog *catalog, uint64_t bytes,
+    uint64_t object)
 {
     assert(fseeko(stream, 0, SEEK_SET) == 0);
-    for (unsigned i = 0; i < count; i++) {
+    for (unsigned i = 0; i < catalog->count; i++) {
         struct cd_catalog_item item;
+        struct cd_catalog_file file;
         assert(cd_catalog_next(stream, &item) == 0);
+        assert(cd_catalog_record(catalog, i, &file, B_FALSE) == 0);
         assert(item.file == i && item.dataset == 99 && item.length == 4096);
+        assert(item.dataset == file.dataset_id && file.parent == item.file);
+        assert(item.offset == file.identity.st_ino * 4096);
+        assert(item.bytes == bytes && item.object == object);
+        char hash[65];
+        for (unsigned j = 0; j < 32; j++)
+            (void) snprintf(hash + 2 * j, 3, "%02x",
+                (unsigned)(uint8_t)file.identity.st_ino);
+        assert(strcmp(item.hash, hash) == 0);
     }
     struct cd_catalog_item end;
     assert(cd_catalog_next(stream, &end) == ENOENT);
@@ -177,13 +188,24 @@ merge_and_links(void)
     assert(catalog.retry[0].identity.st_ino == 3);
     assert(strcmp(catalog.retry[0].path, "dirty") == 0);
     const char *expected[] = { "slow", "good4", "good5", "good6", "good7" };
+    const unsigned inodes[] = { 1, 5, 6, 7, 8 };
+    unsigned char seen[ARRAY_SIZE(expected)] = { 0 };
     for (unsigned i = 0; i < ARRAY_SIZE(expected); i++) {
         struct cd_catalog_file file;
         assert(cd_catalog_record(&catalog, i, &file, B_FALSE) == 0);
-        assert(file.parent == i && strcmp(file.path, expected[i]) == 0);
+        unsigned match;
+        for (match = 0; match < ARRAY_SIZE(expected); match++)
+            if (strcmp(file.path, expected[match]) == 0)
+                break;
+        assert(match < ARRAY_SIZE(expected) && !seen[match]++);
+        assert(file.parent == i && file.identity.st_ino == inodes[match]);
+        assert(file.identity.st_dev == 99 && file.dataset_id == 99);
+        assert(file.identity.st_size == 4096 && S_ISREG(file.identity.st_mode));
+        assert(strcmp(file.dataset, "pool/test") == 0);
     }
-    check_rows(catalog.blocks, 5);
-    check_rows(catalog.chunks, 5);
+    for (unsigned i = 0; i < ARRAY_SIZE(expected); i++) assert(seen[i] == 1);
+    check_rows(catalog.blocks, &catalog, 4096, 128 << 10);
+    check_rows(catalog.chunks, &catalog, 8192, 0);
     unsigned before = analyses;
     struct stat same = identity(1);
     assert(cd_scan_submit(&scan, "pool/test", "seen-alias", &same) == 0);
@@ -201,7 +223,7 @@ merge_and_links(void)
     cd_scan_fini(&scan);
     assert(active == 0);
     cd_catalog_fini(&catalog);
-    puts("PASS actual CLI merge assigns deterministic global IDs and row IDs");
+    puts("PASS actual CLI merge assigns unique consistent global IDs and row IDs");
     puts("PASS skipped/stale workers and partial dirty rows do not enter the catalog");
     puts("PASS dirty results reach central retry queue; pending retry aliases flush once");
     puts("PASS active and completed hard links avoid a second optimizer analysis");

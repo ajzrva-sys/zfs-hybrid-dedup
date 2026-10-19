@@ -987,6 +987,21 @@ int
 zfs_chunkdedup_read_buf(znode_t *zp, uint64_t offset, size_t length,
     void *buffer)
 {
+	if (offset > zp->z_size || length > zp->z_size - offset)
+		return (SET_ERROR(EINVAL));
+	if (length == 0)
+		return (0);
+	/*
+	 * The caller holds the file's range lock (and teardown reader), so a
+	 * native file cannot be converted while this read is in progress.
+	 * Check both the marker and mapping under the metadata mutex, then
+	 * release it before native I/O: unrelated scanner reads must not wait
+	 * for this file's disk access. Missing/corrupt mappings still take the
+	 * fail-closed logical path; chunk reads retain reclamation protection.
+	 */
+	if (!zfs_chunkdedup_active(zp))
+		return (cd_native_read(zp, offset, length, buffer, NULL));
+
 	zfsvfs_t *zfsvfs = ZTOZSB(zp);
 	zfs_chunkdedup_lock(zfsvfs);
 	int error = cd_read_locked(zp, offset, length, buffer);
