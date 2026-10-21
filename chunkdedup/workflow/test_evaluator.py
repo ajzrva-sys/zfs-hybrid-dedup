@@ -97,13 +97,16 @@ test('historical helper nonce replay','INFRA_FAILURE',replay,['helper_run_bindin
 def omission():
  a=main();a['stages']=[x for x in a['stages'] if x['name']!='core_model'];put(run/'run.json',a)
 test('omitted required stage','INFRA_FAILURE',omission,['local_stage_coverage'])
-def missingparallelheader():
- p=run/'local/tested-sources.json';d=json.loads(p.read_text());d['files']=[x for x in d['files'] if x['path']!='cmd/zfs/chunkdedup_parallel.h'];tested=hashlib.sha256(json.dumps(d['files'],sort_keys=True,separators=(',',':')).encode()).hexdigest();d['tested_sources_digest']=tested;put(p,d)
+def missingtestedinput(name):
+ p=run/'local/tested-sources.json';d=json.loads(p.read_text());d['files']=[x for x in d['files'] if x['path']!=name];tested=hashlib.sha256(json.dumps(d['files'],sort_keys=True,separators=(',',':')).encode()).hexdigest();d['tested_sources_digest']=tested;put(p,d)
  a,b=main(),helper();b['tested_sources_digest']=tested;b['tested_sources_manifest']['sha256']=sha(p)
  for rows in (a['stages'],b['results']):
   for entry in rows:
    if 'tested_sources_digest' in entry.get('evidence',{}):entry['evidence']['tested_sources_digest']=tested
  put(run/'run.json',a);put(run/'local/results.json',b)
-test('parallel implementation header omitted with refreshed receipt hashes','INFRA_FAILURE',missingparallelheader,['tested_source_coverage'])
+test('parallel implementation header omitted with refreshed receipt hashes','INFRA_FAILURE',lambda:missingtestedinput('cmd/zfs/chunkdedup_parallel.h'),['tested_source_coverage'])
+test('actual sorter implementation omitted with refreshed receipt hashes','INFRA_FAILURE',lambda:missingtestedinput('cmd/zfs/chunkdedup_hybrid.c'),['tested_source_coverage'])
+test('dirty-data gauge header omitted with refreshed receipt hashes','INFRA_FAILURE',lambda:missingtestedinput('include/sys/dsl_pool.h'),['tested_source_coverage'])
+test('dirty-data gauge implementation omitted with refreshed receipt hashes','INFRA_FAILURE',lambda:missingtestedinput('module/zfs/dsl_pool.c'),['tested_source_coverage'])
 (top/'results.json').write_text(json.dumps(dict(schema=1,scope='tamper tests on copies of actual local-run evidence, no native execution claim',results=results,passed=all(x['passed'] for x in results)),indent=2)+'\n')
 sys.exit(0 if all(x['passed'] for x in results) else 1)

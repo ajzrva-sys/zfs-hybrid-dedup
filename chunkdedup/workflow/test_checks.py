@@ -13,8 +13,9 @@ REQUIRED = (
     'cmd/zfs/chunkdedup_chunker.c', 'cmd/zfs/chunkdedup_chunker.h',
     'cmd/zfs/rabin64_table.h', 'cmd/zfs/zfs_chunkdedup_user.c',
     'include/sys/zfs_chunkdedup.h', 'module/zfs/zfs_chunkdedup.c',
-    'cmd/zfs/chunkdedup_hybrid.h',
+    'cmd/zfs/chunkdedup_hybrid.c', 'cmd/zfs/chunkdedup_hybrid.h',
     'cmd/zfs/chunkdedup_parallel.h',
+    'include/sys/dsl_pool.h', 'module/zfs/dsl_pool.c',
 )
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--repo', type=Path, required=True)
@@ -52,6 +53,8 @@ def run(name, extra, expected_code, expected_status):
 
 baseline = run('baseline', [], 0, 'PASS')
 assert len(baseline['results']) == 7 and all(s['status'] == 'PASS' for s in baseline['results'])
+tested = json.loads((root / 'baseline/tested-sources.json').read_text())
+assert {entry['path'] for entry in tested['files']} == set(REQUIRED)
 infra = run('missing-compiler', ['--cc', str(root / 'absent-compiler')], 2, 'INFRA_FAILURE')
 assert next(s for s in infra['results'] if s['name'] == 'toolchain')['status'] == 'INFRA_FAILURE'
 run('assertions-disabled', ['--cc', 'clang -DNDEBUG'], 2, 'INFRA_FAILURE')

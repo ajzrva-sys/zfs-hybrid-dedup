@@ -5,6 +5,8 @@ from this directory, or `./scripts/verify.sh` from the repository root.
 
 - [Status and remaining work](STATUS.md)
 - [Commands, selection policy and format boundaries](HYBRID.md)
+- [Catalog estimates and saved reports](CATALOG_REPORT.md)
+- [Current dirty-data gauge and isolated validation](DIRTY_DATA.md)
 - [Guarded FreeBSD lab recipe](lab-setup/README.md)
 - [Microsoft conformance fixtures and oracle source](conformance/README.md)
 - [Native core model](native-core-mock/README.md)
@@ -14,3 +16,9 @@ from this directory, or `./scripts/verify.sh` from the repository root.
 21-case original native inventory. The separate hybrid suite has 12 cases.
 Historical model reports bundled with those immutable fixtures are baseline
 artifacts; current revision status is in STATUS.md and VALIDATION.json.
+
+Local verification covers the actual chunker and core model, worker batching,
+parallel scan/share execution, bounded catalog selection and reporting,
+parallel catalog sorting, and packaging. The native dirty-data gauge has a
+separate portable direct-function test and isolated VM evidence. These focused
+checks do not establish a full native-suite pass for the combined revision.

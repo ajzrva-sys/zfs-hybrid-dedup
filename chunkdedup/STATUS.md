@@ -1,48 +1,75 @@
-# Validation status — 19 October 2026
+# Validation status — 21 October 2026
 
-The latest development source snapshot is
-`833fb482f3675b5ad87e3bbdcb18cca66760de1625ecd219be2c22359724a1ed`.
-Its required local profile **passed**, checking 4,138 source files, 141 immutable
-baseline files and 35 Microsoft conformance fixtures. Strict and ASan/UBSan
-tests cover concurrent execution, bounded admission, ordered catalog merging,
-dirty retries, hardlinks, stale/skipped files and cancellation cleanup.
+The current publication includes parallel native sharing, bounded catalog
+selection and saved reports, parallel catalog sorting, and the FreeBSD
+read-only per-pool dirty-data gauge. The OpenZFS source projection contains
+4,138 files; [SOURCE.json](SOURCE.json) and
+[tested-source-files.json](tested-source-files.json) identify it separately
+from the complete repository snapshots used by local verification.
 
-The native CLI build and installation readback passed. A 40-worker deployment
-showed 41 process threads and more than four cores of CPU use, confirming
-multicore activity. These observations are not a matched throughput benchmark.
-Parallel scanning changes only the CLI source, its new executor header and its
-build file relative to the kernel-tested predecessor. Selection, sharing and
-CDC installation remain sequential; kernel and on-disk formats are unchanged
-by this userspace update. The full native suite was not rerun for that update.
+Local verification covers the actual production chunker and core model,
+141 immutable baseline files, 35 Microsoft conformance fixtures, worker
+batching, bounded parallel execution, catalog selection/reporting, sorting and
+packaging. Strict and ASan/UBSan tests cover concurrency, admission limits,
+catalog identity, dirty retries, hardlinks, stale/skipped files and joined
+cancellation cleanup. Current run outcomes and their source identities are
+recorded in [VALIDATION.json](VALIDATION.json).
 
-The preceding durability-batching source snapshot,
-`98882f3c8618f31f28dcb7208c0909f78eca5290de029a2763749b7a5bc5ebcc`,
-passed **21 original and 12 hybrid cases** in the isolated guest through the
-`native-smoke` profile. It reused the exact module/tools from an earlier
-successful compilation of the same source, with fresh hash/provenance checks.
-Guest restoration, shutdown and exact host comparison passed. This is fresh
-native test execution with a reused build, not a fresh full-native compilation
-or a relabeling of earlier failed evaluations.
+## Optimizer changes and focused native checks
 
-The native cases include snapshots, clones, logical replication, independent
-mutations and reference preservation. New batching checks cover dirty-file
-admission, request bounds, preserved bytes/metadata and repeated clean
-inspections without transaction-group advances. Fixture setup now settles
-allocation and BRT visibility explicitly before measuring their existing
-assertions. All 21 original and 12 hybrid cases and immutable expectations
-remain present. Earlier source, fixture and infrastructure failures remain
-retained in development evidence; the prior public results remain history in
-[VALIDATION.json](VALIDATION.json).
+Native sharing now uses bounded workers while preserving current-file
+identity/content checks and copy-on-write semantics. Catalog selection uses a
+group index capped at 256 MiB, retaining the disk-backed path when necessary.
+The optimize-only `--report` option publishes complete sharing-group estimates
+before sharing, refuses an existing output, and cleans up partial output on
+analysis failure. See [the report format](CATALOG_REPORT.md).
 
-The block-only command is also included with its focused scanner tests. It is
-currently serial; parallel `--threads` support belongs to `zfs chunkdedup`.
-Block-only operation needs the matching patched driver and native
-`block_cloning` feature, without enabling the CDC feature.
+Catalog sorting distributes whole records to up to 64 workers, then performs
+an ordered serial merge with the original keys and C locale. Per-worker wrapper
+buffers are bounded to 64 KiB; each sort process retains the existing 4 MiB
+sort-buffer setting, which is not a hard RSS cap. Temporary runs and spills are
+removed on success, failure or cancellation.
+
+Focused native optimizer runs at one and 40 threads used 196 fixture files and
+observed 637,534,208 bytes of savings while preserving file hashes, metadata and
+copy-on-write isolation. These are bounded functional checks against the
+existing matching kernel, not the complete native suite. A synthetic 1 GiB
+catalog-sort comparison observed 29.809 seconds serial and 16.573 seconds with
+40 sort children, or about 1.80x faster. This measures that synthetic sorting
+stage, not production optimizer throughput.
+
+## Current dirty-data gauge
+
+The new gauge reports current ZFS dirty-space accounting, its per-pool limit
+and pool GUID. Eight direct-function checks passed in strict and ASan/UBSan
+builds. The exact candidate compiled as a FreeBSD kernel module with `-Werror`
+and passed ten native checks in an isolated offline VM using the matching
+kernel. Checks covered pool identity, idle zero, read-only fields, active
+backlog and drain, pool isolation, reserved/dotted names, concurrent readers
+during pool teardown, and clean guest shutdown.
+
+The gauge candidate remains uninstalled on the running storage host;
+activation and reboot are held. This is separate gauge-specific runtime proof,
+not a full native regression pass for the combined source. Interface semantics,
+candidate identity and reproduction details are in [DIRTY_DATA.md](DIRTY_DATA.md).
+
+## Remaining scope
+
+Earlier revisions passed the preserved 21-original and 12-hybrid native suites,
+including snapshot/clone independence, logical replication and reference
+preservation. Their exact source identities, build reuse and retained failures
+remain in [VALIDATION.json](VALIDATION.json). Those earlier results do not
+qualify the combined revision. No current full-suite pass is claimed.
+
+The separate `zfs blockdedup` command remains serial; parallel `--threads`
+support belongs to `zfs chunkdedup`. Block-only operation needs the matching
+patched module and native `block_cloning` feature without enabling CDC.
 
 Current-revision matched allocation, pure-read and RAM comparisons and forced
 sharing power-loss qualification remain **NOT_RUN**. The **1.25x** foreground-read
-target is unqualified. Functional tests and live CPU observations do not prove
-a performance target or production readiness.
+target is unqualified. Functional checks and synthetic sort timing do not
+establish that target or production readiness.
 
 This public summary excludes host inventories, private paths, device identities
-and raw operational logs. Use the guarded disposable guest for reproduction.
+and raw operational logs. Reproduce native behavior only in a guarded
+disposable guest.

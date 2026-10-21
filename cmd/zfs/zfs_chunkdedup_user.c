@@ -285,7 +285,8 @@ done:
 
 /*
  * A pass is analyzed completely before any conversion. File metadata and the
- * union/find forest live in a private temporary file; sort spills catalogs to
+ * file records live in a private temporary file; compact group state is
+ * kept in bounded memory during selection (disk fallback on allocation failure); sort spills catalogs to
  * a private directory with a 4 MiB sort buffer. No content index survives a
  * pass. Connecting both CDC and native matches prevents charging a seed to
  * one policy group while silently reusing it in another.
@@ -309,8 +310,21 @@ struct cd_retry_file {
 	struct stat identity;
 };
 
+struct cd_catalog_group {
+	uint64_t parent, native_estimate, chunk_estimate;
+	boolean_t uncertain;
+};
+
+#ifndef CD_CATALOG_GROUP_LIMIT
+#define CD_CATALOG_GROUP_LIMIT (UINT64_C(256) << 20)
+#endif
+
 struct cd_catalog {
 	FILE *files, *blocks, *chunks, *sorted_blocks, *sorted_chunks, *seen;
+	struct cd_catalog_group *groups;
+	FILE *report;
+	const char *report_path;
+	char report_temporary[PATH_MAX];
 	char directory[PATH_MAX];
 	uint64_t count, processed, skipped;
 	uint64_t seen_capacity;
@@ -437,6 +451,24 @@ cd_catalog_root(struct cd_catalog *c, uint64_t id, uint64_t *root)
 {
 	struct cd_catalog_file file;
 	uint64_t start = id;
+	if (c->groups != NULL) {
+		for (uint64_t steps = 0; steps <= c->count; steps++) {
+			if (id >= c->count)
+				return (EOVERFLOW);
+			uint64_t parent = c->groups[id].parent;
+			if (parent == id) {
+				*root = id;
+				while (start != id) {
+					uint64_t next = c->groups[start].parent;
+					c->groups[start].parent = id;
+					start = next;
+				}
+				return (0);
+			}
+			id = parent;
+		}
+		return (EPROTO);
+	}
 	for (uint64_t steps = 0; steps <= c->count; steps++) {
 		int error = cd_catalog_record(c, id, &file, B_FALSE);
 		if (error != 0)
@@ -467,6 +499,10 @@ cd_catalog_join(struct cd_catalog *c, uint64_t a, uint64_t b)
 		return (error);
 	struct cd_catalog_file file;
 	uint64_t parent = MIN(ar, br), child = MAX(ar, br);
+	if (c->groups != NULL) {
+		c->groups[child].parent = parent;
+		return (0);
+	}
 	if ((error = cd_catalog_record(c, child, &file, B_FALSE)) == 0) {
 		file.parent = parent;
 		error = cd_catalog_record(c, child, &file, B_TRUE);
@@ -918,8 +954,8 @@ cd_catalog_connect(struct cd_catalog *c, FILE *items)
 {
 	struct cd_catalog_item first = { 0 }, item;
 	boolean_t have = B_FALSE;
-	int error;
-	while ((error = cd_catalog_next(items, &item)) == 0) {
+	int error = ENOENT;
+	while (!cd_stop && (error = cd_catalog_next(items, &item)) == 0) {
 		if (!have || !cd_catalog_same(&first, &item)) {
 			first = item;
 			have = B_TRUE;
@@ -928,6 +964,8 @@ cd_catalog_connect(struct cd_catalog *c, FILE *items)
 			return (error);
 		}
 	}
+	if (cd_stop)
+		return (ECANCELED);
 	if (error != ENOENT)
 		return (error);
 	return (fseeko(items, 0, SEEK_SET) == 0 ? 0 : errno);
@@ -940,6 +978,12 @@ cd_catalog_charge(struct cd_catalog *c, uint64_t id, uint64_t bytes,
 	uint64_t root;
 	int error = cd_catalog_root(c, id, &root);
 	struct cd_catalog_file file;
+	if (c->groups != NULL) {
+		if (error != 0)
+			return (error);
+		return (cd_hybrid_add(chunks ? &c->groups[root].chunk_estimate :
+		    &c->groups[root].native_estimate, bytes));
+	}
 	if (error == 0)
 		error = cd_catalog_record(c, root, &file, B_FALSE);
 	if (error == 0)
@@ -956,8 +1000,8 @@ cd_catalog_cost(struct cd_catalog *c, FILE *items, boolean_t chunks)
 	struct cd_catalog_item first = { 0 }, item;
 	boolean_t have = B_FALSE, existing = B_FALSE;
 	uint64_t cost = 0;
-	int error;
-	while ((error = cd_catalog_next(items, &item)) == 0) {
+	int error = ENOENT;
+	while (!cd_stop && (error = cd_catalog_next(items, &item)) == 0) {
 		if (!have || !cd_catalog_same(&first, &item)) {
 			if (have && (error = cd_catalog_charge(c, first.file,
 			    chunks && existing ? 0 : cost, chunks)) != 0)
@@ -973,6 +1017,8 @@ cd_catalog_cost(struct cd_catalog *c, FILE *items, boolean_t chunks)
 			existing |= chunks && item.object != 0;
 		}
 	}
+	if (cd_stop)
+		return (ECANCELED);
 	if (error != ENOENT)
 		return (error);
 	if (have && (error = cd_catalog_charge(c, first.file,
@@ -981,44 +1027,233 @@ cd_catalog_cost(struct cd_catalog *c, FILE *items, boolean_t chunks)
 	return (fseeko(items, 0, SEEK_SET) == 0 ? 0 : errno);
 }
 
+/* Reports are completed before sharing and survive temporary catalog cleanup. */
 static int
-cd_catalog_select(struct cd_catalog *c)
+cd_catalog_report_init(struct cd_catalog *c, const char *path)
 {
-	int error = cd_hybrid_sort(c->blocks, &c->sorted_blocks,
-	    c->directory);
-	if (error == 0)
-		error = cd_hybrid_sort(c->chunks, &c->sorted_chunks,
-		    c->directory);
+	if (path == NULL)
+		return (0);
+	int length = snprintf(c->report_temporary, sizeof (c->report_temporary),
+	    "%s.partial.XXXXXX", path);
+	if (length < 0 || (size_t)length >= sizeof (c->report_temporary)) {
+		c->report_temporary[0] = '\0';
+		return (ENAMETOOLONG);
+	}
+	struct stat existing;
+	if (lstat(path, &existing) == 0) {
+		c->report_temporary[0] = '\0';
+		return (EEXIST);
+	}
+	if (errno != ENOENT) {
+		int error = errno;
+		c->report_temporary[0] = '\0';
+		return (error);
+	}
+	int fd = mkstemp(c->report_temporary);
+	if (fd < 0) {
+		c->report_temporary[0] = '\0';
+		return (errno);
+	}
+	c->report = fdopen(fd, "w");
+	if (c->report == NULL) {
+		int error = errno;
+		(void) close(fd);
+		(void) unlink(c->report_temporary);
+		c->report_temporary[0] = '\0';
+		return (error);
+	}
+	c->report_path = path;
+	(void) fprintf(c->report, "{\"type\":\"metadata\",\"schema\":1,"
+	    "\"estimates_only\":true,\"scope\":\"sharing-group\","
+	    "\"path_encoding\":\"utf-8-surrogateescape\",\"created_epoch\":%" PRId64 "}\n", (int64_t)time(NULL));
+	return (ferror(c->report) ? EIO : 0);
+}
+
+/* Preserve UTF-8 names and escape undecodable filename bytes losslessly. */
+static void
+cd_catalog_report_string(FILE *fp, const char *value)
+{
+	(void) fputc('"', fp);
+	const unsigned char *p = (const unsigned char *)value;
+	while (*p) {
+		unsigned int n = *p >= 0xc2 && *p <= 0xdf ? 2 :
+		    *p >= 0xe0 && *p <= 0xef ? 3 :
+		    *p >= 0xf0 && *p <= 0xf4 ? 4 : 0;
+		boolean_t valid = n != 0;
+		for (unsigned int i = 1; valid && i < n; i++)
+			valid = (p[i] & 0xc0) == 0x80;
+		if (valid && ((*p == 0xe0 && p[1] < 0xa0) ||
+		    (*p == 0xed && p[1] >= 0xa0) ||
+		    (*p == 0xf0 && p[1] < 0x90) ||
+		    (*p == 0xf4 && p[1] >= 0x90)))
+			valid = B_FALSE;
+		if (valid) {
+			(void) fwrite(p, 1, n, fp);
+			p += n;
+			continue;
+		}
+		if (*p >= 0x80)
+			(void) fprintf(fp, "\\udc%02x", (unsigned int)*p);
+		else if (*p < 0x20)
+			(void) fprintf(fp, "\\u%04x", (unsigned int)*p);
+		else {
+			if (*p == '"' || *p == '\\')
+				(void) fputc('\\', fp);
+			(void) fputc(*p, fp);
+		}
+		p++;
+	}
+	(void) fputc('"', fp);
+}
+
+static int
+cd_catalog_report_file(struct cd_catalog *c, uint64_t id, uint64_t root,
+    const struct cd_catalog_file *file, const struct cd_catalog_file *group)
+{
+	FILE *fp = c->report;
+	if (fp == NULL)
+		return (0);
+	if (id == root) {
+		uint64_t savings = group->native_estimate > group->chunk_estimate ?
+		    group->native_estimate - group->chunk_estimate : 0;
+		enum cd_method recommended = cd_hybrid_choose(group->native_estimate,
+		    group->chunk_estimate, group->uncertain);
+		(void) fprintf(fp, "{\"type\":\"group\",\"group_id\":%" PRIu64
+		    ",\"native_estimate\":%" PRIu64 ",\"chunk_estimate\":%" PRIu64
+		    ",\"chunk_savings_estimate\":%" PRIu64
+		    ",\"uncertain\":%s,\"recommended_method\":\"%s\",\"dataset\":",
+		    root, group->native_estimate, group->chunk_estimate, savings,
+		    group->uncertain ? "true" : "false",
+		    recommended == CD_METHOD_CHUNK ? "chunk" : "block");
+		cd_catalog_report_string(fp, file->dataset);
+		(void) fputs("}\n", fp);
+	}
+	(void) fprintf(fp, "{\"type\":\"file\",\"file_id\":%" PRIu64
+	    ",\"group_id\":%" PRIu64 ",\"dataset\":", id, root);
+	cd_catalog_report_string(fp, file->dataset);
+	(void) fputs(",\"path\":", fp);
+	cd_catalog_report_string(fp, file->path);
+	(void) fprintf(fp, ",\"object\":%" PRIu64 ",\"size\":%" PRIu64
+	    ",\"mtime_sec\":%" PRId64 ",\"existing_chunked\":%s"
+	    ",\"selected_method\":\"%s\"}\n", (uint64_t)file->identity.st_ino,
+	    (uint64_t)file->identity.st_size, (int64_t)file->identity.st_mtime,
+	    file->chunked ? "true" : "false",
+	    file->method == CD_METHOD_CHUNK ? "chunk" : "block");
+	return (ferror(fp) ? EIO : 0);
+}
+
+static int
+cd_catalog_report_finish(struct cd_catalog *c)
+{
+	if (c->report == NULL)
+		return (0);
+	int error = 0;
+	if (fflush(c->report) != 0 || fsync(fileno(c->report)) != 0)
+		error = errno != 0 ? errno : EIO;
+	if (fclose(c->report) != 0 && error == 0)
+		error = errno != 0 ? errno : EIO;
+	c->report = NULL;
+	if (error == 0 && link(c->report_temporary, c->report_path) != 0)
+		error = errno;
+	if (error == 0 && unlink(c->report_temporary) != 0)
+		error = errno;
+	if (error == 0) {
+		c->report_temporary[0] = '\0';
+		(void) printf("catalog: report=%s\n", c->report_path);
+		(void) fflush(stdout);
+	}
+	return (error);
+}
+
+static int
+cd_catalog_select(struct cd_catalog *c, unsigned int threads)
+{
+	time_t started = time(NULL);
+	(void) printf("catalog: sorting=native workers=%u\n", threads);
+	(void) fflush(stdout);
+	int error = cd_hybrid_sort_parallel(c->blocks, &c->sorted_blocks,
+	    c->directory, threads, &cd_stop);
+	if (error == 0) {
+		(void) printf("catalog: sorted=native seconds=%jd\n",
+		    (intmax_t)(time(NULL) - started));
+		(void) printf("catalog: sorting=chunk workers=%u\n", threads);
+		(void) fflush(stdout);
+		started = time(NULL);
+		error = cd_hybrid_sort_parallel(c->chunks, &c->sorted_chunks,
+		    c->directory, threads, &cd_stop);
+		if (error == 0) {
+			(void) printf("catalog: sorted=chunk seconds=%jd\n",
+			    (intmax_t)(time(NULL) - started));
+			(void) fflush(stdout);
+		}
+	}
+	if (error == 0 && c->count <= CD_CATALOG_GROUP_LIMIT / sizeof (*c->groups))
+		c->groups = calloc((size_t)c->count, sizeof (*c->groups));
+	if (error == 0) {
+		(void) printf("catalog: files=%" PRIu64 " group_index=%s bytes=%zu\n",
+		    c->count, c->groups != NULL ? "memory" : "disk",
+		    c->groups != NULL ? (size_t)c->count * sizeof (*c->groups) : 0);
+		(void) fflush(stdout);
+	}
+	if (c->groups != NULL) {
+		for (uint64_t i = 0; error == 0 && i < c->count && !cd_stop; i++) {
+			struct cd_catalog_file file;
+			error = cd_catalog_record(c, i, &file, B_FALSE);
+			if (error == 0)
+				c->groups[i] = (struct cd_catalog_group) {
+				    file.parent, file.native_estimate, file.chunk_estimate,
+				    file.uncertain };
+		}
+	}
 	if (error == 0)
 		error = cd_catalog_connect(c, c->sorted_chunks);
 	if (error == 0)
 		error = cd_catalog_connect(c, c->sorted_blocks);
-	for (uint64_t i = 0; error == 0 && i < c->count; i++) {
+	for (uint64_t i = 0; error == 0 && i < c->count && !cd_stop; i++) {
 		struct cd_catalog_file file, group;
 		uint64_t root;
 		if ((error = cd_catalog_record(c, i, &file, B_FALSE)) != 0 ||
-		    (error = cd_catalog_root(c, i, &root)) != 0 ||
-		    (error = cd_catalog_record(c, root, &group, B_FALSE)) != 0)
+		    (error = cd_catalog_root(c, i, &root)) != 0)
 			break;
+		if (c->groups != NULL) {
+			group = (struct cd_catalog_file) {
+			    .native_estimate = c->groups[root].native_estimate,
+			    .chunk_estimate = c->groups[root].chunk_estimate,
+			    .uncertain = c->groups[root].uncertain };
+		} else if ((error = cd_catalog_record(c, root, &group, B_FALSE)) != 0) {
+			break;
+		}
 		group.uncertain |= file.uncertain;
 		if ((error = cd_hybrid_add(&group.native_estimate,
 		    file.native_base)) == 0)
 			error = cd_hybrid_add(&group.chunk_estimate,
 			    file.chunk_base);
-		if (error == 0)
+		if (error == 0 && c->groups != NULL) {
+			c->groups[root].native_estimate = group.native_estimate;
+			c->groups[root].chunk_estimate = group.chunk_estimate;
+			c->groups[root].uncertain = group.uncertain;
+		} else if (error == 0) {
 			error = cd_catalog_record(c, root, &group, B_TRUE);
+		}
 	}
 	if (error == 0)
 		error = cd_catalog_cost(c, c->sorted_blocks, B_FALSE);
 	if (error == 0)
 		error = cd_catalog_cost(c, c->sorted_chunks, B_TRUE);
-	for (uint64_t i = 0; error == 0 && i < c->count; i++) {
+	for (uint64_t i = 0; error == 0 && i < c->count && !cd_stop; i++) {
 		struct cd_catalog_file file, group;
 		uint64_t root;
 		if ((error = cd_catalog_record(c, i, &file, B_FALSE)) != 0 ||
-		    (error = cd_catalog_root(c, i, &root)) != 0 ||
-		    (error = cd_catalog_record(c, root, &group, B_FALSE)) != 0)
+		    (error = cd_catalog_root(c, i, &root)) != 0)
 			break;
+		if (c->groups != NULL) {
+			group = (struct cd_catalog_file) {
+			    .native_estimate = c->groups[root].native_estimate,
+			    .chunk_estimate = c->groups[root].chunk_estimate,
+			    .uncertain = c->groups[root].uncertain };
+		} else if ((error = cd_catalog_record(c, root, &group, B_FALSE)) != 0) {
+			break;
+		}
 		const char *reason = "forced";
 		if (file.chunked) {
 			file.method = CD_METHOD_CHUNK;
@@ -1035,8 +1270,22 @@ cd_catalog_select(struct cd_catalog *c)
 		    "estimate_scope=sharing-group\n", file.path,
 		    file.method == CD_METHOD_CHUNK ? "chunk" : "block",
 		    group.native_estimate, group.chunk_estimate, reason);
+		if (c->groups != NULL) {
+			file.parent = root;
+			file.native_estimate = c->groups[i].native_estimate;
+			file.chunk_estimate = c->groups[i].chunk_estimate;
+			file.uncertain = c->groups[i].uncertain;
+		}
 		error = cd_catalog_record(c, i, &file, B_TRUE);
+		if (error == 0)
+			error = cd_catalog_report_file(c, i, root, &file, &group);
 	}
+	if (cd_stop && error == 0)
+		error = ECANCELED;
+	if (error == 0)
+		error = cd_catalog_report_finish(c);
+	free(c->groups);
+	c->groups = NULL;
 	return (error);
 }
 
@@ -1068,8 +1317,9 @@ cd_deferred(int error)
 	return (error == EBUSY || error == EAGAIN || error == ESTALE);
 }
 
+/* SHARE_DRIVER_BEGIN */
 static int
-cd_catalog_share(struct cd_catalog *c)
+cd_catalog_share_serial(struct cd_catalog *c)
 {
 	struct cd_catalog_item canonical = { 0 }, item;
 	struct cd_catalog_file source;
@@ -1167,12 +1417,580 @@ cd_catalog_share(struct cd_catalog *c)
 	return (cd_stop || error == ENOENT ? 0 : error);
 }
 
+#ifndef CD_SHARE_MAX_ITEMS
+#define	CD_SHARE_MAX_ITEMS	8192U
+#endif
+#ifndef CD_SHARE_SNAPSHOT_LIMIT
+#define	CD_SHARE_SNAPSHOT_LIMIT	(UINT64_C(1) << 30)
+#endif
+#ifndef CD_SHARE_PROGRESS_SECONDS
+#define	CD_SHARE_PROGRESS_SECONDS	30
+#endif
+#ifndef CD_SHARE_PROGRESS_ISSUED
+#define	CD_SHARE_PROGRESS_ISSUED	1000U
+#endif
+
+struct cd_share_item {
+	uint64_t file, offset, length, object;
+};
+
+enum cd_share_event_kind {
+	CD_SHARE_SOURCE_DEFERRED, CD_SHARE_DEST_DEFERRED, CD_SHARE_UNEQUAL
+};
+
+struct cd_share_event {
+	uint64_t file;
+	enum cd_share_event_kind kind;
+	int error;
+};
+
+struct cd_share_identity {
+	dev_t device;
+	ino_t inode;
+};
+
+struct cd_share_source {
+	boolean_t have;
+	struct cd_share_item canonical;
+	int fd;
+};
+
+struct cd_share_state {
+	const struct cd_catalog_file *files;
+	uint64_t count;
+	atomic_int first_error;
+	atomic_uint_fast64_t groups, issued, deferred, unequal, reported_issued;
+	pthread_mutex_t lock;
+	pthread_cond_t completed;
+	size_t pending;
+	struct timespec reported_at;
+};
+
+struct cd_share_job {
+	struct cd_share_state *state;
+	struct cd_share_item *items;
+	struct cd_share_event *events;
+	struct cd_share_identity *identities;
+	size_t count, event_count, identity_count;
+	boolean_t active, complete;
+};
+
 static int
-cd_catalog_apply(struct cd_catalog *c, uint64_t age)
+cd_share_error(struct cd_share_state *state, int error)
 {
-	int error = cd_catalog_select(c);
+	int expected = 0;
+	if (error != 0)
+		(void) atomic_compare_exchange_strong(&state->first_error,
+		    &expected, error);
+	return (error);
+}
+
+static boolean_t
+cd_share_stopped(struct cd_share_state *state)
+{
+	return (cd_stop || atomic_load(&state->first_error) != 0);
+}
+
+/* Only the coordinator calls this function or reads reported_at. */
+static int
+cd_share_progress(struct cd_share_state *state, boolean_t force)
+{
+	struct timespec now;
+	if (clock_gettime(CLOCK_MONOTONIC, &now) != 0)
+		return (cd_share_error(state, errno));
+	uint64_t issued = atomic_load(&state->issued);
+	if (!force && now.tv_sec - state->reported_at.tv_sec <
+	    CD_SHARE_PROGRESS_SECONDS && issued -
+	    atomic_load(&state->reported_issued) < CD_SHARE_PROGRESS_ISSUED)
+		return (0);
+	if (printf("share: groups=%" PRIu64 " issued=%" PRIu64
+	    " deferred=%" PRIu64 " unequal=%" PRIu64 "\n",
+	    (uint64_t)atomic_load(&state->groups), issued,
+	    (uint64_t)atomic_load(&state->deferred),
+	    (uint64_t)atomic_load(&state->unequal)) < 0 || fflush(stdout) != 0)
+		return (cd_share_error(state, errno != 0 ? errno : EIO));
+	state->reported_at = now;
+	atomic_store(&state->reported_issued, issued);
+	return (0);
+}
+
+static void
+cd_share_event(struct cd_share_job *job, uint64_t file,
+    enum cd_share_event_kind kind, int error)
+{
+	job->events[job->event_count++] = (struct cd_share_event) {
+	    .file = file, .kind = kind, .error = error };
+	if (kind == CD_SHARE_UNEQUAL)
+		(void) atomic_fetch_add(&job->state->unequal, 1);
+	else
+		(void) atomic_fetch_add(&job->state->deferred, 1);
+}
+
+/* No catalog streams, property handles or output are touched by workers. */
+static int
+cd_share_process(struct cd_share_job *job, struct cd_share_source *source,
+    boolean_t coordinator)
+{
+	struct cd_share_state *state = job->state;
+	job->complete = B_FALSE;
+	for (size_t i = 0; i < job->count; i++) {
+		if (coordinator && cd_share_progress(state, B_FALSE) != 0)
+			return (atomic_load(&state->first_error));
+		if (cd_share_stopped(state))
+			return (0);
+		const struct cd_share_item *item = &job->items[i];
+		struct cd_catalog_file destination = state->files[item->file];
+		int error;
+		if (!source->have) {
+			if (cd_share_stopped(state))
+				return (0);
+			error = cd_catalog_open_file(&destination, &source->fd);
+			if (error != 0) {
+				if (!cd_deferred(error))
+					(void) cd_share_error(state, error);
+				if (source->fd >= 0)
+					(void) close(source->fd);
+				source->fd = -1;
+				if (!cd_deferred(error))
+					return (error);
+				cd_share_event(job, item->file,
+				    CD_SHARE_SOURCE_DEFERRED, error);
+				continue;
+			}
+			source->canonical = *item;
+			source->have = B_TRUE;
+			continue;
+		}
+		const struct cd_share_item *canonical = &source->canonical;
+		if (canonical->object != item->object ||
+		    (canonical->file == item->file &&
+		    canonical->offset == item->offset))
+			continue;
+		int fd = -1;
+		if (cd_share_stopped(state))
+			return (0);
+		error = canonical->file != item->file ?
+		    cd_catalog_open_file(&destination, &fd) : 0;
+		if (error == 0 && !cd_share_stopped(state)) {
+			struct cd_catalog_file original = state->files[canonical->file];
+			nvlist_t *args = fnvlist_alloc(), *result = NULL;
+			fnvlist_add_string(args, "op", "share-blocks");
+			cd_identity(args, &destination.identity);
+			fnvlist_add_uint64(args, "offset", item->offset);
+			fnvlist_add_uint64(args, "length", item->length);
+			fnvlist_add_uint64(args, "source_object",
+			    original.identity.st_ino);
+#ifdef __FreeBSD__
+			fnvlist_add_uint64(args, "source_generation",
+			    original.identity.st_gen);
+			fnvlist_add_uint64(args, "source_mtime_sec",
+			    original.identity.st_mtim.tv_sec);
+			fnvlist_add_uint64(args, "source_mtime_nsec",
+			    original.identity.st_mtim.tv_nsec);
+#else
+			fnvlist_add_uint64(args, "source_generation", 0);
+#endif
+			fnvlist_add_uint64(args, "source_size", original.identity.st_size);
+			fnvlist_add_uint64(args, "source_offset", canonical->offset);
+			if (coordinator)
+				(void) cd_share_progress(state, B_FALSE);
+			if (!cd_share_stopped(state)) {
+				uint64_t issued = atomic_fetch_add(&state->issued, 1) + 1;
+				if (issued - atomic_load(&state->reported_issued) >=
+				    CD_SHARE_PROGRESS_ISSUED) {
+					(void) pthread_mutex_lock(&state->lock);
+					(void) pthread_cond_signal(&state->completed);
+					(void) pthread_mutex_unlock(&state->lock);
+				}
+				error = lzc_chunkdedup(destination.dataset, args, &result);
+				if (error != 0 && !cd_deferred(error) && error != EILSEQ)
+					(void) cd_share_error(state, error);
+			}
+			fnvlist_free(args);
+			nvlist_free(result);
+			if (coordinator)
+				(void) cd_share_progress(state, B_FALSE);
+		}
+		if (error != 0 && !cd_deferred(error) && error != EILSEQ)
+			(void) cd_share_error(state, error);
+		if (fd >= 0)
+			(void) close(fd);
+		if (cd_deferred(error))
+			cd_share_event(job, item->file, CD_SHARE_DEST_DEFERRED, error);
+		else if (error == EILSEQ)
+			cd_share_event(job, item->file, CD_SHARE_UNEQUAL, error);
+		else if (error != 0)
+			return (error);
+	}
+	job->complete = B_TRUE;
+	return (0);
+}
+
+static int
+cd_share_work(void *argument)
+{
+	struct cd_share_job *job = argument;
+	struct cd_share_source source = { .fd = -1 };
+	int error = cd_share_process(job, &source, B_FALSE);
+	if (job->complete && error == 0)
+		(void) atomic_fetch_add(&job->state->groups, 1);
+	if (source.fd >= 0)
+		(void) close(source.fd);
+	/* Publish only after every descriptor and ioctl belongs to the past. */
+	(void) pthread_mutex_lock(&job->state->lock);
+	job->state->pending++;
+	(void) pthread_cond_signal(&job->state->completed);
+	(void) pthread_mutex_unlock(&job->state->lock);
+	return (error);
+}
+
+static void
+cd_share_job_fini(struct cd_share_job *job)
+{
+	free(job->items);
+	free(job->events);
+	free(job->identities);
+	memset(job, 0, sizeof (*job));
+}
+
+static void
+cd_share_merge(struct cd_catalog *c, struct cd_share_job *job)
+{
+	for (size_t i = 0; i < job->event_count; i++) {
+		const struct cd_share_event *event = &job->events[i];
+		const char *path = job->state->files[event->file].path;
+		if (event->kind == CD_SHARE_UNEQUAL) {
+			(void) fprintf(stderr, "%s: unequal candidate left ordinary\n", path);
+			continue;
+		}
+		if (event->kind == CD_SHARE_DEST_DEFERRED)
+			(void) fprintf(stderr, "%s: deferred (%s)\n", path,
+			    strerror(event->error));
+		struct cd_catalog_file file;
+		int error = cd_catalog_record(c, event->file, &file, B_FALSE);
+		if (error == 0) {
+			file.deferred = B_TRUE;
+			error = cd_catalog_record(c, event->file, &file, B_TRUE);
+		}
+		(void) cd_share_error(job->state, error);
+	}
+	job->event_count = 0;
+}
+
+static void
+cd_share_take(struct cd_catalog *c, struct cd_parallel *pool,
+    struct cd_share_state *state)
+{
+	for (;;) {
+		(void) cd_share_progress(state, B_FALSE);
+		(void) pthread_mutex_lock(&state->lock);
+		if (state->pending != 0) {
+			(void) pthread_mutex_unlock(&state->lock);
+			break;
+		}
+		/* A threshold signal may precede this lock acquisition. */
+		if (atomic_load(&state->issued) -
+		    atomic_load(&state->reported_issued) >= CD_SHARE_PROGRESS_ISSUED) {
+			(void) pthread_mutex_unlock(&state->lock);
+			continue;
+		}
+		struct timespec until = state->reported_at;
+		until.tv_sec += CD_SHARE_PROGRESS_SECONDS;
+#ifdef __APPLE__
+		struct timespec now;
+		if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
+			(void) cd_share_error(state, errno);
+			now = until;
+		}
+		until.tv_sec -= now.tv_sec;
+		until.tv_nsec -= now.tv_nsec;
+		if (until.tv_nsec < 0) {
+			until.tv_sec--;
+			until.tv_nsec += 1000000000L;
+		}
+		if (until.tv_sec < 0)
+			until = (struct timespec) { 0 };
+		int error = pthread_cond_timedwait_relative_np(&state->completed,
+		    &state->lock, &until);
+#else
+		int error = pthread_cond_timedwait(&state->completed,
+		    &state->lock, &until);
+#endif
+		(void) pthread_mutex_unlock(&state->lock);
+		if (error != 0 && error != ETIMEDOUT)
+			(void) cd_share_error(state, error);
+	}
+	void *argument;
+	int result;
+	int error = cd_parallel_take(pool, &argument, &result);
+	if (error != 0) {
+		(void) cd_share_error(state, error);
+		return;
+	}
+	(void) pthread_mutex_lock(&state->lock);
+	state->pending--;
+	(void) pthread_mutex_unlock(&state->lock);
+	struct cd_share_job *job = argument;
+	(void) cd_share_error(state, result);
+	cd_share_merge(c, job);
+	cd_share_job_fini(job);
+}
+
+static int
+cd_share_identity_compare(const void *left, const void *right)
+{
+	const struct cd_share_identity *a = left, *b = right;
+	if (a->device != b->device)
+		return (a->device < b->device ? -1 : 1);
+	return (a->inode == b->inode ? 0 : a->inode < b->inode ? -1 : 1);
+}
+
+static boolean_t
+cd_share_conflict(const struct cd_share_job *a, const struct cd_share_job *b)
+{
+	size_t i = 0, j = 0;
+	while (i < a->identity_count && j < b->identity_count) {
+		int order = cd_share_identity_compare(&a->identities[i], &b->identities[j]);
+		if (order == 0)
+			return (B_TRUE);
+		if (order < 0)
+			i++;
+		else
+			j++;
+	}
+	return (B_FALSE);
+}
+
+/* EOF is not a published failure. The current item is bounded lookahead. */
+static int
+cd_share_next(struct cd_catalog *c, struct cd_share_state *state,
+    struct cd_catalog_item *item, boolean_t *have)
+{
+	int error = cd_share_progress(state, B_FALSE);
 	if (error == 0)
-		error = cd_catalog_share(c);
+		error = cd_catalog_next(c->sorted_blocks, item);
+	*have = error == 0;
+	if (error == ENOENT)
+		return (0);
+	if (error == 0 && item->file >= state->count)
+		error = EINVAL;
+	return (cd_share_error(state, error));
+}
+
+static int
+cd_share_fill(struct cd_catalog *c, struct cd_share_job *job,
+    const struct cd_catalog_item *key, struct cd_catalog_item *item,
+    boolean_t *have)
+{
+	job->count = 0;
+	while (*have && cd_catalog_same(key, item) &&
+	    !cd_share_stopped(job->state)) {
+		if (job->state->files[item->file].method == CD_METHOD_BLOCK) {
+			if (job->count == CD_SHARE_MAX_ITEMS)
+				break;
+			job->items[job->count++] = (struct cd_share_item) {
+			    item->file, item->offset, item->length, item->object };
+		}
+		int error = cd_share_next(c, job->state, item, have);
+		if (error != 0)
+			return (error);
+	}
+	return (0);
+}
+
+static int
+cd_share_result(int error)
+{
+	return (cd_stop || error == ENOENT ? 0 : error);
+}
+
+static int
+cd_catalog_share(struct cd_catalog *c, unsigned int threads)
+{
+	if (cd_stop)
+		return (0);
+	if (c->watch) {
+		(void) printf("share: serial (watch)\n");
+		(void) fflush(stdout);
+		return (cd_catalog_share_serial(c));
+	}
+	if (fflush(c->files) != 0)
+		return (cd_share_result(errno));
+	if (c->count == 0)
+		return (0);
+	struct cd_catalog_file *files = NULL;
+	if (c->count <= CD_SHARE_SNAPSHOT_LIMIT / sizeof (*files))
+		files = malloc((size_t)c->count * sizeof (*files));
+	if (files == NULL) {
+		(void) printf("share: serial (file snapshot unavailable)\n");
+		(void) fflush(stdout);
+		return (cd_catalog_share_serial(c));
+	}
+	int error = 0;
+	for (uint64_t i = 0; i < c->count && error == 0 && !cd_stop; i++)
+		error = cd_catalog_record(c, i, &files[i], B_FALSE);
+	if (error != 0 || cd_stop) {
+		free(files);
+		return (cd_share_result(error));
+	}
+	struct cd_share_state state = { .files = files, .count = c->count };
+	atomic_init(&state.first_error, 0);
+	atomic_init(&state.groups, 0);
+	atomic_init(&state.issued, 0);
+	atomic_init(&state.deferred, 0);
+	atomic_init(&state.unequal, 0);
+	atomic_init(&state.reported_issued, 0);
+	if ((error = pthread_mutex_init(&state.lock, NULL)) != 0) {
+		free(files);
+		return (cd_share_result(error));
+	}
+	pthread_condattr_t attributes;
+	error = pthread_condattr_init(&attributes);
+	if (error == 0) {
+#ifndef __APPLE__
+		error = pthread_condattr_setclock(&attributes, CLOCK_MONOTONIC);
+#endif
+		if (error == 0)
+			error = pthread_cond_init(&state.completed, &attributes);
+		(void) pthread_condattr_destroy(&attributes);
+	}
+	if (error != 0) {
+		(void) pthread_mutex_destroy(&state.lock);
+		free(files);
+		return (cd_share_result(error));
+	}
+	struct cd_parallel pool;
+	struct cd_share_job *jobs = NULL;
+	boolean_t initialized = B_FALSE;
+	error = cd_share_progress(&state, B_TRUE);
+	if (error == 0)
+		error = cd_parallel_init_unordered(&pool, threads, cd_share_work);
+	if (error == 0) {
+		initialized = B_TRUE;
+		jobs = calloc(pool.capacity, sizeof (*jobs));
+		if (jobs == NULL)
+			error = ENOMEM;
+	}
+	(void) cd_share_error(&state, error);
+	struct cd_catalog_item item;
+	boolean_t have = B_FALSE;
+	if (!cd_share_stopped(&state))
+		(void) cd_share_next(c, &state, &item, &have);
+	while (have && !cd_share_stopped(&state)) {
+		while (cd_parallel_full(&pool) && !cd_share_stopped(&state))
+			cd_share_take(c, &pool, &state);
+		if (cd_share_stopped(&state))
+			break;
+		struct cd_share_job *job = NULL;
+		for (size_t i = 0; i < pool.capacity; i++) {
+			if (!jobs[i].active) {
+				job = &jobs[i];
+				break;
+			}
+		}
+		job->state = &state;
+		job->items = malloc(CD_SHARE_MAX_ITEMS * sizeof (*job->items));
+		job->events = malloc(CD_SHARE_MAX_ITEMS * sizeof (*job->events));
+		if (job->items == NULL || job->events == NULL) {
+			(void) cd_share_error(&state, ENOMEM);
+			break;
+		}
+		struct cd_catalog_item key = item;
+		error = cd_share_fill(c, job, &key, &item, &have);
+		if (error != 0 || cd_share_stopped(&state))
+			break;
+		if (job->count == 0) {
+			cd_share_job_fini(job);
+			continue;
+		}
+		if (have && cd_catalog_same(&key, &item)) {
+			/* A giant run owns the coordinator after a complete barrier. */
+			while (cd_parallel_count(&pool) != 0)
+				cd_share_take(c, &pool, &state);
+			struct cd_share_source source = { .fd = -1 };
+			while (!cd_share_stopped(&state)) {
+				error = cd_share_process(job, &source, B_TRUE);
+				cd_share_merge(c, job);
+				if (error != 0 || cd_share_stopped(&state) ||
+				    !have || !cd_catalog_same(&key, &item))
+					break;
+				error = cd_share_fill(c, job, &key, &item, &have);
+				if (error != 0)
+					break;
+			}
+			if (job->complete && error == 0 &&
+			    (!have || !cd_catalog_same(&key, &item)))
+				(void) atomic_fetch_add(&state.groups, 1);
+			if (source.fd >= 0)
+				(void) close(source.fd);
+			cd_share_job_fini(job);
+			continue;
+		}
+		job->identities = malloc(job->count * sizeof (*job->identities));
+		if (job->identities == NULL) {
+			(void) cd_share_error(&state, ENOMEM);
+			break;
+		}
+		for (size_t i = 0; i < job->count; i++) {
+			const struct stat *identity = &files[job->items[i].file].identity;
+			job->identities[i] = (struct cd_share_identity) {
+			    identity->st_dev, identity->st_ino };
+		}
+		qsort(job->identities, job->count, sizeof (*job->identities),
+		    cd_share_identity_compare);
+		for (size_t i = 0; i < job->count; i++) {
+			if (job->identity_count == 0 || cd_share_identity_compare(
+			    &job->identities[i],
+			    &job->identities[job->identity_count - 1]) != 0)
+				job->identities[job->identity_count++] = job->identities[i];
+		}
+		for (;;) {
+			boolean_t conflict = B_FALSE;
+			for (size_t i = 0; i < pool.capacity; i++) {
+				if (jobs[i].active && cd_share_conflict(job, &jobs[i])) {
+					conflict = B_TRUE;
+					break;
+				}
+			}
+			if (!conflict || cd_share_stopped(&state))
+				break;
+			cd_share_take(c, &pool, &state);
+		}
+		if (cd_share_stopped(&state))
+			break;
+		error = cd_parallel_submit(&pool, job);
+		if (error != 0) {
+			(void) cd_share_error(&state, error);
+			break;
+		}
+		job->active = B_TRUE;
+	}
+	/* Never abandon queued callbacks or their outcomes, even after an error. */
+	if (initialized) {
+		while (cd_parallel_count(&pool) != 0)
+			cd_share_take(c, &pool, &state);
+		cd_parallel_fini(&pool);
+		if (jobs != NULL) {
+			for (size_t i = 0; i < (size_t)threads * 2; i++)
+				cd_share_job_fini(&jobs[i]);
+		}
+	}
+	free(jobs);
+	(void) cd_share_progress(&state, B_TRUE);
+	error = atomic_load(&state.first_error);
+	(void) pthread_cond_destroy(&state.completed);
+	(void) pthread_mutex_destroy(&state.lock);
+	free(files);
+	return (cd_share_result(error));
+}
+/* SHARE_DRIVER_END */
+
+static int
+cd_catalog_apply(struct cd_catalog *c, uint64_t age, unsigned int threads)
+{
+	int error = cd_catalog_select(c, threads);
+	if (error == 0)
+		error = cd_catalog_share(c, threads);
 	for (uint64_t i = 0; error == 0 && i < c->count && !cd_stop; i++) {
 		struct cd_catalog_file file;
 		if ((error = cd_catalog_record(c, i, &file, B_FALSE)) != 0)
@@ -1233,6 +2051,11 @@ static void
 cd_catalog_fini(struct cd_catalog *c)
 {
 	free(c->retry);
+	free(c->groups);
+	if (c->report != NULL)
+		(void) fclose(c->report);
+	if (c->report_temporary[0] != '\0')
+		(void) unlink(c->report_temporary);
 	FILE *streams[] = { c->files, c->blocks, c->chunks,
 	    c->sorted_blocks, c->sorted_chunks, c->seen };
 	for (size_t i = 0; i < ARRAY_SIZE(streams); i++) {
@@ -1616,7 +2439,7 @@ cd_snapshot_path(zfs_handle_t *zhp, char *path, size_t size)
 static int
 cd_pass(const char *op, boolean_t recursive, uint64_t age, int argc,
     char **argv, boolean_t watch, enum cd_method method, boolean_t methods,
-    unsigned int threads)
+    unsigned int threads, const char *report_path)
 {
 	uint64_t processed = 0, skipped = 0;
 	int ret = 0;
@@ -1625,6 +2448,8 @@ cd_pass(const char *op, boolean_t recursive, uint64_t age, int argc,
 	struct cd_scan scan = { 0 };
 	if (optimize) {
 		int error = cd_catalog_init(&catalog, method, watch);
+		if (error == 0)
+			error = cd_catalog_report_init(&catalog, report_path);
 		if (error != 0) {
 			(void) fprintf(stderr, "catalog: %s\n", strerror(error));
 			cd_catalog_fini(&catalog);
@@ -1775,7 +2600,7 @@ target_done:
 		if (ret == 0 && !cd_stop) {
 			int error = cd_catalog_retry(&catalog, age);
 			if (error == 0 && !cd_stop)
-				error = cd_catalog_apply(&catalog, age);
+				error = cd_catalog_apply(&catalog, age, threads);
 			if (error != 0) {
 				(void) fprintf(stderr, "optimize: %s\n",
 				    strerror(error));
@@ -1820,7 +2645,7 @@ cd_watch(uint64_t age, uint64_t interval, int argc, char **argv,
 	(void) fflush(stdout);
 	while (!cd_stop) {
 		(void) cd_pass("optimize", B_TRUE, age, argc, argv, B_TRUE,
-		    method, B_FALSE, threads);
+		    method, B_FALSE, threads, NULL);
 		if (cd_stop)
 			break;
 		struct timespec delay = { .tv_sec = (time_t)interval };
@@ -1848,7 +2673,7 @@ zfs_do_chunkdedup(int argc, char **argv)
 		(void) fprintf(stderr, "usage: zfs chunkdedup "
 		    "<optimize|status|verify|unoptimize> [-r] [--min-age days] "
 		    "[--method auto|block|chunk] [--methods] "
-		    "[--threads 1..64] "
+		    "[--threads 1..64] [--report PATH] "
 		    "<dataset|path>...\n"
 		    "       zfs chunkdedup watch [--interval seconds] "
 		    "[--min-age days] [--method auto|block|chunk] "
@@ -1862,6 +2687,7 @@ zfs_do_chunkdedup(int argc, char **argv)
 		return (2);
 	boolean_t recursive = B_FALSE;
 	boolean_t methods = B_FALSE;
+	const char *report_path = NULL;
 	enum cd_method method = CD_METHOD_AUTO;
 	uint64_t age = 3, interval = 3600;
 	long online = sysconf(_SC_NPROCESSORS_ONLN);
@@ -1873,11 +2699,12 @@ zfs_do_chunkdedup(int argc, char **argv)
 		{ "method", required_argument, NULL, 'm' },
 		{ "methods", no_argument, NULL, 'M' },
 		{ "threads", required_argument, NULL, 't' },
+		{ "report", required_argument, NULL, 'R' },
 		{ NULL, 0, NULL, 0 }
 	};
 	int c;
 	optind = 2;
-	while ((c = getopt_long(argc, argv, "+ra:i:m:Mt:", options, NULL)) != -1) {
+	while ((c = getopt_long(argc, argv, "+ra:i:m:Mt:R:", options, NULL)) != -1) {
 		if (c == 'r') {
 			if (watch)
 				return (2);
@@ -1893,6 +2720,10 @@ zfs_do_chunkdedup(int argc, char **argv)
 				method = CD_METHOD_CHUNK;
 			else
 				return (2);
+		} else if (c == 'R') {
+			if (watch || strcmp(op, "optimize") != 0 || optarg[0] == '\0')
+				return (2);
+			report_path = optarg;
 		} else if (c == 'M') {
 			if (strcmp(op, "status") != 0)
 				return (2);
@@ -1940,7 +2771,7 @@ zfs_do_chunkdedup(int argc, char **argv)
 		}
 	}
 	int result = cd_pass(op, recursive, age, argc - optind, argv + optind,
-	    B_FALSE, method, methods, threads);
+	    B_FALSE, method, methods, threads, report_path);
 	if (optimize) {
 		(void) sigaction(SIGINT, &old_int, NULL);
 		(void) sigaction(SIGTERM, &old_term, NULL);

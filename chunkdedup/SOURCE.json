@@ -1,14 +1,14 @@
 {
   "schema": 1,
   "base_revision": "71a9f9578616a90c3c14bb59629fb4d31bfd68d1",
-  "source_digest": "833fb482f3675b5ad87e3bbdcb18cca66760de1625ecd219be2c22359724a1ed",
+  "source_digest": "7d6fabfb5d2bc1d1b71b4a41154b0d4227aa49943980b010b257667ec0897fb0",
   "source_file_count": 4138,
-  "patch_sha256": "59a5862ccbb8bbefee067d28cf220f3e82e7ab71c2ca2e63ca1f0b54fd7fb4f1",
-  "patch_bytes": 305637,
+  "patch_sha256": "27691bbd7b8cb48fa4a556c4d814351ef50aa13b058269e350699d3c4d72b228",
+  "patch_bytes": 350605,
   "apply_check": {
     "returncode": 0,
-    "scope": "Applied to an isolated Git index loaded at the pinned upstream base",
-    "result_tree": "752d7ee2aa98ee2b997edd4ad8210ce3d074b7f3"
+    "scope": "Applied to a private Git index loaded at the pinned upstream base",
+    "result_tree": "56846a80d0f0c2b67a8540e44305fd76d5cf99ed"
   },
   "local_verification": "PASS",
   "latest_full_native_validation": "NOT_RUN",
@@ -21,6 +21,8 @@
     "hybrid_cases": 12
   },
   "publication_layout": "OpenZFS source at repository root; verification kit in chunkdedup/",
-  "source_projection": "tested-source-files.json describes the development source snapshot. Its original README.md is preserved as chunkdedup/upstream/README.md; the repository root README and verification wrapper are publication additions.",
-  "report": "STATUS.md"
+  "source_projection": "Tracked OpenZFS paths excluding chunkdedup/, scripts/verify.sh and the upstream gitlink. README.md maps to preserved chunkdedup/upstream/README.md; the digest excludes publication metadata and verification kit.",
+  "report": "STATUS.md",
+  "local_evaluation_source_digest": "69712a9e0d8b7cbce99195b78e2364c69e9d5364948084b632ca935568a651e1",
+  "verification_scope": "The implementation projection matches the passing frozen local run. Only publication verification metadata and kit checksums were updated afterward."
 }

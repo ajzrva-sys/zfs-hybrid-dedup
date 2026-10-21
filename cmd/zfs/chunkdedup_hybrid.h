@@ -3,6 +3,7 @@
 #define CHUNKDEDUP_HYBRID_H
 #include <stdint.h>
 #include <stdio.h>
+#include <stdatomic.h>
 
 enum cd_method { CD_METHOD_AUTO, CD_METHOD_BLOCK, CD_METHOD_CHUNK };
 
@@ -18,6 +19,8 @@ cd_hybrid_choose(uint64_t native_bytes, uint64_t chunk_bytes, int uncertain)
 
 /* The catalogs contain only numeric fields and hexadecimal keys, never paths. */
 int cd_hybrid_sort(FILE *, FILE **, const char *);
+int cd_hybrid_sort_parallel(FILE *, FILE **, const char *, unsigned int,
+    const atomic_int *);
 int cd_hybrid_add(uint64_t *, uint64_t);
 int cd_hybrid_alloc(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t,
     uint64_t *);

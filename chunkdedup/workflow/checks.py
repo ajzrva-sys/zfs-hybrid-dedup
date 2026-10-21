@@ -25,8 +25,9 @@ REQUIRED = (
     'cmd/zfs/chunkdedup_chunker.c', 'cmd/zfs/chunkdedup_chunker.h',
     'cmd/zfs/rabin64_table.h', 'cmd/zfs/zfs_chunkdedup_user.c',
     'include/sys/zfs_chunkdedup.h', 'module/zfs/zfs_chunkdedup.c',
-    'cmd/zfs/chunkdedup_hybrid.h',
+    'cmd/zfs/chunkdedup_hybrid.c', 'cmd/zfs/chunkdedup_hybrid.h',
     'cmd/zfs/chunkdedup_parallel.h',
+    'include/sys/dsl_pool.h', 'module/zfs/dsl_pool.c',
 )
 MINIMUM_ASSERTIONS = {'chunker_api': 26, 'core_model': 104,
                       'worker_batches': 26, 'packaging': 8}
@@ -460,7 +461,8 @@ class Runner:
 
     def worker(self):
         self.ready()
-        self.require_sources(*REQUIRED[:4])
+        self.require_sources(*REQUIRED[:4], 'cmd/zfs/chunkdedup_hybrid.c',
+                             'include/sys/dsl_pool.h', 'module/zfs/dsl_pool.c')
         folder = self.root / 'artifacts/worker_batches'
         folder.mkdir(parents=True)
         trace, report = folder / 'workflow_assertions.h', folder / 'assertions.json'

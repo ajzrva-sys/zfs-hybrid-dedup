@@ -171,6 +171,77 @@ static int zfs_zil_clean_taskq_nthr_pct = 100;
 static int zfs_zil_clean_taskq_minalloc = 1024;
 static int zfs_zil_clean_taskq_maxalloc = 1024 * 1024;
 
+#if defined(_KERNEL) && defined(__FreeBSD__)
+/*
+ * Point-in-time pool dirty-space accounting, not completed-TXG dirty bytes or
+ * physical bytes still to write.  The same global limit applies to each pool.
+ * FreeBSD named kstats do not acquire ks_lock around ks_update, so take
+ * dp_lock here.  No hot-path accounting or write-throttle behavior is changed.
+ */
+static int
+dsl_pool_dirty_kstat_update(kstat_t *ksp, int rw)
+{
+	dsl_pool_t *dp = ksp->ks_private;
+	kstat_named_t *stats = ksp->ks_data;
+
+	if (rw == KSTAT_WRITE)
+		return (EACCES);
+
+	uint64_t guid = spa_guid(dp->dp_spa);
+	mutex_enter(&dp->dp_lock);
+	stats[0].value.ui64 = guid;
+	stats[1].value.ui64 = dp->dp_dirty_total;
+	stats[2].value.ui64 = zfs_dirty_data_max;
+	mutex_exit(&dp->dp_lock);
+	return (0);
+}
+
+static void
+dsl_pool_dirty_kstat_init(dsl_pool_t *dp)
+{
+	static const kstat_named_t template[] = {
+		{ "pool_guid", KSTAT_DATA_UINT64 },
+		{ "dirty_bytes", KSTAT_DATA_UINT64 },
+		{ "dirty_limit_bytes", KSTAT_DATA_UINT64 },
+	};
+	kstat_t *ksp;
+	char module[KSTAT_STRLEN];
+	int len = snprintf(module, sizeof (module), "zfs/%s",
+	    spa_name(dp->dp_spa));
+
+	/* Never publish a valid long pool name under a truncated identity. */
+	if (len < 0 || (size_t)len >= sizeof (module))
+		return;
+
+	/* FreeBSD: kstat.zfs.<pool>.dirty_data.stats.<field>. */
+	ksp = kstat_create(module, 0, "stats", "dirty_data",
+	    KSTAT_TYPE_NAMED, ARRAY_SIZE(template), 0);
+	if (ksp == NULL)
+		return;
+	memcpy(ksp->ks_data, template, sizeof (template));
+	ksp->ks_private = dp;
+	ksp->ks_update = dsl_pool_dirty_kstat_update;
+	dp->dp_dirty_kstat = ksp;
+	kstat_install(ksp);
+}
+
+static void
+dsl_pool_dirty_kstat_fini(dsl_pool_t *dp)
+{
+	if (dp->dp_dirty_kstat != NULL) {
+		/*
+		 * sysctl_ctx_free() unregisters the OIDs and drains their readers.
+		 * Do not hold dp_lock while waiting for an active update callback.
+		 */
+		kstat_delete(dp->dp_dirty_kstat);
+		dp->dp_dirty_kstat = NULL;
+	}
+}
+#else
+#define	dsl_pool_dirty_kstat_init(dp) ((void) (dp))
+#define	dsl_pool_dirty_kstat_fini(dp) ((void) (dp))
+#endif
+
 int
 dsl_pool_open_special_dir(dsl_pool_t *dp, const char *name, dsl_dir_t **ddp)
 {
@@ -233,6 +304,7 @@ dsl_pool_open_impl(spa_t *spa, uint64_t txg)
 	    100, defclsyspri, boot_ncpus, INT_MAX,
 	    TASKQ_PREPOPULATE | TASKQ_DYNAMIC | TASKQ_THREADS_CPU_PCT);
 
+	dsl_pool_dirty_kstat_init(dp);
 	return (dp);
 }
 
@@ -371,6 +443,8 @@ out:
 void
 dsl_pool_close(dsl_pool_t *dp)
 {
+	dsl_pool_dirty_kstat_fini(dp);
+
 	/*
 	 * Drop our references from dsl_pool_open().
 	 *

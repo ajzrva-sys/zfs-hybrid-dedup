@@ -151,6 +151,10 @@ typedef struct dsl_pool {
 	rrwlock_t dp_config_rwlock;
 
 	zfs_all_blkstats_t *dp_blkstats;
+#if defined(_KERNEL) && defined(__FreeBSD__)
+	/* Removed and drained before this DSL pool is destroyed. */
+	kstat_t *dp_dirty_kstat;
+#endif
 } dsl_pool_t;
 
 int dsl_pool_init(spa_t *spa, uint64_t txg, dsl_pool_t **dpp);

@@ -10,17 +10,20 @@ selected per file; existing chunked files retain their format.
 
 ## Current status
 
-Scanning and hashing now use multiple cores: `optimize` and `watch` default to
-the online CPU count, capped at 64, with `--threads=1..64` available. Clean-file
-inspection avoids a forced durability wait; dirty files share waits in batches
-of up to 256. Selection and installation remain sequential.
+Scanning, hashing, native sharing and catalog sorting use bounded parallel
+workers: `optimize` and `watch` default to the online CPU count, capped at 64,
+with `--threads=1..64` available. Clean-file inspection avoids a forced
+durability wait; dirty files share waits in batches of up to 256. Catalog
+selection uses a memory index capped at 256 MiB, with a disk-backed fallback.
+`optimize --report` saves sharing-group estimates before conversion.
 
-The latest userspace revision passed local checks and focused strict/sanitizer
-tests. Its kernel predecessor passed **21 original and 12 hybrid native cases**
-through `native-smoke`, reusing an exactly verified build with guest and host
-restoration. The full native suite was not rerun after the userspace-only
-parallel scan change. A live 40-worker run confirmed multicore execution;
-it does not establish a matched speedup.
+Focused native optimizer checks cover one and 40 threads, preserved content
+and metadata, and copy-on-write isolation. The new read-only per-pool dirty-data
+gauge passed direct-function tests, a FreeBSD kernel-module build and ten
+checks in an isolated offline VM. That candidate has not been activated on the
+running storage host. The complete 21-original/12-hybrid native suite has not
+been rerun for the combined revision; earlier suite results remain separately
+identified in the validation history.
 
 Matched allocation, pure-read and RAM comparisons and forced-power-loss
 qualification remain incomplete. The foreground-read target remains 1.25x
@@ -41,6 +44,12 @@ and [command/design documentation](chunkdedup/HYBRID.md).
 - The worker analyzes the traversal before conversion, with temporary disk
   catalogs, bounded parallel admission, allocation estimates and conservative
   fallbacks.
+- Catalog sorting uses up to 64 sort workers and an ordered serial merge with
+  the original keys and C locale. Selection retains a bounded disk fallback;
+  the optional [saved report](chunkdedup/CATALOG_REPORT.md) records estimates
+  per sharing group without authorizing conversion.
+- The FreeBSD module exposes current dirty-space accounting, the per-pool limit
+  and pool GUID through a [read-only native gauge](chunkdedup/DIRTY_DATA.md).
 - `status --methods` reports per-file representation and labeled pool-wide BRT
   statistics. Plain six-field status remains compatible.
 - `zfs blockdedup` provides the separate block-only optimizer with a matching
@@ -60,7 +69,14 @@ cd zfs-hybrid-dedup
 ```
 
 This checks source integrity, pinned Microsoft fixtures, the actual chunker,
-the native core model, worker batching, selection policy and packaging.
+the native core model, worker batching, selection policy, parallel sharing,
+catalog selection/reporting, sorting and packaging. Run the portable gauge
+checks separately:
+
+```sh
+python3 chunkdedup/lab-setup/tests/test_dirty_data.py --repo .
+```
+
 Local checks do not load a kernel module or prove native filesystem behavior.
 Generated evidence belongs outside this checkout. For native reproduction,
 read the [guarded offline lab recipe](chunkdedup/lab-setup/README.md).
@@ -68,7 +84,7 @@ read the [guarded offline lab recipe](chunkdedup/lab-setup/README.md).
 ## Source and provenance
 
 The fork is based on upstream [`zfs-2.4.4`](https://github.com/openzfs/zfs/commit/71a9f9578616a90c3c14bb59629fb4d31bfd68d1).
-The latest tested development snapshot contains 4,138 source files. Its digest
+The OpenZFS source projection contains 4,138 source files. Its digest
 and file manifest are in [SOURCE.json](chunkdedup/SOURCE.json) and
 [tested-source-files.json](chunkdedup/tested-source-files.json). Publication
 documentation and the portable verification wrapper use this repository's

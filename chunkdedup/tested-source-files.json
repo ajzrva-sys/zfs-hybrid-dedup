@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "source_digest": "833fb482f3675b5ad87e3bbdcb18cca66760de1625ecd219be2c22359724a1ed",
+  "source_digest": "7d6fabfb5d2bc1d1b71b4a41154b0d4227aa49943980b010b257667ec0897fb0",
   "files": [
     {
       "path": ".editorconfig",
@@ -761,19 +761,19 @@
     {
       "path": "cmd/zfs/chunkdedup_hybrid.c",
       "type": "file",
-      "sha256": "30237d559f67ecc19925a000c51d93f3498983a42ee31a81c738912180ab46c1",
+      "sha256": "6a7651d05781a722edbf54a12da35a2eb8cee2cc3c46f4f1034f9d9cfd79672c",
       "mode": 644
     },
     {
       "path": "cmd/zfs/chunkdedup_hybrid.h",
       "type": "file",
-      "sha256": "18eee376f489b71002f15492cc171ab0e14f382f19606edf462954ad126b0203",
+      "sha256": "2b028c703ba24b6f668eb20be7b619ab9f79f8bb42aa1d0e5d6ce767ca4f4202",
       "mode": 644
     },
     {
       "path": "cmd/zfs/chunkdedup_parallel.h",
       "type": "file",
-      "sha256": "f3f9b4d1bcc01b31e11ad9f5dbf4333b5c45dca4ca6b7e79b784f00fc955c80a",
+      "sha256": "64dd33330a4e2be497019352b714a7c4378b451090a9954715d5703a018f2e02",
       "mode": 644
     },
     {
@@ -791,7 +791,7 @@
     {
       "path": "cmd/zfs/zfs_chunkdedup_user.c",
       "type": "file",
-      "sha256": "7c13a6867661e2f16867bcc70065a8dede500cb5fae999c63e626fd90fdf2384",
+      "sha256": "74a185b6405e50b584e1cb347d6131355cd00440269732d82cfcdab95d4df31c",
       "mode": 644
     },
     {
@@ -4829,7 +4829,7 @@
     {
       "path": "include/sys/dmu.h",
       "type": "file",
-      "sha256": "1742483c34c811a8ecc5936aae77aa67a94d60d02010e4ada354eb781197df7d",
+      "sha256": "58a9a01cf87795672be6a928e1b844555782ee1e94ac5b389aabdc4114fe50fa",
       "mode": 644
     },
     {
@@ -4931,7 +4931,7 @@
     {
       "path": "include/sys/dsl_pool.h",
       "type": "file",
-      "sha256": "b19ca344ddc3f8d9e25b8c7bf0a1c0a990eda52588ac849743ed2e83537b11ed",
+      "sha256": "594d608d00d1375eb580fca85dcdc1a61ae14d1014685b003afa56276e2dc6f1",
       "mode": 644
     },
     {
@@ -9209,7 +9209,7 @@
     {
       "path": "module/zfs/dmu.c",
       "type": "file",
-      "sha256": "1c529be6f8189afc77179b64ac4bb72ee1ce06ab719a7cd492bd9b3e5bd0e56c",
+      "sha256": "0cbc56f1c0c1ed799ea45b8243ee825356fad4bc8cd942a6e8ced31d562d8d5a",
       "mode": 644
     },
     {
@@ -9329,7 +9329,7 @@
     {
       "path": "module/zfs/dsl_pool.c",
       "type": "file",
-      "sha256": "6fdc302feb8757ee405335e11d520640aba9521353027e46b17b406dbca57858",
+      "sha256": "e004e2e36e8997f9279b887b6964a9a631b6faabb80102fd68e4184151d3713d",
       "mode": 644
     },
     {
@@ -9803,7 +9803,7 @@
     {
       "path": "module/zfs/zfs_chunkdedup.c",
       "type": "file",
-      "sha256": "388715b08ee8576095343e468508d558940a1ef99d8493a1c838366d3da888e2",
+      "sha256": "bdc02d27d65a1f20775cbdd8d545f136823218fd4124750ff238a69160f693e9",
       "mode": 644
     },
     {
@@ -9839,7 +9839,7 @@
     {
       "path": "module/zfs/zfs_ioctl.c",
       "type": "file",
-      "sha256": "3a8b2d1c8326fd3e49051d544f3ae785beafefe41052f905376ada0c5b8f78dd",
+      "sha256": "41c0a5cfba7d23fb73a88ded0495254e23f3469687fd4d00617031b8cb6462e2",
       "mode": 644
     },
     {

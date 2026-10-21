@@ -57,3 +57,15 @@ extract cd_scan_submit 'static int' >> "$temporary/functions.inc"
     "-DSCAN_FUNCTIONS_SOURCE=\"$temporary/functions.inc\"" \
     "$here/parallel_scan_glue_test.c" -o "$temporary/parallel-scan-glue"
 "$temporary/parallel-scan-glue"
+
+# Exercise the current sharing driver through the same local verification gate.
+python3 "$here/test_parallel_share.py" --repo "$1"
+
+# Compare the actual in-memory catalog path with its disk fallback and report.
+python3 "$here/test_catalog_memory.py" --repo "$1"
+
+# Compare real parallel /usr/bin/sort processes with the preserved serial path.
+python3 "$here/test_parallel_sort.py" --repo "$1"
+
+# Exercise the actual optional FreeBSD dirty-data gauge with portable stubs.
+python3 "$here/test_dirty_data.py" --repo "$1"

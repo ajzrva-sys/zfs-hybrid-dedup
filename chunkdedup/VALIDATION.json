@@ -1,19 +1,19 @@
 {
   "schema": 1,
-  "updated": "2026-10-19",
-  "scope": "Public summary of saved validation; raw host inventories and operational logs excluded",
-  "tested_source_digest": "833fb482f3675b5ad87e3bbdcb18cca66760de1625ecd219be2c22359724a1ed",
+  "updated": "2026-10-21",
+  "scope": "Public component summaries; raw operational inventories and machine identifiers excluded",
+  "publication_projection_digest": "7d6fabfb5d2bc1d1b71b4a41154b0d4227aa49943980b010b257667ec0897fb0",
   "local_evaluation": {
     "schema": 1,
-    "run_id": "20261019t171221z-1ddf3976-a0",
+    "run_id": "20261021t175011z-49b856b3-a0",
     "profile": "local",
     "status": "PASS",
-    "source_digest": "833fb482f3675b5ad87e3bbdcb18cca66760de1625ecd219be2c22359724a1ed",
+    "source_digest": "69712a9e0d8b7cbce99195b78e2364c69e9d5364948084b632ca935568a651e1",
     "policy_id": "native-chunkdedup-prototype-v1",
-    "evaluated_at": "2026-10-19T17:12:33.271019+00:00",
+    "evaluated_at": "2026-10-21T17:50:46.127599+00:00",
     "artifact_digests_checked": 189,
     "assessments": {
-      "source_files_verified": 4138,
+      "source_files_verified": 4334,
       "immutable_baseline_files_verified": 141,
       "conformance_fixtures_verified": 35
     },
@@ -22,300 +22,207 @@
   },
   "latest_full_native_evaluation": {
     "status": "NOT_RUN",
-    "source_digest": "833fb482f3675b5ad87e3bbdcb18cca66760de1625ecd219be2c22359724a1ed",
-    "reason": "Latest parallel scanning change is userspace only. Kernel, VFS, library and replication sources match the native-smoke-tested predecessor."
+    "publication_projection_digest": "7d6fabfb5d2bc1d1b71b4a41154b0d4227aa49943980b010b257667ec0897fb0",
+    "reason": "The combined optimizer and dirty-data gauge revision has separate focused native proofs; the complete original plus hybrid native suite was not rerun for the combined revision."
   },
-  "predecessor_native_evaluation": {
-    "schema": 1,
-    "run_id": "20261019t165053z-e338a730-a0",
-    "profile": "native-smoke",
-    "status": "PASS",
-    "source_digest": "98882f3c8618f31f28dcb7208c0909f78eca5290de029a2763749b7a5bc5ebcc",
-    "policy_id": "native-chunkdedup-prototype-v1",
-    "evaluated_at": "2026-10-19T16:52:51.229164+00:00",
-    "artifact_digests_checked": 227,
-    "assessments": {
-      "source_files_verified": 4137,
-      "immutable_baseline_files_verified": 141,
-      "conformance_fixtures_verified": 35,
-      "native_provenance": {
-        "source_entries": 4137,
-        "fresh_build": false,
-        "module_sha256": "e542e4132df498ed0b35e2166ccab98af728bf8992401a4758bbdef42e8ae8f0",
-        "binary_sha256": "e2bc388927f171db7ef621a5f23212329a0b0b6bb4568c5bf5b46bb13727fe89",
-        "host_restored": true
-      },
-      "native": {
-        "checks": 21,
-        "fixture_savings": 0.8065395095367848,
-        "paired_remounted_read_slowdown": 1.1805711963024428,
-        "write_memory": "context only; repeated writes hydrate only once and memory is sampled",
-        "fresh_crash_legacy_coverage": false
-      }
+  "optimizer": {
+    "source_identity": "bd27ec20b52818e05bfc2ead3ea47d6130b8c7a157a34236376c490b3640a5af",
+    "source_identity_scope": "Prior frozen full publication tree before dirty-data gauge; all existing optimizer changes match it.",
+    "local_profile": "PASS",
+    "source_files_checked": 4330,
+    "freebsd_userspace_build": "PASS",
+    "focused_native_tests": {
+      "status": "PASS",
+      "threads": [
+        1,
+        40
+      ],
+      "fixture_files": 196,
+      "saved_bytes_each": 637534208,
+      "hashes_metadata_and_cow_preserved": true,
+      "temporary_catalog_cleanup": true,
+      "concurrent_native_share_stacks_observed": 6
     },
-    "feedback": [],
-    "claim": "current guest 21-case regression; no fresh crash or old-software claim"
+    "parallel_sort_synthetic_benchmark": {
+      "status": "PASS",
+      "input_bytes": 1073741824,
+      "workers": 40,
+      "serial_seconds": 29.809,
+      "parallel_seconds": 16.573,
+      "speedup": 1.7986484040306523,
+      "sorted_output_bytes_equal": true,
+      "scope": "Synthetic catalog including serial merge; not production filesystem throughput."
+    }
   },
-  "predecessor_native_cases": {
-    "original_passed": 21,
-    "hybrid_passed": 12,
-    "scope": "Fresh functional execution and restoration using exact previously verified compiled artifacts; native-smoke, not a new full compile."
+  "dirty_data_gauge": {
+    "kernel_build": "PASS",
+    "compiler_warnings_as_errors": true,
+    "candidate_module_sha256": "7a836ada25ec533ae5af4f72f35e46b0ac7f0b0eb59c44f6cbb6cd5e56708401",
+    "kernel_source_files_checked": 782,
+    "direct_c_tests": {
+      "passed": 8,
+      "modes": [
+        "strict",
+        "ASan/UBSan"
+      ],
+      "scope": "Actual functions with userspace kstat/mutex stubs"
+    },
+    "isolated_vm": {
+      "status": "PASS",
+      "kernel": "FreeBSD 15.1-RELEASE-p4",
+      "cpus": 1,
+      "memory_gib": 4,
+      "network": false,
+      "shared_filesystem": false,
+      "physical_disk_passthrough": false,
+      "native_checks_passed": 10,
+      "peak_dirty_bytes": 15532544,
+      "positive_with_idle_pool_zero_checks": 4430,
+      "lifecycle_cycles": 5,
+      "concurrent_pollers": 3,
+      "unexpected_poll_errors": 0,
+      "drained_to_zero": true,
+      "read_only_fields": true,
+      "reserved_and_dotted_names": true,
+      "gauge_nodes_removed": true,
+      "guest_clean_shutdown": true,
+      "host_restoration": "PASS"
+    },
+    "installed_on_running_storage_host": false,
+    "documentation": "DIRTY_DATA.md"
   },
-  "parallel_component_comparison": {
-    "source_before": "98882f3c8618f31f28dcb7208c0909f78eca5290de029a2763749b7a5bc5ebcc",
-    "source_after": "833fb482f3675b5ad87e3bbdcb18cca66760de1625ecd219be2c22359724a1ed",
-    "changed_paths": [
-      "cmd/zfs/Makefile.am",
-      "cmd/zfs/chunkdedup_parallel.h",
-      "cmd/zfs/zfs_chunkdedup_user.c"
-    ],
-    "kernel_vfs_libzfs_replication_unchanged": true,
-    "scope": "source comparison only; new userspace behavior is tested separately"
-  },
-  "parallel_tests": {
-    "status": "PASS",
-    "implementation": "Actual production pthread pool and extracted current CLI coordinator/catalog functions",
-    "modes": [
-      "strict C warnings",
-      "AddressSanitizer",
-      "UndefinedBehaviorSanitizer"
-    ],
-    "coverage": [
-      "concurrent workers",
-      "bounded admission",
-      "ordered catalog IDs",
-      "dirty retry handoff",
-      "hardlinks",
-      "stale and skipped candidates",
-      "cancellation and joined cleanup"
-    ]
-  },
-  "evaluator_tests": {
-    "passed": 17,
-    "total": 17,
-    "includes": "Missing parallel header rejected after receipt hashes and digests are refreshed"
-  },
-  "freebsd_userspace": {
-    "build": "PASS",
-    "installation_readback": "PASS",
-    "observed_scan_workers": 40,
-    "observed_process_threads": 41,
-    "observed_cpu_percent": 424.9,
-    "observed_rss_kib": 101608,
-    "scope": "One operational snapshot; not a matched performance or memory comparison"
-  },
-  "matched_performance": "NOT_RUN",
+  "matched_filesystem_performance": "NOT_RUN",
   "memory_comparison": "NOT_RUN",
   "planned_power_loss": "NOT_RUN",
   "foreground_read_target": 1.25,
   "foreground_read_target_verified": false,
-  "predecessor_lab_restored_and_stopped": true,
   "previous_validation": [
     {
       "schema": 1,
-      "scope": "Public summary of saved validation, not raw host logs or independent attestation",
-      "tested_source_digest": "90ce02dca5f0da9148af08d93f6a517265e9396b91b3bb9f9b24197ced144faf",
-      "implementation_commit": "dc5117ed63ceadc7cbc479db725dfc633ad46d77",
+      "updated": "2026-10-19",
+      "scope": "Public summary of saved validation; raw host inventories and operational logs excluded",
+      "tested_source_digest": "833fb482f3675b5ad87e3bbdcb18cca66760de1625ecd219be2c22359724a1ed",
       "local_evaluation": {
         "schema": 1,
-        "run_id": "20261018t220059z-37b686da-a0",
+        "run_id": "20261019t171221z-1ddf3976-a0",
         "profile": "local",
         "status": "PASS",
-        "source_digest": "90ce02dca5f0da9148af08d93f6a517265e9396b91b3bb9f9b24197ced144faf",
+        "source_digest": "833fb482f3675b5ad87e3bbdcb18cca66760de1625ecd219be2c22359724a1ed",
         "policy_id": "native-chunkdedup-prototype-v1",
-        "evaluated_at": "2026-10-18T22:01:10.395342+00:00",
+        "evaluated_at": "2026-10-19T17:12:33.271019+00:00",
         "artifact_digests_checked": 189,
         "assessments": {
-          "source_files_verified": 4134,
+          "source_files_verified": 4138,
           "immutable_baseline_files_verified": 141,
           "conformance_fixtures_verified": 35
         },
         "feedback": [],
         "claim": "local models/conformance only"
       },
-      "native_evaluation": {
-        "schema": 1,
-        "run_id": "20261018t220121z-c8abad48-a0",
-        "profile": "native",
-        "status": "INFRA_FAILURE",
-        "source_digest": "90ce02dca5f0da9148af08d93f6a517265e9396b91b3bb9f9b24197ced144faf",
-        "policy_id": "native-chunkdedup-prototype-v1",
-        "evaluated_at": "2026-10-18T22:13:26.617631+00:00",
-        "artifact_digests_checked": 222,
-        "assessments": {
-          "source_files_verified": 4134,
-          "immutable_baseline_files_verified": 141,
-          "conformance_fixtures_verified": 35
-        },
-        "feedback": [
-          {
-            "category": "INFRA_FAILURE",
-            "stage": "host_restore",
-            "rule": "stage_infrastructure",
-            "observed": {
-              "returncode": 1,
-              "log": "native/host_restore.log"
-            },
-            "expected": "stage executed with complete evidence",
-            "action": "Fix the unavailable environment; do not treat this as a source pass."
-          }
-        ],
-        "claim": "validation incomplete; no current native pass claim"
+      "latest_full_native_evaluation": {
+        "status": "NOT_RUN",
+        "source_digest": "833fb482f3675b5ad87e3bbdcb18cca66760de1625ecd219be2c22359724a1ed",
+        "reason": "Latest parallel scanning change is userspace only. Kernel, VFS, library and replication sources match the native-smoke-tested predecessor."
       },
-      "legacy_checks": [
-        {
-          "name": "guest guard and helper build",
-          "passed": true
+      "predecessor_native_evaluation": {
+        "schema": 1,
+        "run_id": "20261019t165053z-e338a730-a0",
+        "profile": "native-smoke",
+        "status": "PASS",
+        "source_digest": "98882f3c8618f31f28dcb7208c0909f78eca5290de029a2763749b7a5bc5ebcc",
+        "policy_id": "native-chunkdedup-prototype-v1",
+        "evaluated_at": "2026-10-19T16:52:51.229164+00:00",
+        "artifact_digests_checked": 227,
+        "assessments": {
+          "source_files_verified": 4137,
+          "immutable_baseline_files_verified": 141,
+          "conformance_fixtures_verified": 35,
+          "native_provenance": {
+            "source_entries": 4137,
+            "fresh_build": false,
+            "module_sha256": "e542e4132df498ed0b35e2166ccab98af728bf8992401a4758bbdef42e8ae8f0",
+            "binary_sha256": "e2bc388927f171db7ef621a5f23212329a0b0b6bb4568c5bf5b46bb13727fe89",
+            "host_restored": true
+          },
+          "native": {
+            "checks": 21,
+            "fixture_savings": 0.8065395095367848,
+            "paired_remounted_read_slowdown": 1.1805711963024428,
+            "write_memory": "context only; repeated writes hydrate only once and memory is sampled",
+            "fresh_crash_legacy_coverage": false
+          }
         },
-        {
-          "name": "isolated pools and bounded datasets",
-          "passed": true
-        },
-        {
-          "name": "deterministic mixed fixtures",
-          "passed": true
-        },
-        {
-          "name": "sharing, saved physical space and metadata",
-          "passed": true
-        },
-        {
-          "name": "cold native read paths",
-          "passed": true
-        },
-        {
-          "name": "foreground logical read and memory metrics",
-          "passed": true
-        },
-        {
-          "name": "partial writes, mmap writes and idempotent reoptimization",
-          "passed": true
-        },
-        {
-          "name": "rename, hardlink and open-unlinked lifecycle",
-          "passed": true
-        },
-        {
-          "name": "truncate, partial EOF append, extension and sparse data",
-          "passed": true
-        },
-        {
-          "name": "age, busy file, property, quota and export admission",
-          "passed": true
-        },
-        {
-          "name": "tiny files and 40-100 KiB partial EOF records",
-          "passed": true
-        },
-        {
-          "name": "atime-on conversion preserves file timestamps and metadata",
-          "passed": true
-        },
-        {
-          "name": "sparse extents and bounded physical hole allocation",
-          "passed": true
-        },
-        {
-          "name": "background watching and writable mmap races",
-          "passed": true
-        },
-        {
-          "name": "short tails crossing 1 MiB conversion batches",
-          "passed": true
-        },
-        {
-          "name": "interrupted conversion and resumable mixed mappings",
-          "passed": true
-        },
-        {
-          "name": "debug-only collision comparator and corrupt mapping rejection",
-          "passed": true
-        },
-        {
-          "name": "snapshot, clone independence and logical copy",
-          "passed": true
-        },
-        {
-          "name": "full/incremental replication and receiver feature rejection",
-          "passed": true
-        },
-        {
-          "name": "unoptimization, live reference GC and snapshot retention",
-          "passed": true
-        },
-        {
-          "name": "quota exhaustion preserves logical reads",
-          "passed": true
-        }
-      ],
-      "hybrid_checks": [
-        {
-          "name": "hybrid CLI contracts and forced methods",
-          "passed": true
-        },
-        {
-          "name": "native exact sharing preserves metadata and COW",
-          "passed": true
-        },
-        {
-          "name": "automatic unique data stays native",
-          "passed": true
-        },
-        {
-          "name": "automatic shifted cohort selects chunking",
-          "passed": true
-        },
-        {
-          "name": "native sparse tails and incompatible geometry",
-          "passed": true
-        },
-        {
-          "name": "verified sharing rejects stale unequal and busy ranges",
-          "passed": true
-        },
-        {
-          "name": "native peers and snapshots survive CDC conversion",
-          "passed": true
-        },
-        {
-          "name": "existing CDC resume and explicit restoration",
-          "passed": true
-        },
-        {
-          "name": "automatic background watching shares native blocks",
-          "passed": true
-        },
-        {
-          "name": "interrupted CDC conversion resumes through automatic mode",
-          "passed": true
-        },
-        {
-          "name": "exhausted quota preserves content during conversion",
-          "passed": true
-        },
-        {
-          "name": "hybrid snapshots clones and logical replication",
-          "passed": true
-        }
-      ],
-      "remaining_failure": "Latest full native gate is INFRA_FAILURE after a five-second host-cleanup SSH timeout. Separate recovery confirmed the guest stopped and exact VM configuration restored, but strict host-state comparison found an existing running service with a changed process identity. Original failed evaluation is retained; no full native pass is claimed.",
+        "feedback": [],
+        "claim": "current guest 21-case regression; no fresh crash or old-software claim"
+      },
+      "predecessor_native_cases": {
+        "original_passed": 21,
+        "hybrid_passed": 12,
+        "scope": "Fresh functional execution and restoration using exact previously verified compiled artifacts; native-smoke, not a new full compile."
+      },
+      "parallel_component_comparison": {
+        "source_before": "98882f3c8618f31f28dcb7208c0909f78eca5290de029a2763749b7a5bc5ebcc",
+        "source_after": "833fb482f3675b5ad87e3bbdcb18cca66760de1625ecd219be2c22359724a1ed",
+        "changed_paths": [
+          "cmd/zfs/Makefile.am",
+          "cmd/zfs/chunkdedup_parallel.h",
+          "cmd/zfs/zfs_chunkdedup_user.c"
+        ],
+        "kernel_vfs_libzfs_replication_unchanged": true,
+        "scope": "source comparison only; new userspace behavior is tested separately"
+      },
+      "parallel_tests": {
+        "status": "PASS",
+        "implementation": "Actual production pthread pool and extracted current CLI coordinator/catalog functions",
+        "modes": [
+          "strict C warnings",
+          "AddressSanitizer",
+          "UndefinedBehaviorSanitizer"
+        ],
+        "coverage": [
+          "concurrent workers",
+          "bounded admission",
+          "ordered catalog IDs",
+          "dirty retry handoff",
+          "hardlinks",
+          "stale and skipped candidates",
+          "cancellation and joined cleanup"
+        ]
+      },
+      "evaluator_tests": {
+        "passed": 17,
+        "total": 17,
+        "includes": "Missing parallel header rejected after receipt hashes and digests are refreshed"
+      },
+      "freebsd_userspace": {
+        "build": "PASS",
+        "installation_readback": "PASS",
+        "observed_scan_workers": 40,
+        "observed_process_threads": 41,
+        "observed_cpu_percent": 424.9,
+        "observed_rss_kib": 101608,
+        "scope": "One operational snapshot; not a matched performance or memory comparison"
+      },
       "matched_performance": "NOT_RUN",
       "memory_comparison": "NOT_RUN",
       "planned_power_loss": "NOT_RUN",
       "foreground_read_target": 1.25,
-      "lab_restored_and_stopped": true,
-      "updated": "2026-10-18",
+      "foreground_read_target_verified": false,
+      "predecessor_lab_restored_and_stopped": true,
       "previous_validation": [
         {
-          "date": "2026-10-17",
+          "schema": 1,
+          "scope": "Public summary of saved validation, not raw host logs or independent attestation",
+          "tested_source_digest": "90ce02dca5f0da9148af08d93f6a517265e9396b91b3bb9f9b24197ced144faf",
+          "implementation_commit": "dc5117ed63ceadc7cbc479db725dfc633ad46d77",
           "local_evaluation": {
             "schema": 1,
-            "run_id": "20261017t235222z-2671604f-a0",
+            "run_id": "20261018t220059z-37b686da-a0",
             "profile": "local",
             "status": "PASS",
             "source_digest": "90ce02dca5f0da9148af08d93f6a517265e9396b91b3bb9f9b24197ced144faf",
             "policy_id": "native-chunkdedup-prototype-v1",
-            "evaluated_at": "2026-10-17T23:52:33.591024+00:00",
+            "evaluated_at": "2026-10-18T22:01:10.395342+00:00",
             "artifact_digests_checked": 189,
             "assessments": {
               "source_files_verified": 4134,
@@ -327,13 +234,13 @@
           },
           "native_evaluation": {
             "schema": 1,
-            "run_id": "20261017t235237z-1c24e42b-a0",
+            "run_id": "20261018t220121z-c8abad48-a0",
             "profile": "native",
-            "status": "TEST_FAILURE",
+            "status": "INFRA_FAILURE",
             "source_digest": "90ce02dca5f0da9148af08d93f6a517265e9396b91b3bb9f9b24197ced144faf",
             "policy_id": "native-chunkdedup-prototype-v1",
-            "evaluated_at": "2026-10-18T00:04:25.012731+00:00",
-            "artifact_digests_checked": 224,
+            "evaluated_at": "2026-10-18T22:13:26.617631+00:00",
+            "artifact_digests_checked": 222,
             "assessments": {
               "source_files_verified": 4134,
               "immutable_baseline_files_verified": 141,
@@ -341,62 +248,262 @@
             },
             "feedback": [
               {
-                "category": "TEST_FAILURE",
-                "stage": "guest_regression",
-                "rule": "executed_test_failed",
+                "category": "INFRA_FAILURE",
+                "stage": "host_restore",
+                "rule": "stage_infrastructure",
                 "observed": {
                   "returncode": 1,
-                  "log": "native/guest_regression.log"
+                  "log": "native/host_restore.log"
                 },
-                "expected": "all required assertions pass",
-                "action": "Diagnose the observed log and repair only implementation source."
+                "expected": "stage executed with complete evidence",
+                "action": "Fix the unavailable environment; do not treat this as a source pass."
               }
             ],
             "claim": "validation incomplete; no current native pass claim"
           },
-          "legacy_checks_passed": 21,
-          "hybrid_checks_passed": 11,
-          "hybrid_checks_total": 12,
-          "remaining_failure": "Final hybrid replication harness tried to mount an already mounted received filesystem. Received content and hybrid incremental assertions were not reached."
+          "legacy_checks": [
+            {
+              "name": "guest guard and helper build",
+              "passed": true
+            },
+            {
+              "name": "isolated pools and bounded datasets",
+              "passed": true
+            },
+            {
+              "name": "deterministic mixed fixtures",
+              "passed": true
+            },
+            {
+              "name": "sharing, saved physical space and metadata",
+              "passed": true
+            },
+            {
+              "name": "cold native read paths",
+              "passed": true
+            },
+            {
+              "name": "foreground logical read and memory metrics",
+              "passed": true
+            },
+            {
+              "name": "partial writes, mmap writes and idempotent reoptimization",
+              "passed": true
+            },
+            {
+              "name": "rename, hardlink and open-unlinked lifecycle",
+              "passed": true
+            },
+            {
+              "name": "truncate, partial EOF append, extension and sparse data",
+              "passed": true
+            },
+            {
+              "name": "age, busy file, property, quota and export admission",
+              "passed": true
+            },
+            {
+              "name": "tiny files and 40-100 KiB partial EOF records",
+              "passed": true
+            },
+            {
+              "name": "atime-on conversion preserves file timestamps and metadata",
+              "passed": true
+            },
+            {
+              "name": "sparse extents and bounded physical hole allocation",
+              "passed": true
+            },
+            {
+              "name": "background watching and writable mmap races",
+              "passed": true
+            },
+            {
+              "name": "short tails crossing 1 MiB conversion batches",
+              "passed": true
+            },
+            {
+              "name": "interrupted conversion and resumable mixed mappings",
+              "passed": true
+            },
+            {
+              "name": "debug-only collision comparator and corrupt mapping rejection",
+              "passed": true
+            },
+            {
+              "name": "snapshot, clone independence and logical copy",
+              "passed": true
+            },
+            {
+              "name": "full/incremental replication and receiver feature rejection",
+              "passed": true
+            },
+            {
+              "name": "unoptimization, live reference GC and snapshot retention",
+              "passed": true
+            },
+            {
+              "name": "quota exhaustion preserves logical reads",
+              "passed": true
+            }
+          ],
+          "hybrid_checks": [
+            {
+              "name": "hybrid CLI contracts and forced methods",
+              "passed": true
+            },
+            {
+              "name": "native exact sharing preserves metadata and COW",
+              "passed": true
+            },
+            {
+              "name": "automatic unique data stays native",
+              "passed": true
+            },
+            {
+              "name": "automatic shifted cohort selects chunking",
+              "passed": true
+            },
+            {
+              "name": "native sparse tails and incompatible geometry",
+              "passed": true
+            },
+            {
+              "name": "verified sharing rejects stale unequal and busy ranges",
+              "passed": true
+            },
+            {
+              "name": "native peers and snapshots survive CDC conversion",
+              "passed": true
+            },
+            {
+              "name": "existing CDC resume and explicit restoration",
+              "passed": true
+            },
+            {
+              "name": "automatic background watching shares native blocks",
+              "passed": true
+            },
+            {
+              "name": "interrupted CDC conversion resumes through automatic mode",
+              "passed": true
+            },
+            {
+              "name": "exhausted quota preserves content during conversion",
+              "passed": true
+            },
+            {
+              "name": "hybrid snapshots clones and logical replication",
+              "passed": true
+            }
+          ],
+          "remaining_failure": "Latest full native gate is INFRA_FAILURE after a five-second host-cleanup SSH timeout. Separate recovery confirmed the guest stopped and exact VM configuration restored, but strict host-state comparison found an existing running service with a changed process identity. Original failed evaluation is retained; no full native pass is claimed.",
+          "matched_performance": "NOT_RUN",
+          "memory_comparison": "NOT_RUN",
+          "planned_power_loss": "NOT_RUN",
+          "foreground_read_target": 1.25,
+          "lab_restored_and_stopped": true,
+          "updated": "2026-10-18",
+          "previous_validation": [
+            {
+              "date": "2026-10-17",
+              "local_evaluation": {
+                "schema": 1,
+                "run_id": "20261017t235222z-2671604f-a0",
+                "profile": "local",
+                "status": "PASS",
+                "source_digest": "90ce02dca5f0da9148af08d93f6a517265e9396b91b3bb9f9b24197ced144faf",
+                "policy_id": "native-chunkdedup-prototype-v1",
+                "evaluated_at": "2026-10-17T23:52:33.591024+00:00",
+                "artifact_digests_checked": 189,
+                "assessments": {
+                  "source_files_verified": 4134,
+                  "immutable_baseline_files_verified": 141,
+                  "conformance_fixtures_verified": 35
+                },
+                "feedback": [],
+                "claim": "local models/conformance only"
+              },
+              "native_evaluation": {
+                "schema": 1,
+                "run_id": "20261017t235237z-1c24e42b-a0",
+                "profile": "native",
+                "status": "TEST_FAILURE",
+                "source_digest": "90ce02dca5f0da9148af08d93f6a517265e9396b91b3bb9f9b24197ced144faf",
+                "policy_id": "native-chunkdedup-prototype-v1",
+                "evaluated_at": "2026-10-18T00:04:25.012731+00:00",
+                "artifact_digests_checked": 224,
+                "assessments": {
+                  "source_files_verified": 4134,
+                  "immutable_baseline_files_verified": 141,
+                  "conformance_fixtures_verified": 35
+                },
+                "feedback": [
+                  {
+                    "category": "TEST_FAILURE",
+                    "stage": "guest_regression",
+                    "rule": "executed_test_failed",
+                    "observed": {
+                      "returncode": 1,
+                      "log": "native/guest_regression.log"
+                    },
+                    "expected": "all required assertions pass",
+                    "action": "Diagnose the observed log and repair only implementation source."
+                  }
+                ],
+                "claim": "validation incomplete; no current native pass claim"
+              },
+              "legacy_checks_passed": 21,
+              "hybrid_checks_passed": 11,
+              "hybrid_checks_total": 12,
+              "remaining_failure": "Final hybrid replication harness tried to mount an already mounted received filesystem. Received content and hybrid incremental assertions were not reached."
+            }
+          ],
+          "fresh_vm_functional_runs": [
+            {
+              "run_id": "20261018t214707z-07a4e00a-a0",
+              "legacy_checks_passed": 21,
+              "hybrid_checks_passed": 12,
+              "full_native_gate": "INFRA_FAILURE",
+              "blocker": "Media inventory rejected the separately pinned sixth input; corrected afterward."
+            },
+            {
+              "run_id": "20261018t220121z-c8abad48-a0",
+              "legacy_checks_passed": 21,
+              "hybrid_checks_passed": 12,
+              "full_native_gate": "INFRA_FAILURE",
+              "blocker": "Host-cleanup SSH VM-state probe exceeded its five-second timeout."
+            }
+          ],
+          "bare_metal_functional": {
+            "status": "PASS",
+            "legacy_checks_passed": 21,
+            "hybrid_checks_passed": 12,
+            "layout": "Disposable SSD-backed file-vdev pools",
+            "restoration_status": "PASS",
+            "scope": "Functional evidence only; not the VM-specific full native gate, raw-device, performance or power-loss qualification."
+          },
+          "harness_corrections": [
+            "Check and assert mounted state after full and incremental receive, preserving previous content assertions.",
+            "Include the hybrid archive in exact media coverage when hybrid_tests is declared; preserve archive and test hashes."
+          ],
+          "restoration": {
+            "guest_module_and_test_pools_restored": true,
+            "lab_stopped": true,
+            "exact_vm_configuration_restored": true,
+            "own_workflow_lock_removed": true,
+            "strict_host_static_comparison_passed": false,
+            "difference": "One existing service was running before and after with a different process identity; cause unestablished. Recovery did not target services."
+          },
+          "foreground_read_target_verified": false
         }
-      ],
-      "fresh_vm_functional_runs": [
-        {
-          "run_id": "20261018t214707z-07a4e00a-a0",
-          "legacy_checks_passed": 21,
-          "hybrid_checks_passed": 12,
-          "full_native_gate": "INFRA_FAILURE",
-          "blocker": "Media inventory rejected the separately pinned sixth input; corrected afterward."
-        },
-        {
-          "run_id": "20261018t220121z-c8abad48-a0",
-          "legacy_checks_passed": 21,
-          "hybrid_checks_passed": 12,
-          "full_native_gate": "INFRA_FAILURE",
-          "blocker": "Host-cleanup SSH VM-state probe exceeded its five-second timeout."
-        }
-      ],
-      "bare_metal_functional": {
-        "status": "PASS",
-        "legacy_checks_passed": 21,
-        "hybrid_checks_passed": 12,
-        "layout": "Disposable SSD-backed file-vdev pools",
-        "restoration_status": "PASS",
-        "scope": "Functional evidence only; not the VM-specific full native gate, raw-device, performance or power-loss qualification."
-      },
-      "harness_corrections": [
-        "Check and assert mounted state after full and incremental receive, preserving previous content assertions.",
-        "Include the hybrid archive in exact media coverage when hybrid_tests is declared; preserve archive and test hashes."
-      ],
-      "restoration": {
-        "guest_module_and_test_pools_restored": true,
-        "lab_stopped": true,
-        "exact_vm_configuration_restored": true,
-        "own_workflow_lock_removed": true,
-        "strict_host_static_comparison_passed": false,
-        "difference": "One existing service was running before and after with a different process identity; cause unestablished. Recovery did not target services."
-      },
-      "foreground_read_target_verified": false
+      ]
     }
-  ]
+  ],
+  "local_evaluation_projection_relation": "All 4,138 implementation projection entries match the passing frozen run. Full-run and projection digests have different scopes; subsequent changes update publication verification metadata and kit checksums only.",
+  "workflow_safety_tests": {
+    "runner_unit_tests_passed": 14,
+    "helper_classification_cases_passed": 5,
+    "independent_evaluator_cases_passed": 20
+  }
 }

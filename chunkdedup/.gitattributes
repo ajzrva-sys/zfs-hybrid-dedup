@@ -1,0 +1,3 @@
+# Unified-diff context includes significant leading spaces and tabs.
+# Actual implementation files retain the normal whitespace checks.
+source.patch -whitespace

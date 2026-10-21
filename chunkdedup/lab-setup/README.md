@@ -69,12 +69,20 @@ also supports `--profile native-smoke --cached-build-receipt PATH`. The receipt
 and actual cached binaries are checked before testing; reuse is recorded
 explicitly and does not count as a fresh compilation.
 
-The durability-batching predecessor passed all 21 original and 12 hybrid cases
-through that cached-build profile, including guest and host restoration. The
-latest parallel CLI revision passed local and focused strict/sanitizer checks;
-its kernel sources are unchanged from that predecessor. The complete native
-suite was not rerun after this userspace-only update. See [current validation
-scope](../STATUS.md) for source identities and retained failure history.
+Earlier revisions passed all 21 original and 12 hybrid cases with their exact
+build/reuse and restoration scope recorded in the validation history. Later
+optimizer changes have focused strict/sanitizer and native functional checks;
+the new dirty-data gauge has separate direct-function tests, a kernel-module
+build and ten checks in an isolated offline VM. The complete native suite has
+not been rerun for the combined revision. See [current validation scope](../STATUS.md)
+and [gauge validation](../DIRTY_DATA.md) for source identities and proof limits.
+
+The gauge VM used a private UFS root image with the matching FreeBSD kernel,
+one CPU, 4 GiB RAM, and no network adapter, shared filesystem or physical-disk
+attachment. It verified current backlog and drain, pool isolation, read-only
+field types, escaped/reserved pool names and concurrent-reader teardown before
+clean shutdown. That run did not install the candidate on the running storage
+host or change its boot configuration. Host activation and reboot remain held.
 
 The one-CPU lab recipe isolates functional testing; it does not measure
 multicore scaling. The hybrid optimizer itself defaults to online CPUs, capped
