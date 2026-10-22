@@ -16,9 +16,18 @@ with `--threads=1..64` available. Clean-file inspection avoids a forced
 durability wait; dirty files share waits in batches of up to 256. Catalog
 selection uses a memory index capped at 256 MiB, with a disk-backed fallback.
 `optimize --report` saves sharing-group estimates before conversion.
+`optimize --checkpoint DIR` durably saves scan progress and completed sorts for
+later invocations. The parallel-sharing file snapshot has an 8 GiB ceiling and
+allocates only the bytes needed by its records; larger or unallocatable snapshots
+retain the serial fallback.
 
 Focused native optimizer checks cover one and 40 threads, preserved content
-and metadata, and copy-on-write isolation. The new read-only per-pool dirty-data
+and metadata, and copy-on-write isolation. An isolated checkpoint test stopped
+before sharing, then completed real native sharing with source analysis and
+sort execution hard-vetoed. Production checkpoint recovery remains unverified.
+Operational sharing errors, including `ENOENT`, propagate as failures; only a
+catalog reader's immediate end-of-file result is treated as normal completion.
+The new read-only per-pool dirty-data
 gauge passed direct-function tests, a FreeBSD kernel-module build and ten
 checks in an isolated offline VM. That candidate has not been activated on the
 running storage host. The complete 21-original/12-hybrid native suite has not
@@ -48,6 +57,10 @@ and [command/design documentation](chunkdedup/HYBRID.md).
   the original keys and C locale. Selection retains a bounded disk fallback;
   the optional [saved report](chunkdedup/CATALOG_REPORT.md) records estimates
   per sharing group without authorizing conversion.
+- [Durable checkpoints](chunkdedup/CATALOG_REPORT.md#checkpoint-and-resume)
+  retain committed files during a partial scan and reuse complete scans and
+  sorted catalogs. Keep checkpoint and report paths stable across retries.
+  [Recovery guidance](chunkdedup/RECOVERY.md) covers operating boundaries.
 - The FreeBSD module exposes current dirty-space accounting, the per-pool limit
   and pool GUID through a [read-only native gauge](chunkdedup/DIRTY_DATA.md).
 - `status --methods` reports per-file representation and labeled pool-wide BRT
@@ -70,7 +83,8 @@ cd zfs-hybrid-dedup
 
 This checks source integrity, pinned Microsoft fixtures, the actual chunker,
 the native core model, worker batching, selection policy, parallel sharing,
-catalog selection/reporting, sorting and packaging. Run the portable gauge
+catalog selection/reporting, durable checkpoint recovery, sorting and packaging.
+Run the portable gauge
 checks separately:
 
 ```sh
@@ -84,7 +98,7 @@ read the [guarded offline lab recipe](chunkdedup/lab-setup/README.md).
 ## Source and provenance
 
 The fork is based on upstream [`zfs-2.4.4`](https://github.com/openzfs/zfs/commit/71a9f9578616a90c3c14bb59629fb4d31bfd68d1).
-The OpenZFS source projection contains 4,138 source files. Its digest
+The OpenZFS source projection includes the durable checkpoint implementation. Its digest
 and file manifest are in [SOURCE.json](chunkdedup/SOURCE.json) and
 [tested-source-files.json](chunkdedup/tested-source-files.json). Publication
 documentation and the portable verification wrapper use this repository's

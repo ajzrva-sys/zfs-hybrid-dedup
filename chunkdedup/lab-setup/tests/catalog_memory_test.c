@@ -56,6 +56,18 @@ int cd_hybrid_sort_parallel(FILE *input,FILE **output,const char *directory,
     assert(threads==40);
     return stop&&atomic_load(stop)?ECANCELED:cd_hybrid_sort(input,output,directory);
 }
+/* Checkpoint-enabled sorting is covered by checkpoint_test.c, using real sort. */
+static int cd_catalog_sort(struct cd_catalog *catalog,FILE *input,FILE **output,
+    unsigned threads,unsigned index)
+{
+    assert(catalog->checkpoint==NULL&&index<2);
+    return cd_hybrid_sort_parallel(input,output,catalog->directory,threads,&cd_stop);
+}
+static int cd_checkpoint_report_save(struct cd_checkpoint *checkpoint,const char *path)
+{
+    (void)checkpoint;(void)path;
+    assert(!"checkpoint transport disabled in catalog fixture");return EINVAL;
+}
 #include "core.inc"
 static void cleanup(struct cd_catalog *c)
 {

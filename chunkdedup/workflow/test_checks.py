@@ -14,7 +14,7 @@ REQUIRED = (
     'cmd/zfs/rabin64_table.h', 'cmd/zfs/zfs_chunkdedup_user.c',
     'include/sys/zfs_chunkdedup.h', 'module/zfs/zfs_chunkdedup.c',
     'cmd/zfs/chunkdedup_hybrid.c', 'cmd/zfs/chunkdedup_hybrid.h',
-    'cmd/zfs/chunkdedup_parallel.h',
+    'cmd/zfs/chunkdedup_parallel.h', 'cmd/zfs/chunkdedup_checkpoint.h',
     'include/sys/dsl_pool.h', 'module/zfs/dsl_pool.c',
 )
 parser = argparse.ArgumentParser(description=__doc__)

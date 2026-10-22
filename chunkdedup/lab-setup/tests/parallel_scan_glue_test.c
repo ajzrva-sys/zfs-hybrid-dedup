@@ -30,7 +30,13 @@ typedef int boolean_t;
 #define ARRAY_SIZE(a) (sizeof (a) / sizeof ((a)[0]))
 enum cd_method { CD_METHOD_AUTO, CD_METHOD_BLOCK, CD_METHOD_CHUNK };
 static volatile sig_atomic_t cd_stop;
+/* This preexisting fixture deliberately runs with checkpoints disabled. */
+struct cd_checkpoint { FILE *streams[5]; int loaded; };
 #include SCAN_TYPES_SOURCE
+static void cd_checkpoint_close(struct cd_checkpoint *checkpoint)
+{ (void)checkpoint; assert(!"checkpoint transport disabled in scan glue fixture"); }
+static int cd_catalog_checkpoint_save(struct cd_catalog *catalog, boolean_t complete)
+{ (void)complete; assert(catalog->checkpoint == NULL); return 0; }
 
 static int cd_catalog_analyze(struct cd_catalog *, const char *, const char *,
     uint64_t, const struct stat *, boolean_t);

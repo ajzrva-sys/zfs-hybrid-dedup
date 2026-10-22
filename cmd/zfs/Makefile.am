@@ -11,6 +11,7 @@ zfs_SOURCES = \
 	%D%/chunkdedup_hybrid.c \
 	%D%/chunkdedup_hybrid.h \
 	%D%/chunkdedup_parallel.h \
+	%D%/chunkdedup_checkpoint.h \
 	%D%/chunkdedup_chunker.c \
 	%D%/chunkdedup_chunker.h \
 	%D%/rabin64_table.h \

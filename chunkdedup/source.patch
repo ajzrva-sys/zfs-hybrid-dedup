@@ -26,10 +26,10 @@ index 000000000..de43774a2
 +OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 +SOFTWARE.
 diff --git a/cmd/zfs/Makefile.am b/cmd/zfs/Makefile.am
-index 357b5b3f4..a8c37a94d 100644
+index 357b5b3f4..21829ceb6 100644
 --- a/cmd/zfs/Makefile.am
 +++ b/cmd/zfs/Makefile.am
-@@ -6,10 +6,21 @@ zfs_SOURCES = \
+@@ -6,10 +6,22 @@ zfs_SOURCES = \
  	%D%/zfs_iter.c \
  	%D%/zfs_iter.h \
  	%D%/zfs_main.c \
@@ -38,6 +38,7 @@ index 357b5b3f4..a8c37a94d 100644
 +	%D%/chunkdedup_hybrid.c \
 +	%D%/chunkdedup_hybrid.h \
 +	%D%/chunkdedup_parallel.h \
++	%D%/chunkdedup_checkpoint.h \
 +	%D%/chunkdedup_chunker.c \
 +	%D%/chunkdedup_chunker.h \
 +	%D%/rabin64_table.h \
@@ -51,7 +52,7 @@ index 357b5b3f4..a8c37a94d 100644
  zfs_LDADD = \
  	libzfs.la \
  	libzfs_core.la \
-@@ -21,3 +32,7 @@ zfs_LDADD += $(LTLIBINTL)
+@@ -21,3 +33,7 @@ zfs_LDADD += $(LTLIBINTL)
  if BUILD_FREEBSD
  zfs_LDADD += -lgeom -ljail
  endif
@@ -59,6 +60,655 @@ index 357b5b3f4..a8c37a94d 100644
 +zfs_LDADD += -lcrypto
 +
 +EXTRA_DIST = %D%/CHUNKDEDUP-MIT-LICENSE
+diff --git a/cmd/zfs/chunkdedup_checkpoint.h b/cmd/zfs/chunkdedup_checkpoint.h
+new file mode 100644
+index 000000000..3b15c1b6d
+--- /dev/null
++++ b/cmd/zfs/chunkdedup_checkpoint.h
+@@ -0,0 +1,643 @@
++/* SPDX-License-Identifier: CDDL-1.0 */
++#ifndef _CHUNKDEDUP_CHECKPOINT_H
++#define _CHUNKDEDUP_CHECKPOINT_H
++
++#include <sys/types.h>
++#include <sys/stat.h>
++#include <sys/file.h>
++#include <errno.h>
++#include <fcntl.h>
++#include <limits.h>
++#include <stdbool.h>
++#include <stddef.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <unistd.h>
++#ifdef __APPLE__
++#include <CommonCrypto/CommonDigest.h>
++#else
++#include <openssl/evp.h>
++#endif
++
++#define CD_CHECKPOINT_STREAMS 5
++#define CD_CHECKPOINT_BINDING_MAX 4096
++_Static_assert(sizeof (off_t) >= sizeof (int64_t), "64-bit checkpoint offsets required");
++
++/* This host-local format deliberately includes an ABI/schema binding supplied
++ * by the driver. Payloads are append-only; selection must use a separate copy
++ * of files.raw. Only a committed manifest authorizes a resumable prefix.
++ */
++struct cd_checkpoint_hash {
++#ifdef __APPLE__
++	CC_SHA256_CTX context;
++#else
++	EVP_MD_CTX *context;
++#endif
++	bool initialized;
++};
++
++struct cd_checkpoint {
++	FILE *streams[CD_CHECKPOINT_STREAMS];
++	bool loaded, complete;
++	uint64_t count, skipped;
++	unsigned sorted_mask;
++	int lockfd, dirfd;
++	/* Internal state: callers must not change committed prefixes or contexts. */
++	uint64_t sizes[CD_CHECKPOINT_STREAMS], hashed[CD_CHECKPOINT_STREAMS];
++	struct cd_checkpoint_hash hashes[CD_CHECKPOINT_STREAMS];
++	unsigned char binding[CD_CHECKPOINT_BINDING_MAX];
++	size_t binding_length;
++	bool initialized, failed;
++};
++
++struct cd_checkpoint_disk {
++	unsigned char magic[16];
++	uint32_t version, binding_length;
++	uint64_t count, skipped, complete, sorted_mask;
++	uint64_t sizes[CD_CHECKPOINT_STREAMS];
++	unsigned char hashes[CD_CHECKPOINT_STREAMS][32];
++	unsigned char binding[CD_CHECKPOINT_BINDING_MAX];
++	unsigned char checksum[32];
++};
++
++static const char *const cd_checkpoint_names[CD_CHECKPOINT_STREAMS] = {
++	"files.raw", "native.raw", "chunks.raw", "native.sorted", "chunks.sorted"
++};
++static const unsigned char cd_checkpoint_magic[16] = "CD-CHECKPOINT-1";
++
++static int
++cd_checkpoint_hash_init(struct cd_checkpoint_hash *hash)
++{
++#ifdef __APPLE__
++	if (CC_SHA256_Init(&hash->context) != 1)
++		return (EIO);
++#else
++	hash->context = EVP_MD_CTX_new();
++	if (hash->context == NULL)
++		return (ENOMEM);
++	if (EVP_DigestInit_ex(hash->context, EVP_sha256(), NULL) != 1) {
++		EVP_MD_CTX_free(hash->context);
++		hash->context = NULL;
++		return (EIO);
++	}
++#endif
++	hash->initialized = true;
++	return (0);
++}
++
++static int
++cd_checkpoint_hash_update(struct cd_checkpoint_hash *hash,
++    const void *data, size_t length)
++{
++#ifdef __APPLE__
++	if (length > UINT_MAX ||
++	    CC_SHA256_Update(&hash->context, data, (CC_LONG)length) != 1)
++		return (EIO);
++#else
++	if (EVP_DigestUpdate(hash->context, data, length) != 1)
++		return (EIO);
++#endif
++	return (0);
++}
++
++static int
++cd_checkpoint_hash_final(const struct cd_checkpoint_hash *hash,
++    unsigned char result[32])
++{
++#ifdef __APPLE__
++	CC_SHA256_CTX copy = hash->context;
++	return (CC_SHA256_Final(result, &copy) == 1 ? 0 : EIO);
++#else
++	EVP_MD_CTX *copy = EVP_MD_CTX_new();
++	if (copy == NULL)
++		return (ENOMEM);
++	unsigned int length = 0;
++	int success = EVP_MD_CTX_copy_ex(copy, hash->context) == 1 &&
++	    EVP_DigestFinal_ex(copy, result, &length) == 1 && length == 32;
++	EVP_MD_CTX_free(copy);
++	return (success ? 0 : EIO);
++#endif
++}
++
++static int
++cd_checkpoint_checksum(const struct cd_checkpoint_disk *disk,
++    unsigned char result[32])
++{
++	struct cd_checkpoint_hash hash = { 0 };
++	int error = cd_checkpoint_hash_init(&hash);
++	if (error == 0)
++		error = cd_checkpoint_hash_update(&hash, disk,
++		    offsetof(struct cd_checkpoint_disk, checksum));
++	if (error == 0)
++		error = cd_checkpoint_hash_final(&hash, result);
++#ifndef __APPLE__
++	EVP_MD_CTX_free(hash.context);
++#endif
++	return (error);
++}
++
++static int
++cd_checkpoint_regular(int fd)
++{
++	struct stat status;
++	if (fstat(fd, &status) != 0)
++		return (errno);
++	return (S_ISREG(status.st_mode) && status.st_uid == geteuid() &&
++	    (status.st_mode & 07777) == 0600 && status.st_nlink == 1 &&
++	    status.st_size >= 0 ? 0 : EPERM);
++}
++
++static int
++cd_checkpoint_read(int fd, void *buffer, size_t length, off_t offset)
++{
++	unsigned char *bytes = buffer;
++	while (length != 0) {
++		ssize_t amount = pread(fd, bytes, length, offset);
++		if (amount < 0 && errno == EINTR)
++			continue;
++		if (amount <= 0)
++			return (amount == 0 ? EIO : errno);
++		bytes += amount;
++		length -= (size_t)amount;
++		offset += amount;
++	}
++	return (0);
++}
++
++static int
++cd_checkpoint_hash_to(struct cd_checkpoint *cp, unsigned i, uint64_t size)
++{
++	unsigned char buffer[65536];
++	if (size > INT64_MAX || cp->hashed[i] > size)
++		return (EOVERFLOW);
++	while (cp->hashed[i] < size) {
++		uint64_t remaining = size - cp->hashed[i];
++		size_t amount = remaining < sizeof (buffer) ?
++		    (size_t)remaining : sizeof (buffer);
++		int error = cd_checkpoint_read(fileno(cp->streams[i]), buffer,
++		    amount, (off_t)cp->hashed[i]);
++		if (error == 0)
++			error = cd_checkpoint_hash_update(&cp->hashes[i], buffer, amount);
++		if (error != 0)
++			return (error);
++		cp->hashed[i] += amount;
++	}
++	return (0);
++}
++
++static void
++cd_checkpoint_close(struct cd_checkpoint *cp)
++{
++	if (!cp->initialized) {
++		memset(cp, 0, sizeof (*cp));
++		cp->lockfd = cp->dirfd = -1;
++		return;
++	}
++	for (unsigned i = 0; i < CD_CHECKPOINT_STREAMS; i++) {
++		if (cp->streams[i] != NULL)
++			(void) fclose(cp->streams[i]);
++#ifndef __APPLE__
++		if (cp->hashes[i].initialized)
++			EVP_MD_CTX_free(cp->hashes[i].context);
++#endif
++	}
++	if (cp->lockfd >= 0) {
++		(void) flock(cp->lockfd, LOCK_UN);
++		(void) close(cp->lockfd);
++	}
++	if (cp->dirfd >= 0)
++		(void) close(cp->dirfd);
++	memset(cp, 0, sizeof (*cp));
++	cp->lockfd = cp->dirfd = -1;
++}
++
++static int
++cd_checkpoint_parent_sync(const char *path)
++{
++	char *parent = strdup(path);
++	if (parent == NULL)
++		return (ENOMEM);
++	size_t length = strlen(parent);
++	while (length > 1 && parent[length - 1] == '/')
++		parent[--length] = '\0';
++	char *slash = strrchr(parent, '/');
++	const char *name = ".";
++	if (slash != NULL) {
++		slash[slash == parent ? 1 : 0] = '\0';
++		name = parent;
++	}
++	int fd = open(name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
++	int error = fd < 0 ? errno : 0;
++	if (error == 0 && fsync(fd) != 0)
++		error = errno;
++	if (fd >= 0)
++		(void) close(fd);
++	free(parent);
++	return (error);
++}
++
++struct cd_checkpoint_report_disk {
++	unsigned char magic[16];
++	uint64_t version, length;
++	unsigned char hash[32];
++};
++static const unsigned char cd_checkpoint_report_magic[16] = "CD-REPORT-1";
++
++static int
++cd_checkpoint_report_hash(const char *path, uint64_t *length,
++    unsigned char result[32])
++{
++	int fd = open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
++	if (fd < 0)
++		return (errno);
++	struct stat status;
++	int error = fstat(fd, &status) == 0 ? 0 : errno;
++	/* Publication uses link followed by unlink of the private report name.
++	 * A crash between them leaves two legitimate names for the same bytes.
++	 * Unlike checkpoint payloads/receipts, report data may therefore be linked;
++	 * ownership, private permissions and the recorded digest still must match.
++	 */
++	if (error == 0 && (!S_ISREG(status.st_mode) ||
++	    status.st_uid != geteuid() || (status.st_mode & 07777) != 0600 ||
++	    status.st_nlink < 1 || status.st_size < 0))
++		error = EPERM;
++	struct cd_checkpoint_hash hash = { 0 };
++	if (error == 0)
++		error = cd_checkpoint_hash_init(&hash);
++	uint64_t offset = 0;
++	unsigned char buffer[65536];
++	while (error == 0 && offset < (uint64_t)status.st_size) {
++		uint64_t remaining = (uint64_t)status.st_size - offset;
++		size_t amount = remaining < sizeof (buffer) ?
++		    (size_t)remaining : sizeof (buffer);
++		error = cd_checkpoint_read(fd, buffer, amount, (off_t)offset);
++		if (error == 0)
++			error = cd_checkpoint_hash_update(&hash, buffer, amount);
++		offset += amount;
++	}
++	if (error == 0) {
++		*length = (uint64_t)status.st_size;
++		error = cd_checkpoint_hash_final(&hash, result);
++	}
++#ifndef __APPLE__
++	if (hash.initialized)
++		EVP_MD_CTX_free(hash.context);
++#endif
++	(void) close(fd);
++	return (error);
++}
++
++static int
++cd_checkpoint_report_read(struct cd_checkpoint *cp,
++    struct cd_checkpoint_report_disk *receipt)
++{
++	int fd = openat(cp->dirfd, "report.receipt", O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
++	if (fd < 0)
++		return (errno);
++	int error = cd_checkpoint_regular(fd);
++	struct stat status;
++	if (error == 0 && fstat(fd, &status) != 0)
++		error = errno;
++	if (error == 0 && (uint64_t)status.st_size != sizeof (*receipt))
++		error = EILSEQ;
++	if (error == 0)
++		error = cd_checkpoint_read(fd, receipt, sizeof (*receipt), 0);
++	(void) close(fd);
++	if (error == 0 && (memcmp(receipt->magic, cd_checkpoint_report_magic, 16) != 0 ||
++	    receipt->version != 1 || receipt->length > INT64_MAX))
++		error = EILSEQ;
++	return (error);
++}
++
++/* The caller flushes/fsyncs/closes the private report before saving this
++ * receipt, and publishes that same report only after this call succeeds.
++ * A receipt alone never makes an absent published report ready.
++ */
++static inline int
++cd_checkpoint_report_save(struct cd_checkpoint *cp, const char *path)
++{
++	if (!cp->initialized || cp->failed || !cp->complete ||
++	    cp->dirfd < 0 || cp->lockfd < 0 || path == NULL)
++		return (EINVAL);
++	struct cd_checkpoint_report_disk previous;
++	int existing = cd_checkpoint_report_read(cp, &previous);
++	if (existing != 0 && existing != ENOENT)
++		return (existing);
++	struct cd_checkpoint_report_disk receipt;
++	memset(&receipt, 0, sizeof (receipt));
++	memcpy(receipt.magic, cd_checkpoint_report_magic, sizeof (receipt.magic));
++	receipt.version = 1;
++	int error = cd_checkpoint_report_hash(path, &receipt.length, receipt.hash);
++	char temporary[64] = { 0 };
++	int fd = -1;
++	if (error == 0) {
++		for (unsigned attempt = 0; attempt < 100; attempt++) {
++			(void) snprintf(temporary, sizeof (temporary),
++			    "report.receipt.tmp.%ld.%u", (long)getpid(), attempt);
++			fd = openat(cp->dirfd, temporary,
++			    O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
++			if (fd >= 0 || errno != EEXIST)
++				break;
++		}
++		if (fd < 0)
++			error = errno;
++	}
++	if (error == 0) {
++		const unsigned char *bytes = (const unsigned char *)&receipt;
++		size_t remaining = sizeof (receipt);
++		while (remaining != 0) {
++			ssize_t amount = write(fd, bytes, remaining);
++			if (amount < 0 && errno == EINTR)
++				continue;
++			if (amount <= 0) {
++				error = amount == 0 ? EIO : errno;
++				break;
++			}
++			bytes += amount;
++			remaining -= (size_t)amount;
++		}
++	}
++	if (error == 0 && fsync(fd) != 0)
++		error = errno;
++	if (fd >= 0 && close(fd) != 0 && error == 0)
++		error = errno;
++	if (error == 0 && renameat(cp->dirfd, temporary,
++	    cp->dirfd, "report.receipt") != 0)
++		error = errno;
++	if (error == 0 && fsync(cp->dirfd) != 0)
++		error = errno;
++	if (error != 0) {
++		if (fd >= 0 && temporary[0] != '\0')
++			(void) unlinkat(cp->dirfd, temporary, 0);
++		cp->failed = true;
++	}
++	return (error);
++}
++
++static inline int
++cd_checkpoint_report_validate(struct cd_checkpoint *cp, const char *path)
++{
++	if (!cp->initialized || cp->failed || !cp->complete ||
++	    cp->dirfd < 0 || cp->lockfd < 0 || path == NULL)
++		return (EINVAL);
++	struct cd_checkpoint_report_disk receipt;
++	int error = cd_checkpoint_report_read(cp, &receipt);
++	uint64_t length;
++	unsigned char hash[32];
++	if (error == 0)
++		error = cd_checkpoint_report_hash(path, &length, hash);
++	if (error == 0 && (length != receipt.length || memcmp(hash, receipt.hash, 32) != 0))
++		error = EILSEQ;
++	return (error);
++}
++
++/* A failed commit requires close/reopen before further writes/commits. Before
++ * rename the previous manifest remains authoritative. A directory-fsync error
++ * after rename leaves a valid, fully payload-synced new manifest; recovery may
++ * observe either complete prefix. No commit truncates or deletes payloads.
++ */
++static int
++cd_checkpoint_commit(struct cd_checkpoint *cp, uint64_t count,
++    uint64_t skipped, bool complete, unsigned sorted_mask)
++{
++	if (cp->failed || cp->dirfd < 0 || cp->lockfd < 0)
++		return (EINVAL);
++	struct cd_checkpoint_disk disk;
++	memset(&disk, 0, sizeof (disk));
++	memcpy(disk.magic, cd_checkpoint_magic, sizeof (disk.magic));
++	disk.version = 1;
++	disk.binding_length = (uint32_t)cp->binding_length;
++	memcpy(disk.binding, cp->binding, cp->binding_length);
++	disk.count = count;
++	disk.skipped = skipped;
++	disk.complete = complete;
++	disk.sorted_mask = sorted_mask;
++	int error = 0;
++	if (count < cp->count || skipped < cp->skipped ||
++	    (cp->complete && !complete) || sorted_mask > 3 ||
++	    (cp->complete && (count != cp->count || skipped != cp->skipped)) ||
++	    (sorted_mask & cp->sorted_mask) != cp->sorted_mask ||
++	    (!complete && sorted_mask != 0))
++		error = EINVAL;
++	for (unsigned i = 0; error == 0 && i < CD_CHECKPOINT_STREAMS; i++) {
++		if (cp->streams[i] == NULL) {
++			error = EINVAL;
++			break;
++		}
++		if (fflush(cp->streams[i]) != 0 ||
++		    fsync(fileno(cp->streams[i])) != 0) {
++			error = errno != 0 ? errno : EIO;
++			break;
++		}
++		error = cd_checkpoint_regular(fileno(cp->streams[i]));
++		struct stat status;
++		if (error == 0 && fstat(fileno(cp->streams[i]), &status) != 0)
++			error = errno;
++		if (error != 0)
++			break;
++		uint64_t size = (uint64_t)status.st_size;
++		if (size < cp->sizes[i] || (i < 3 && cp->complete &&
++		    size != cp->sizes[i]) || (i >= 3 &&
++		    (cp->sorted_mask & (1U << (i - 3))) != 0 &&
++		    size != cp->sizes[i])) {
++			error = ESTALE;
++			break;
++		}
++		if (i >= 3 && (sorted_mask & (1U << (i - 3))) == 0)
++			size = 0;
++		disk.sizes[i] = size;
++		error = cd_checkpoint_hash_to(cp, i, size);
++		if (error == 0)
++			error = cd_checkpoint_hash_final(&cp->hashes[i], disk.hashes[i]);
++	}
++	if (error == 0)
++		error = cd_checkpoint_checksum(&disk, disk.checksum);
++	char temporary[64] = { 0 };
++	int fd = -1;
++	if (error == 0) {
++		for (unsigned attempt = 0; attempt < 100; attempt++) {
++			(void) snprintf(temporary, sizeof (temporary),
++			    "manifest.tmp.%ld.%u", (long)getpid(), attempt);
++			fd = openat(cp->dirfd, temporary,
++			    O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
++			if (fd >= 0 || errno != EEXIST)
++				break;
++		}
++		if (fd < 0)
++			error = errno;
++	}
++	if (error == 0) {
++		const unsigned char *bytes = (const unsigned char *)&disk;
++		size_t remaining = sizeof (disk);
++		while (remaining != 0) {
++			ssize_t amount = write(fd, bytes, remaining);
++			if (amount < 0 && errno == EINTR)
++				continue;
++			if (amount <= 0) {
++				error = amount == 0 ? EIO : errno;
++				break;
++			}
++			bytes += amount;
++			remaining -= (size_t)amount;
++		}
++	}
++	if (error == 0 && fsync(fd) != 0)
++		error = errno;
++	if (fd >= 0 && close(fd) != 0 && error == 0)
++		error = errno;
++	if (error == 0 && renameat(cp->dirfd, temporary,
++	    cp->dirfd, "manifest") != 0)
++		error = errno;
++	if (error == 0) {
++		cp->count = count;
++		cp->skipped = skipped;
++		cp->complete = complete;
++		cp->sorted_mask = sorted_mask;
++		memcpy(cp->sizes, disk.sizes, sizeof (cp->sizes));
++		if (fsync(cp->dirfd) != 0)
++			error = errno;
++	}
++	if (error != 0) {
++		/* Remove only the unique temporary created by this attempt. */
++		if (fd >= 0 && temporary[0] != '\0')
++			(void) unlinkat(cp->dirfd, temporary, 0);
++		cp->failed = true;
++	}
++	return (error);
++}
++
++static int
++cd_checkpoint_open(struct cd_checkpoint *cp, const char *path,
++    const void *binding, size_t length)
++{
++	memset(cp, 0, sizeof (*cp));
++	cp->lockfd = cp->dirfd = -1;
++	cp->initialized = true;
++	/* A trailing slash would make the final named component intermediate for
++	 * O_NOFOLLOW. The driver supplies a canonical directory pathname.
++	 */
++	if (path == NULL || path[0] == '\0' || path[strlen(path) - 1] == '/' ||
++	    length > CD_CHECKPOINT_BINDING_MAX ||
++	    (length != 0 && binding == NULL))
++		return (EINVAL);
++	const char *basename = strrchr(path, '/');
++	basename = basename == NULL ? path : basename + 1;
++	if (strcmp(basename, ".") == 0 || strcmp(basename, "..") == 0)
++		return (EINVAL);
++	cp->binding_length = length;
++	if (length != 0)
++		memcpy(cp->binding, binding, length);
++	bool created = mkdir(path, 0700) == 0;
++	if (!created && errno != EEXIST)
++		return (errno);
++	cp->dirfd = open(path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
++	if (cp->dirfd < 0)
++		return (errno);
++	struct stat status;
++	int error = fstat(cp->dirfd, &status) == 0 ? 0 : errno;
++	if (error == 0 && (!S_ISDIR(status.st_mode) || status.st_uid != geteuid() ||
++	    (status.st_mode & 07777) != 0700))
++		error = EPERM;
++	if (error == 0) {
++		cp->lockfd = openat(cp->dirfd, "lock", O_RDWR | O_NOFOLLOW | O_CLOEXEC |
++		    (created ? O_CREAT | O_EXCL : 0), 0600);
++		if (cp->lockfd < 0)
++			error = errno;
++	}
++	if (error == 0)
++		error = cd_checkpoint_regular(cp->lockfd);
++	if (error == 0 && flock(cp->lockfd, LOCK_EX | LOCK_NB) != 0)
++		error = errno;
++	struct cd_checkpoint_disk disk;
++	memset(&disk, 0, sizeof (disk));
++	if (error == 0 && !created) {
++		int fd = openat(cp->dirfd, "manifest", O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
++		if (fd < 0)
++			error = errno;
++		else {
++			error = cd_checkpoint_regular(fd);
++			if (error == 0 && fstat(fd, &status) != 0)
++				error = errno;
++			if (error == 0 && (uint64_t)status.st_size != sizeof (disk))
++				error = EINVAL;
++			if (error == 0)
++				error = cd_checkpoint_read(fd, &disk, sizeof (disk), 0);
++			(void) close(fd);
++		}
++		unsigned char checksum[32];
++		if (error == 0)
++			error = cd_checkpoint_checksum(&disk, checksum);
++		if (error == 0 && (memcmp(disk.magic, cd_checkpoint_magic, 16) != 0 ||
++		    disk.version != 1 || disk.binding_length != length ||
++		    memcmp(disk.binding, cp->binding, length) != 0 ||
++		    memcmp(disk.checksum, checksum, 32) != 0 || disk.complete > 1 ||
++		    disk.sorted_mask > 3 || (!disk.complete && disk.sorted_mask != 0)))
++			error = EINVAL;
++	}
++	for (unsigned i = 0; error == 0 && i < CD_CHECKPOINT_STREAMS; i++) {
++		int fd = openat(cp->dirfd, cd_checkpoint_names[i],
++		    O_RDWR | O_APPEND | O_NOFOLLOW | O_CLOEXEC |
++		    (created ? O_CREAT | O_EXCL : 0), 0600);
++		if (fd < 0) {
++			error = errno;
++			break;
++		}
++		error = cd_checkpoint_regular(fd);
++		if (error == 0 && fstat(fd, &status) != 0)
++			error = errno;
++		if (error == 0 && (disk.sizes[i] > INT64_MAX ||
++		    (uint64_t)status.st_size < disk.sizes[i] ||
++		    (i >= 3 && (disk.sorted_mask & (1U << (i - 3))) == 0 &&
++		    disk.sizes[i] != 0)))
++			error = EINVAL;
++		if (error != 0) {
++			(void) close(fd);
++			break;
++		}
++		cp->streams[i] = fdopen(fd, "r+");
++		if (cp->streams[i] == NULL) {
++			error = errno;
++			(void) close(fd);
++			break;
++		}
++		error = cd_checkpoint_hash_init(&cp->hashes[i]);
++		if (error == 0)
++			error = cd_checkpoint_hash_to(cp, i, disk.sizes[i]);
++		unsigned char digest[32];
++		if (error == 0)
++			error = cd_checkpoint_hash_final(&cp->hashes[i], digest);
++		if (error == 0 && !created && memcmp(digest, disk.hashes[i], 32) != 0)
++			error = EILSEQ;
++	}
++	/* Do not discard even uncommitted tails until every committed payload and
++	 * the complete manifest/binding have validated successfully.
++	 */
++	for (unsigned i = 0; error == 0 && i < CD_CHECKPOINT_STREAMS; i++) {
++		if (fstat(fileno(cp->streams[i]), &status) != 0)
++			error = errno;
++		else if ((uint64_t)status.st_size > disk.sizes[i] &&
++		    ftruncate(fileno(cp->streams[i]), (off_t)disk.sizes[i]) != 0)
++			error = errno;
++		if (error == 0 &&
++		    fseeko(cp->streams[i], (off_t)disk.sizes[i], SEEK_SET) != 0)
++			error = errno;
++	}
++	if (error == 0) {
++		cp->count = disk.count;
++		cp->skipped = disk.skipped;
++		cp->complete = disk.complete != 0;
++		cp->sorted_mask = (unsigned)disk.sorted_mask;
++		memcpy(cp->sizes, disk.sizes, sizeof (cp->sizes));
++		cp->loaded = !created;
++		if (created)
++			error = cd_checkpoint_commit(cp, 0, 0, false, 0);
++		if (error == 0 && created)
++			error = cd_checkpoint_parent_sync(path);
++	}
++	if (error != 0)
++		cd_checkpoint_close(cp);
++	return (error);
++}
++#endif /* _CHUNKDEDUP_CHECKPOINT_H */
 diff --git a/cmd/zfs/chunkdedup_chunker.c b/cmd/zfs/chunkdedup_chunker.c
 new file mode 100644
 index 000000000..fe4dd83a5
@@ -456,10 +1106,10 @@ index 000000000..416e88e9b
 +#endif
 diff --git a/cmd/zfs/chunkdedup_hybrid.c b/cmd/zfs/chunkdedup_hybrid.c
 new file mode 100644
-index 000000000..4c1b17648
+index 000000000..bd5814a03
 --- /dev/null
 +++ b/cmd/zfs/chunkdedup_hybrid.c
-@@ -0,0 +1,488 @@
+@@ -0,0 +1,520 @@
 +/* SPDX-License-Identifier: CDDL-1.0 */
 +#include "chunkdedup_hybrid.h"
 +#include <sys/types.h>
@@ -763,9 +1413,9 @@ index 000000000..4c1b17648
 +	return (error);
 +}
 +
-+int
-+cd_hybrid_sort_parallel(FILE *input, FILE **output, const char *directory,
-+    unsigned int threads, const atomic_int *stop)
++static int
++cd_hybrid_sort_parallel_impl(FILE *input, FILE **output, const char *directory,
++    unsigned int threads, const atomic_int *stop, FILE *destination, int hold_fd)
 +{
 +	if (input == NULL || output == NULL || directory == NULL ||
 +	    threads == 0 || threads > CD_HYBRID_SORT_MAX_THREADS)
@@ -842,6 +1492,9 @@ index 000000000..4c1b17648
 +			goto done;
 +		}
 +		if (pid == 0) {
++			/* An orphan must retain the checkpoint lock until it exits. */
++			if (hold_fd >= 0 && fcntl(hold_fd, F_SETFD, 0) != 0)
++				_exit(126);
 +			if (dup2(runs[i].pipe[0], STDIN_FILENO) < 0 ||
 +			    dup2(runs[i].fd, STDOUT_FILENO) < 0)
 +				_exit(126);
@@ -876,13 +1529,13 @@ index 000000000..4c1b17648
 +	}
 +	if (error != 0 || (error = cd_sort_wait(runs, threads, stop)) != 0)
 +		goto done;
-+	if (threads == 1) {
++	if (threads == 1 && destination == NULL) {
 +		sorted = fopen(runs[0].path, "r+");
 +		if (sorted == NULL)
 +			error = errno;
 +		goto done;
 +	}
-+	sorted = tmpfile();
++	sorted = destination != NULL ? destination : tmpfile();
 +	if (sorted == NULL) {
 +		error = errno;
 +		goto done;
@@ -893,6 +1546,8 @@ index 000000000..4c1b17648
 +		goto done;
 +	}
 +	if (pid == 0) {
++		if (hold_fd >= 0 && fcntl(hold_fd, F_SETFD, 0) != 0)
++			_exit(126);
 +		if (dup2(fileno(sorted), STDOUT_FILENO) < 0 ||
 +		    setenv("LC_ALL", "C", 1) != 0 ||
 +		    setenv("TMPDIR", temporary, 1) != 0)
@@ -941,19 +1596,46 @@ index 000000000..4c1b17648
 +	if (error == 0 && fseeko(sorted, 0, SEEK_SET) != 0)
 +		error = errno;
 +	if (error != 0) {
-+		if (sorted != NULL)
++		if (sorted != NULL && sorted != destination)
 +			(void) fclose(sorted);
 +		return (error);
 +	}
 +	*output = sorted;
 +	return (0);
 +}
++
++int
++cd_hybrid_sort_parallel(FILE *input, FILE **output, const char *directory,
++    unsigned int threads, const atomic_int *stop)
++{
++	return (cd_hybrid_sort_parallel_impl(input, output, directory, threads,
++	    stop, NULL, -1));
++}
++
++/* The caller owns the durable destination, including failed partial output. */
++int
++cd_hybrid_sort_parallel_to(FILE *input, FILE *destination,
++    const char *directory, unsigned int threads, const atomic_int *stop,
++    int hold_fd)
++{
++	if (destination == NULL)
++		return (EINVAL);
++	/* Keep the inherited lock clear of stdin/stdout even when either is closed. */
++	int lock = fcntl(hold_fd, F_DUPFD_CLOEXEC, STDERR_FILENO + 1);
++	if (lock < 0)
++		return (errno);
++	FILE *output = NULL;
++	int error = cd_hybrid_sort_parallel_impl(input, &output, directory, threads,
++	    stop, destination, lock);
++	(void) close(lock);
++	return (error);
++}
 diff --git a/cmd/zfs/chunkdedup_hybrid.h b/cmd/zfs/chunkdedup_hybrid.h
 new file mode 100644
-index 000000000..e7caf2fec
+index 000000000..15f6b71e3
 --- /dev/null
 +++ b/cmd/zfs/chunkdedup_hybrid.h
-@@ -0,0 +1,27 @@
+@@ -0,0 +1,29 @@
 +/* SPDX-License-Identifier: CDDL-1.0 */
 +#ifndef CHUNKDEDUP_HYBRID_H
 +#define CHUNKDEDUP_HYBRID_H
@@ -977,6 +1659,8 @@ index 000000000..e7caf2fec
 +int cd_hybrid_sort(FILE *, FILE **, const char *);
 +int cd_hybrid_sort_parallel(FILE *, FILE **, const char *, unsigned int,
 +    const atomic_int *);
++int cd_hybrid_sort_parallel_to(FILE *, FILE *, const char *, unsigned int,
++    const atomic_int *, int);
 +int cd_hybrid_add(uint64_t *, uint64_t);
 +int cd_hybrid_alloc(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t,
 +    uint64_t *);
@@ -2562,10 +3246,10 @@ index 000000000..ca6194770
 +}
 diff --git a/cmd/zfs/zfs_chunkdedup_user.c b/cmd/zfs/zfs_chunkdedup_user.c
 new file mode 100644
-index 000000000..708e05258
+index 000000000..153a311eb
 --- /dev/null
 +++ b/cmd/zfs/zfs_chunkdedup_user.c
-@@ -0,0 +1,2782 @@
+@@ -0,0 +1,3102 @@
 +/* SPDX-License-Identifier: CDDL-1.0 */
 +/* Native, bounded, post-process chunk deduplication worker. */
 +#include <sys/types.h>
@@ -2591,6 +3275,7 @@ index 000000000..708e05258
 +#include "chunkdedup_chunker.h"
 +#include "chunkdedup_hybrid.h"
 +#include "chunkdedup_parallel.h"
++#include "chunkdedup_checkpoint.h"
 +#ifdef __APPLE__
 +#include <CommonCrypto/CommonDigest.h>
 +#else
@@ -2895,6 +3580,8 @@ index 000000000..708e05258
 +	char report_temporary[PATH_MAX];
 +	char directory[PATH_MAX];
 +	uint64_t count, processed, skipped;
++	struct cd_checkpoint *checkpoint;
++	time_t checkpoint_at;
 +	uint64_t seen_capacity;
 +	enum cd_method method;
 +	boolean_t watch;
@@ -3721,6 +4408,8 @@ index 000000000..708e05258
 +	if (fclose(c->report) != 0 && error == 0)
 +		error = errno != 0 ? errno : EIO;
 +	c->report = NULL;
++	if (error == 0 && c->checkpoint != NULL)
++		error = cd_checkpoint_report_save(c->checkpoint, c->report_temporary);
 +	if (error == 0 && link(c->report_temporary, c->report_path) != 0)
 +		error = errno;
 +	if (error == 0 && unlink(c->report_temporary) != 0)
@@ -3733,22 +4422,273 @@ index 000000000..708e05258
 +	return (error);
 +}
 +
++/* CHECKPOINT_DRIVER_BEGIN */
++/* Bind reusable bytes to one target and to the on-disk record interpretation. */
++struct cd_checkpoint_binding {
++	uint64_t version, record_size, stat_size, dataset_guid, pool_guid;
++	uint64_t device, object, age, method, recursive;
++	char dataset[ZFS_MAX_DATASET_NAME_LEN];
++	char target[PATH_MAX], report[PATH_MAX];
++};
++
++static int
++cd_checkpoint_location(const char *path, char *location, size_t size)
++{
++	if (realpath(path, location) != NULL)
++		return (0);
++	if (errno != ENOENT)
++		return (errno);
++	char parent[PATH_MAX], resolved[PATH_MAX];
++	if (strlcpy(parent, path, sizeof (parent)) >= sizeof (parent))
++		return (ENAMETOOLONG);
++	char *slash = strrchr(parent, '/');
++	const char *base = slash != NULL ? slash + 1 : path;
++	if (base[0] == '\0' || strcmp(base, ".") == 0 || strcmp(base, "..") == 0)
++		return (EINVAL);
++	char name[PATH_MAX];
++	(void) strlcpy(name, base, sizeof (name));
++	if (slash != NULL)
++		slash[slash == parent ? 1 : 0] = '\0';
++	else
++		(void) strlcpy(parent, ".", sizeof (parent));
++	if (realpath(parent, resolved) == NULL)
++		return (errno);
++	int length = snprintf(location, size, "%s%s%s", resolved,
++	    strcmp(resolved, "/") == 0 ? "" : "/", name);
++	return (length < 0 || (size_t)length >= size ? ENAMETOOLONG : 0);
++}
++
++static int
++cd_catalog_checkpoint_save(struct cd_catalog *c, boolean_t complete)
++{
++	if (c->checkpoint == NULL)
++		return (0);
++	int error = cd_checkpoint_commit(c->checkpoint, c->count, c->skipped,
++	    complete, c->checkpoint->sorted_mask);
++	if (error == 0) {
++		c->checkpoint_at = time(NULL);
++		(void) printf("checkpoint: scan=%s files=%" PRIu64 "\n",
++		    complete ? "complete" : "partial", c->count);
++		(void) fflush(stdout);
++	}
++	return (error);
++}
++
++static int
++cd_catalog_checkpoint_open(struct cd_catalog *c, const char *directory,
++    zfs_handle_t *zhp, const char *path, uint64_t age, boolean_t recursive)
++{
++	struct cd_checkpoint_binding binding = { .version = 1,
++	    .record_size = sizeof (struct cd_catalog_file),
++	    .stat_size = sizeof (struct stat), .age = age,
++	    .method = c->method, .recursive = recursive };
++	struct stat root;
++	if (realpath(path, binding.target) == NULL ||
++	    lstat(binding.target, &root) != 0)
++		return (errno);
++	binding.device = root.st_dev;
++	binding.object = root.st_ino;
++	char location[PATH_MAX];
++	int error = cd_checkpoint_location(directory, location, sizeof (location));
++	if (error != 0)
++		return (error);
++	size_t root_length = strlen(binding.target);
++	if (strncmp(location, binding.target, root_length) == 0 &&
++	    (root_length == 1 || location[root_length] == '\0' ||
++	    location[root_length] == '/'))
++		return (EINVAL);
++	if (strlcpy(binding.dataset, zfs_get_name(zhp),
++	    sizeof (binding.dataset)) >= sizeof (binding.dataset) ||
++	    (c->report_path != NULL && strlcpy(binding.report, c->report_path,
++	    sizeof (binding.report)) >= sizeof (binding.report)))
++		return (ENAMETOOLONG);
++	if (zfs_prop_get_numeric(zhp, ZFS_PROP_GUID, &binding.dataset_guid,
++	    NULL, NULL, 0) != 0)
++		return (EIO);
++	zpool_handle_t *pool = zfs_get_pool_handle(zhp);
++	if (pool == NULL)
++		return (EIO);
++	binding.pool_guid = zpool_get_prop_int(pool, ZPOOL_PROP_GUID, NULL);
++	struct cd_checkpoint *checkpoint = calloc(1, sizeof (*checkpoint));
++	if (checkpoint == NULL)
++		return (ENOMEM);
++	(void) printf("checkpoint: validating=%s\n", directory);
++	(void) fflush(stdout);
++	error = cd_checkpoint_open(checkpoint, directory, &binding,
++	    sizeof (binding));
++	if (error != 0) {
++		cd_checkpoint_close(checkpoint);
++		free(checkpoint);
++		return (error);
++	}
++	c->checkpoint = checkpoint;
++	(void) fclose(c->files);
++	(void) fclose(c->blocks);
++	(void) fclose(c->chunks);
++	c->files = checkpoint->streams[0];
++	c->blocks = checkpoint->streams[1];
++	c->chunks = checkpoint->streams[2];
++	c->skipped = checkpoint->skipped;
++	if (checkpoint->count > INT64_MAX / sizeof (struct cd_catalog_file))
++		return (EOVERFLOW);
++	struct stat stored;
++	if (fstat(fileno(c->files), &stored) != 0)
++		return (errno);
++	if ((uint64_t)stored.st_size != checkpoint->count *
++	    sizeof (struct cd_catalog_file))
++		return (EPROTO);
++	if (fseeko(c->files, 0, SEEK_SET) != 0)
++		return (errno);
++	/* Validate metadata only. Never read file contents to validate a resume. */
++	for (uint64_t i = 0; i < checkpoint->count; i++) {
++		struct cd_catalog_file file;
++		struct stat current;
++		if (cd_stop)
++			return (ECANCELED);
++		if (fread(&file, sizeof (file), 1, c->files) != 1)
++			return (EIO);
++		if (memchr(file.path, '\0', sizeof (file.path)) == NULL ||
++		    memchr(file.dataset, '\0', sizeof (file.dataset)) == NULL ||
++		    strcmp(file.dataset, binding.dataset) != 0 || file.parent != i ||
++		    file.identity.st_dev != root.st_dev ||
++		    strncmp(file.path, binding.target, root_length) != 0 ||
++		    (root_length != 1 && file.path[root_length] != '\0' &&
++		    file.path[root_length] != '/'))
++			return (EPROTO);
++		if (lstat(file.path, &current) != 0)
++			return (errno);
++		if (!S_ISREG(current.st_mode) ||
++		    current.st_dev != file.identity.st_dev ||
++		    current.st_ino != file.identity.st_ino ||
++		    current.st_size != file.identity.st_size ||
++		    current.st_mtime != file.identity.st_mtime
++#ifdef __FreeBSD__
++		    || current.st_gen != file.identity.st_gen ||
++		    current.st_mtim.tv_nsec != file.identity.st_mtim.tv_nsec
++#endif
++		    )
++			return (ESTALE);
++		if (!checkpoint->complete) {
++			boolean_t duplicate;
++			error = cd_catalog_seen(c, &file.identity, B_TRUE, &duplicate);
++			if (error != 0 || duplicate)
++				return (error != 0 ? error : EPROTO);
++		}
++		c->count++;
++	}
++	FILE *raw[] = { c->files, c->blocks, c->chunks };
++	for (size_t i = 0; i < ARRAY_SIZE(raw); i++) {
++		if (fseeko(raw[i], 0, SEEK_END) != 0)
++			return (errno);
++	}
++	(void) printf("checkpoint: %s scan=%s files=%" PRIu64 "\n",
++	    checkpoint->loaded ? "resumed" : "created",
++	    checkpoint->complete ? "complete" : "partial", c->count);
++	(void) fflush(stdout);
++	return (0);
++}
++
++static int
++cd_catalog_checkpoint_report(struct cd_catalog *c, const char *path)
++{
++	if (path != NULL && c->checkpoint != NULL &&
++	    c->checkpoint->loaded && c->checkpoint->complete) {
++		struct stat st;
++		if (lstat(path, &st) == 0) {
++			if (!S_ISREG(st.st_mode) || st.st_uid != geteuid())
++				return (EPERM);
++			int error = cd_checkpoint_report_validate(c->checkpoint, path);
++			if (error != 0)
++				return (error);
++			(void) printf("checkpoint: preserved_report=%s\n", path);
++			c->report_path = NULL;
++			return (0);
++		}
++		if (errno != ENOENT)
++			return (errno);
++	}
++	return (cd_catalog_report_init(c, path));
++}
++
++/* Selection mutates parents and estimates; never mutate the durable scan. */
++static int
++cd_catalog_checkpoint_work(struct cd_catalog *c)
++{
++	if (c->checkpoint == NULL)
++		return (0);
++	if (!c->checkpoint->complete)
++		return (EPROTO);
++	FILE *working = tmpfile();
++	if (working == NULL)
++		return (errno);
++	int error = fseeko(c->files, 0, SEEK_SET) != 0 ? errno : 0;
++	unsigned char buffer[65536];
++	while (error == 0 && !cd_stop) {
++		size_t count = fread(buffer, 1, sizeof (buffer), c->files);
++		if (count != 0 && fwrite(buffer, 1, count, working) != count)
++			error = errno != 0 ? errno : EIO;
++		if (count != sizeof (buffer)) {
++			if (ferror(c->files))
++				error = EIO;
++			break;
++		}
++	}
++	if (error == 0 && cd_stop)
++		error = ECANCELED;
++	if (error == 0 && fseeko(working, 0, SEEK_SET) != 0)
++		error = errno;
++	if (error != 0)
++		(void) fclose(working);
++	else
++		c->files = working;
++	return (error);
++}
++
++static int
++cd_catalog_sort(struct cd_catalog *c, FILE *input, FILE **output,
++    unsigned int threads, unsigned int index)
++{
++	if (index > 1)
++		return (EINVAL);
++	struct cd_checkpoint *checkpoint = c->checkpoint;
++	if (checkpoint == NULL)
++		return (cd_hybrid_sort_parallel(input, output, c->directory,
++		    threads, &cd_stop));
++	unsigned int bit = 1U << index;
++	FILE *destination = checkpoint->streams[3 + index];
++	int error;
++	if ((checkpoint->sorted_mask & bit) != 0) {
++		error = fseeko(destination, 0, SEEK_SET) != 0 ? errno : 0;
++		if (error == 0)
++			(void) printf("checkpoint: reused_sort=%s\n",
++			    index == 0 ? "native" : "chunk");
++	} else {
++		error = cd_hybrid_sort_parallel_to(input, destination,
++		    c->directory, threads, &cd_stop, checkpoint->lockfd);
++		if (error == 0)
++			error = cd_checkpoint_commit(checkpoint, checkpoint->count,
++			    checkpoint->skipped, 1, checkpoint->sorted_mask | bit);
++	}
++	if (error == 0)
++		*output = destination;
++	return (error);
++}
++/* CHECKPOINT_DRIVER_END */
++
 +static int
 +cd_catalog_select(struct cd_catalog *c, unsigned int threads)
 +{
 +	time_t started = time(NULL);
 +	(void) printf("catalog: sorting=native workers=%u\n", threads);
 +	(void) fflush(stdout);
-+	int error = cd_hybrid_sort_parallel(c->blocks, &c->sorted_blocks,
-+	    c->directory, threads, &cd_stop);
++	int error = cd_catalog_sort(c, c->blocks, &c->sorted_blocks, threads, 0);
 +	if (error == 0) {
 +		(void) printf("catalog: sorted=native seconds=%jd\n",
 +		    (intmax_t)(time(NULL) - started));
 +		(void) printf("catalog: sorting=chunk workers=%u\n", threads);
 +		(void) fflush(stdout);
 +		started = time(NULL);
-+		error = cd_hybrid_sort_parallel(c->chunks, &c->sorted_chunks,
-+		    c->directory, threads, &cd_stop);
++		error = cd_catalog_sort(c, c->chunks, &c->sorted_chunks, threads, 1);
 +		if (error == 0) {
 +			(void) printf("catalog: sorted=chunk seconds=%jd\n",
 +			    (intmax_t)(time(NULL) - started));
@@ -3893,8 +4833,13 @@ index 000000000..708e05258
 +	struct cd_catalog_file source;
 +	boolean_t have = B_FALSE;
 +	int source_fd = -1, error;
-+	while (!cd_stop && (error = cd_catalog_next(c->sorted_blocks,
-+	    &item)) == 0) {
++	while (!cd_stop) {
++		error = cd_catalog_next(c->sorted_blocks, &item);
++		if (error != 0) {
++			if (error == ENOENT)
++				error = 0;
++			break;
++		}
 +		struct cd_catalog_file destination;
 +		if ((error = cd_catalog_record(c, item.file, &destination,
 +		    B_FALSE)) != 0)
@@ -3982,14 +4927,14 @@ index 000000000..708e05258
 +	}
 +	if (source_fd >= 0)
 +		(void) close(source_fd);
-+	return (cd_stop || error == ENOENT ? 0 : error);
++	return (cd_stop ? 0 : error);
 +}
 +
 +#ifndef CD_SHARE_MAX_ITEMS
 +#define	CD_SHARE_MAX_ITEMS	8192U
 +#endif
 +#ifndef CD_SHARE_SNAPSHOT_LIMIT
-+#define	CD_SHARE_SNAPSHOT_LIMIT	(UINT64_C(1) << 30)
++#define	CD_SHARE_SNAPSHOT_LIMIT	(UINT64_C(8) << 30)
 +#endif
 +#ifndef CD_SHARE_PROGRESS_SECONDS
 +#define	CD_SHARE_PROGRESS_SECONDS	30
@@ -4369,7 +5314,7 @@ index 000000000..708e05258
 +static int
 +cd_share_result(int error)
 +{
-+	return (cd_stop || error == ENOENT ? 0 : error);
++	return (cd_stop ? 0 : error);
 +}
 +
 +static int
@@ -4627,8 +5572,17 @@ index 000000000..708e05258
 +	FILE *streams[] = { c->files, c->blocks, c->chunks,
 +	    c->sorted_blocks, c->sorted_chunks, c->seen };
 +	for (size_t i = 0; i < ARRAY_SIZE(streams); i++) {
-+		if (streams[i] != NULL)
++		boolean_t borrowed = B_FALSE;
++		if (c->checkpoint != NULL) {
++			for (size_t j = 0; j < 5; j++)
++				borrowed |= streams[i] == c->checkpoint->streams[j];
++		}
++		if (streams[i] != NULL && !borrowed)
 +			(void) fclose(streams[i]);
++	}
++	if (c->checkpoint != NULL) {
++		cd_checkpoint_close(c->checkpoint);
++		free(c->checkpoint);
 +	}
 +	if (c->directory[0] != '\0')
 +	{
@@ -4755,6 +5709,10 @@ index 000000000..708e05258
 +	    fwrite(&file, sizeof (file), 1, c->files) != 1)
 +		return (errno != 0 ? errno : EIO);
 +	c->count++;
++	/* Only whole, merged files become durable; active jobs stay private. */
++	if (c->checkpoint != NULL && (c->checkpoint_at == 0 ||
++	    difftime(time(NULL), c->checkpoint_at) >= 60))
++		return (cd_catalog_checkpoint_save(c, B_FALSE));
 +	return (0);
 +}
 +
@@ -4838,7 +5796,9 @@ index 000000000..708e05258
 +	if (error != 0)
 +		return (error);
 +	if (duplicate) {
-+		c->skipped++;
++		/* Saved files are reused work, not newly skipped source files. */
++		if (c->checkpoint == NULL || !c->checkpoint->loaded)
++			c->skipped++;
 +		return (0);
 +	}
 +	if (cd_parallel_full(&scan->parallel) &&
@@ -5007,31 +5967,37 @@ index 000000000..708e05258
 +static int
 +cd_pass(const char *op, boolean_t recursive, uint64_t age, int argc,
 +    char **argv, boolean_t watch, enum cd_method method, boolean_t methods,
-+    unsigned int threads, const char *report_path)
++    unsigned int threads, const char *report_path, const char *checkpoint_path)
 +{
 +	uint64_t processed = 0, skipped = 0;
 +	int ret = 0;
 +	boolean_t optimize = strcmp(op, "optimize") == 0;
 +	struct cd_catalog catalog = { 0 };
 +	struct cd_scan scan = { 0 };
++	boolean_t scan_started = B_FALSE;
 +	if (optimize) {
 +		int error = cd_catalog_init(&catalog, method, watch);
-+		if (error == 0)
++		catalog.report_path = report_path;
++		if (error == 0 && checkpoint_path == NULL)
 +			error = cd_catalog_report_init(&catalog, report_path);
 +		if (error != 0) {
 +			(void) fprintf(stderr, "catalog: %s\n", strerror(error));
 +			cd_catalog_fini(&catalog);
 +			return (1);
 +		}
-+		error = cd_scan_init(&scan, &catalog, age, threads);
++		if (checkpoint_path == NULL)
++			error = cd_scan_init(&scan, &catalog, age, threads);
 +		if (error != 0) {
 +			(void) fprintf(stderr, "scan workers: %s\n", strerror(error));
 +			cd_catalog_fini(&catalog);
 +			return (1);
 +		}
-+		(void) printf("optimize: scan_threads=%u max_inflight=%zu\n",
-+		    threads, scan.parallel.capacity);
-+		(void) fflush(stdout);
++		if (checkpoint_path == NULL) {
++			scan_started = B_TRUE;
++			(void) printf("optimize: scan_threads=%u max_inflight=%zu\n",
++			    threads, scan.parallel.capacity);
++			(void) fflush(stdout);
++		}
 +	}
 +	boolean_t readonly = strcmp(op, "status") == 0 ||
 +	    strcmp(op, "verify") == 0;
@@ -5103,6 +6069,27 @@ index 000000000..708e05258
 +		} else if (!dataset_target) {
 +			(void) strlcpy(path, argv[i], sizeof (path));
 +		}
++		if (checkpoint_path != NULL) {
++			char canonical[PATH_MAX];
++			if (realpath(path, canonical) == NULL) {
++				error = errno;
++				goto target_done;
++			}
++			(void) strlcpy(path, canonical, sizeof (path));
++			error = cd_catalog_checkpoint_open(&catalog, checkpoint_path,
++			    zhp, path, age, recursive);
++			if (error == 0)
++				error = cd_catalog_checkpoint_report(&catalog, report_path);
++			if (error != 0 || catalog.checkpoint->complete)
++				goto target_done;
++			error = cd_scan_init(&scan, &catalog, age, threads);
++			if (error != 0)
++				goto target_done;
++			scan_started = B_TRUE;
++			(void) printf("optimize: scan_threads=%u max_inflight=%zu\n",
++			    threads, scan.parallel.capacity);
++			(void) fflush(stdout);
++		}
 +		char *paths[] = { path, NULL };
 +		FTS *tree = fts_open(paths,
 +		    FTS_PHYSICAL | FTS_NOCHDIR | FTS_XDEV, NULL);
@@ -5163,10 +6150,19 @@ index 000000000..708e05258
 +			break;
 +	}
 +	if (optimize) {
-+		cd_scan_fini(&scan);
++		if (scan_started)
++			cd_scan_fini(&scan);
 +		/* Discovery failures never leave a partially selected pass installed. */
 +		if (ret == 0 && !cd_stop) {
-+			int error = cd_catalog_retry(&catalog, age);
++			int error = 0;
++			if (catalog.checkpoint == NULL ||
++			    !catalog.checkpoint->complete) {
++				error = cd_catalog_retry(&catalog, age);
++				if (error == 0 && !cd_stop)
++					error = cd_catalog_checkpoint_save(&catalog, B_TRUE);
++			}
++			if (error == 0 && !cd_stop)
++				error = cd_catalog_checkpoint_work(&catalog);
 +			if (error == 0 && !cd_stop)
 +				error = cd_catalog_apply(&catalog, age, threads);
 +			if (error != 0) {
@@ -5213,7 +6209,7 @@ index 000000000..708e05258
 +	(void) fflush(stdout);
 +	while (!cd_stop) {
 +		(void) cd_pass("optimize", B_TRUE, age, argc, argv, B_TRUE,
-+		    method, B_FALSE, threads, NULL);
++		    method, B_FALSE, threads, NULL, NULL);
 +		if (cd_stop)
 +			break;
 +		struct timespec delay = { .tv_sec = (time_t)interval };
@@ -5241,7 +6237,7 @@ index 000000000..708e05258
 +		(void) fprintf(stderr, "usage: zfs chunkdedup "
 +		    "<optimize|status|verify|unoptimize> [-r] [--min-age days] "
 +		    "[--method auto|block|chunk] [--methods] "
-+		    "[--threads 1..64] [--report PATH] "
++		    "[--threads 1..64] [--report PATH] [--checkpoint DIR] "
 +		    "<dataset|path>...\n"
 +		    "       zfs chunkdedup watch [--interval seconds] "
 +		    "[--min-age days] [--method auto|block|chunk] "
@@ -5256,6 +6252,7 @@ index 000000000..708e05258
 +	boolean_t recursive = B_FALSE;
 +	boolean_t methods = B_FALSE;
 +	const char *report_path = NULL;
++	const char *checkpoint_path = NULL;
 +	enum cd_method method = CD_METHOD_AUTO;
 +	uint64_t age = 3, interval = 3600;
 +	long online = sysconf(_SC_NPROCESSORS_ONLN);
@@ -5268,11 +6265,12 @@ index 000000000..708e05258
 +		{ "methods", no_argument, NULL, 'M' },
 +		{ "threads", required_argument, NULL, 't' },
 +		{ "report", required_argument, NULL, 'R' },
++		{ "checkpoint", required_argument, NULL, 'C' },
 +		{ NULL, 0, NULL, 0 }
 +	};
 +	int c;
 +	optind = 2;
-+	while ((c = getopt_long(argc, argv, "+ra:i:m:Mt:R:", options, NULL)) != -1) {
++	while ((c = getopt_long(argc, argv, "+ra:i:m:Mt:R:C:", options, NULL)) != -1) {
 +		if (c == 'r') {
 +			if (watch)
 +				return (2);
@@ -5292,6 +6290,10 @@ index 000000000..708e05258
 +			if (watch || strcmp(op, "optimize") != 0 || optarg[0] == '\0')
 +				return (2);
 +			report_path = optarg;
++		} else if (c == 'C') {
++			if (watch || strcmp(op, "optimize") != 0 || optarg[0] == '\0')
++				return (2);
++			checkpoint_path = optarg;
 +		} else if (c == 'M') {
 +			if (strcmp(op, "status") != 0)
 +				return (2);
@@ -5323,6 +6325,8 @@ index 000000000..708e05258
 +	}
 +	if (optind == argc)
 +		return (2);
++	if (checkpoint_path != NULL && argc - optind != 1)
++		return (2);
 +	if (watch)
 +		return (cd_watch(age, interval, argc - optind, argv + optind,
 +		    method, threads));
@@ -5339,7 +6343,7 @@ index 000000000..708e05258
 +		}
 +	}
 +	int result = cd_pass(op, recursive, age, argc - optind, argv + optind,
-+	    B_FALSE, method, methods, threads, report_path);
++	    B_FALSE, method, methods, threads, report_path, checkpoint_path);
 +	if (optimize) {
 +		(void) sigaction(SIGINT, &old_int, NULL);
 +		(void) sigaction(SIGTERM, &old_term, NULL);

@@ -7,6 +7,10 @@
 #define _POSIX_C_SOURCE 200809L
 #include <sys/types.h>
 #include <sys/stat.h>
+#include <sys/resource.h>
+#ifdef __FreeBSD__
+#include <sys/sysctl.h>
+#endif
 #include <assert.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -49,6 +53,8 @@ static unsigned opened[FILES], open_total, close_total, peak_open;
 static unsigned calls, active_calls, peak_calls, finished_calls;
 static unsigned record_calls, fail_record_at, fail_alloc_at, alloc_calls;
 static unsigned thread_creations, fail_thread_at, outstanding_allocations;
+static size_t largest_allocation;
+static int reject_large_allocation, native_large_mode, native_resource_abort;
 static void *allocations[1024];
 static int open_error[FILES], ioctl_error[FILES], stale_file = -1;
 static int pool_error, enabled = 1, enabled_error;
@@ -64,6 +70,25 @@ static size_t output_used, error_used;
 static pthread_t coordinator;
 static pthread_mutex_t fixture_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t fixture_changed = PTHREAD_COND_INITIALIZER;
+
+static uint64_t fixture_free_memory(void)
+{
+#ifdef __FreeBSD__
+    union { uint32_t small; uint64_t large; } pages = {0};
+    unsigned int page_size = 0;
+    size_t size = sizeof (pages);
+    if (sysctlbyname("vm.stats.vm.v_free_count", &pages, &size, NULL, 0) != 0)
+        return 0;
+    uint64_t count = size == sizeof (pages.small) ? pages.small : pages.large;
+    size = sizeof (page_size);
+    if (sysctlbyname("hw.pagesize", &page_size, &size, NULL, 0) != 0 ||
+        !page_size || count > UINT64_MAX / page_size)
+        return 0;
+    return count * page_size;
+#else
+    return 0;
+#endif
+}
 
 static int fixture_thread_create(pthread_t *thread, const pthread_attr_t *attributes,
     void *(*callback)(void *), void *argument)
@@ -198,6 +223,11 @@ static int fixture_record(struct cd_catalog *catalog, uint64_t id,
 {
     assert(pthread_equal(pthread_self(), coordinator));
     record_calls++;
+    if (native_large_mode && record_calls % 65536 == 0 &&
+        fixture_free_memory() < (UINT64_C(8) << 30)) {
+        native_resource_abort = 1;
+        return ENOMEM;
+    }
     if (fail_record_at && record_calls == fail_record_at) return EIO;
     return cd_catalog_record(catalog, id, file, write);
 }
@@ -205,6 +235,8 @@ static int fixture_record(struct cd_catalog *catalog, uint64_t id,
 static void *fixture_malloc(size_t size)
 {
     alloc_calls++;
+    if (size > largest_allocation) largest_allocation = size;
+    if (reject_large_allocation && size > (16U << 20)) return NULL;
     if (fail_alloc_at && alloc_calls == fail_alloc_at) return NULL;
     void *pointer = malloc(size);
     if (pointer) {
@@ -333,6 +365,8 @@ static void reset(void)
     open_total = close_total = peak_open = 0;
     record_calls = fail_record_at = fail_alloc_at = alloc_calls = 0;
     thread_creations = fail_thread_at = 0;
+    largest_allocation = 0;
+    reject_large_allocation = native_large_mode = native_resource_abort = 0;
     stale_file = -1;
     pool_error = enabled_error = hold_calls = release_calls = stop_on_call = 0;
     enabled = 1;
@@ -495,7 +529,7 @@ static void fatal_and_stop(void)
     reset(); c = catalog(2);
     item(&c, 1, 0, 4096, 4096); item(&c, 1, 1, 8192, 4096);
     ioctl_error[1] = ENOENT;
-    assert(run(&c, 4) == 0 && calls == 1);
+    assert(run(&c, 4) == ENOENT && calls == 1);
     finish_catalog(&c);
     reset(); c = catalog(2);
     item(&c, 1, 0, 4096, 4096); item(&c, 1, 1, 8192, 4096);
@@ -507,7 +541,63 @@ static void fatal_and_stop(void)
     atomic_store(&cd_stop, 1);
     assert(run(&c, 4) == 0 && calls == 0);
     finish_catalog(&c);
-    puts("PASS fatal error stops queued work, ENOENT maps to success and stop dominates");
+    puts("PASS fatal errors propagate, queued work stops and stop dominates");
+}
+
+static void operational_enoent(void)
+{
+    for (unsigned watch = 0; watch < 2; watch++) {
+        for (unsigned failure = 0; failure < 3; failure++) {
+            reset();
+            struct cd_catalog c = catalog(8);
+            c.watch = watch;
+            for (unsigned group = 0; group < 4; group++) {
+                item(&c, group, group * 2, 4096, 4096);
+                item(&c, group, group * 2 + 1, 8192, 4096);
+            }
+            if (failure < 2) open_error[failure] = ENOENT;
+            else ioctl_error[1] = ENOENT;
+            assert(run(&c, 1) == ENOENT);
+            assert(calls == (failure == 2 ? 1U : 0U));
+            for (unsigned file = 0; file < 8; file++) {
+                struct cd_catalog_file record;
+                assert(!cd_catalog_record(&c, file, &record, B_FALSE));
+                assert(!record.deferred);
+            }
+            finish_catalog(&c);
+        }
+        /* Genuine EOF remains success after all groups, including watch mode. */
+        reset();
+        struct cd_catalog c = catalog(8);
+        c.watch = watch;
+        for (unsigned group = 0; group < 4; group++) {
+            item(&c, group, group * 2, 4096, 4096);
+            item(&c, group, group * 2 + 1, 8192, 4096);
+        }
+        assert(run(&c, 4) == 0 && calls == 4);
+        finish_catalog(&c);
+        reset(); c = catalog(0); c.watch = watch;
+        assert(run(&c, 4) == 0 && calls == 0);
+        finish_catalog(&c);
+        reset(); c = catalog(2); c.watch = watch;
+        item(&c, 0, 0, 4096, 4096); item(&c, 0, 1, 8192, 4096);
+        ioctl_error[1] = ENOENT; stop_on_call = 1;
+        assert(run(&c, 4) == 0 && calls == 1);
+        finish_catalog(&c);
+    }
+    /* All four native calls are in flight when ENOENT is returned; run()
+     * verifies that every callback, descriptor and allocation is drained. */
+    reset();
+    struct cd_catalog c = catalog(8);
+    for (unsigned group = 0; group < 4; group++) {
+        item(&c, group, group * 2, 4096, 4096);
+        item(&c, group, group * 2 + 1, 8192, 4096);
+    }
+    barrier_calls = 4; ioctl_error[1] = ENOENT;
+    assert(run(&c, 4) == ENOENT && calls == 4 && peak_calls == 4);
+    assert(finished_calls == calls);
+    finish_catalog(&c);
+    puts("PASS multi-group open/native ENOENT differs from EOF in parallel/watch modes; stop wins and concurrent work drains");
 }
 
 static void coordinator_failures(void)
@@ -607,6 +697,110 @@ static void allocation_failures(void)
     puts("PASS every driver allocation failure frees submitted and unsubmitted storage");
 }
 
+/* Exercise the default arithmetic without allocating multi-GiB buffers in the
+ * normal strict/sanitized suite. The allocator records and refuses the request.
+ */
+static void snapshot_cap_boundaries(void)
+{
+    assert(CD_SHARE_SNAPSHOT_LIMIT == (UINT64_C(8) << 30));
+    uint64_t last = CD_SHARE_SNAPSHOT_LIMIT / sizeof (struct cd_catalog_file);
+    const uint64_t counts[] = {2569137, last, last + 1, UINT64_MAX};
+    for (unsigned i = 0; i < ARRAY_SIZE(counts); i++) {
+        reset();
+        struct cd_catalog c = catalog(2);
+        c.count = counts[i];
+        reject_large_allocation = 1;
+        item(&c, 1, 0, 4096, 4096); item(&c, 1, 1, 8192, 4096);
+        assert(run(&c, 4) == 0 && calls == 1 && thread_creations == 0);
+        assert(strstr(output_log, "serial (file snapshot unavailable)"));
+        if (counts[i] <= last) {
+            assert(alloc_calls == 1);
+            assert(largest_allocation == counts[i] * sizeof (struct cd_catalog_file));
+        } else {
+            assert(alloc_calls == 0 && largest_allocation == 0);
+        }
+        finish_catalog(&c);
+    }
+    puts("PASS default 8 GiB snapshot admission, exact count boundary and overflow-safe no-allocation fallback");
+}
+
+/* A separately compiled small cap proves the successful snapshot path at its
+ * actual record boundary, alongside over-cap and malloc-failure fallback.
+ */
+static void small_snapshot_boundaries(void)
+{
+    assert(CD_SHARE_SNAPSHOT_LIMIT == UINT64_C(4) * sizeof (struct cd_catalog_file));
+    for (unsigned count = 3; count <= 5; count++) {
+        reset();
+        struct cd_catalog c = catalog(count);
+        item(&c, 1, 0, 4096, 4096); item(&c, 1, 1, 8192, 4096);
+        assert(run(&c, 4) == 0 && calls == 1);
+        if (count <= 4) {
+            assert(thread_creations == 4 && record_calls == count);
+            assert(!strstr(output_log, "serial"));
+        } else {
+            assert(thread_creations == 0 && alloc_calls == 0);
+            assert(strstr(output_log, "serial (file snapshot unavailable)"));
+        }
+        finish_catalog(&c);
+    }
+    reset();
+    struct cd_catalog c = catalog(4);
+    item(&c, 1, 0, 4096, 4096); item(&c, 1, 1, 8192, 4096);
+    fail_alloc_at = 1;
+    assert(run(&c, 4) == 0 && calls == 1 && thread_creations == 0);
+    assert(strstr(output_log, "serial (file snapshot unavailable)"));
+    finish_catalog(&c);
+    puts("PASS bounded actual snapshot copy below/at cap; above-cap and allocation failure retain serial behavior");
+}
+
+static int native_large_snapshot(void)
+{
+    uint64_t available = fixture_free_memory();
+    if (available < (UINT64_C(16) << 30)) {
+        fprintf(stderr, "native large snapshot requires FreeBSD and 16 GiB freshly free RAM\n");
+        return 2;
+    }
+    reset();
+    const uint64_t count = 2569137;
+    const uint64_t bytes = count * sizeof (struct cd_catalog_file);
+    assert(sizeof (struct cd_catalog_file) == 1608 && bytes == UINT64_C(4131172296));
+    assert(CD_SHARE_SNAPSHOT_LIMIT == (UINT64_C(8) << 30) && bytes <= CD_SHARE_SNAPSHOT_LIMIT);
+    struct cd_catalog c = catalog(0);
+    c.count = count;
+    assert(!ftruncate(fileno(c.files), (off_t)bytes));
+    native_large_mode = 1;
+    int result = run(&c, 40);
+    unsigned copied = record_calls;
+    size_t requested = largest_allocation;
+    int guarded_abort = native_resource_abort;
+    int admitted = !strstr(output_log, "serial") && thread_creations == 40;
+    uint64_t free_after = fixture_free_memory();
+    struct rusage usage;
+    assert(!getrusage(RUSAGE_SELF, &usage));
+    assert(calls == 0 && open_total == 0 && outstanding_allocations == 0);
+    finish_catalog(&c);
+
+    reset(); c = catalog(0);
+    c.count = CD_SHARE_SNAPSHOT_LIMIT / sizeof (struct cd_catalog_file) + 1;
+    reject_large_allocation = 1;
+    int over_result = run(&c, 40);
+    int over_no_alloc = over_result == 0 && alloc_calls == 0 && record_calls == 0 &&
+        thread_creations == 0 && strstr(output_log, "serial (file snapshot unavailable)");
+    finish_catalog(&c);
+    int passed = result == 0 && admitted && copied == count && requested == bytes &&
+        !guarded_abort && over_no_alloc;
+    printf("{\"status\":\"%s\",\"scope\":\"sparse snapshot capacity and cleanup only; no share ioctls\","
+        "\"record_size\":%zu,\"records\":%" PRIu64 ",\"snapshot_bytes\":%" PRIu64
+        ",\"allocation_request\":%zu,\"records_read\":%u,\"free_before_bytes\":%" PRIu64
+        ",\"free_after_bytes\":%" PRIu64 ",\"peak_rss_kib\":%ld,\"resource_guard_aborted\":%s,"
+        "\"over_cap_no_allocation\":%s,\"share_ioctls\":0,\"cleanup_passed\":true}\n",
+        passed ? "PASS" : "FAIL", sizeof (struct cd_catalog_file), count, bytes,
+        requested, copied, available, free_after, usage.ru_maxrss,
+        guarded_abort ? "true" : "false", over_no_alloc ? "true" : "false");
+    return passed ? 0 : 1;
+}
+
 static void share_state_init(struct cd_share_state *state, unsigned count)
 {
     *state = (struct cd_share_state){ .files = model, .count = count };
@@ -634,7 +828,7 @@ static void first_error_and_notifications(void)
     assert(cd_share_error(&state, ENOENT) == ENOENT);
     assert(cd_share_error(&state, EIO) == EIO);
     assert(atomic_load(&state.first_error) == ENOENT);
-    assert(cd_share_result(atomic_load(&state.first_error)) == 0);
+    assert(cd_share_result(atomic_load(&state.first_error)) == ENOENT);
     atomic_store(&state.first_error, EIO);
     atomic_store(&cd_stop, 1);
     assert(cd_share_result(atomic_load(&state.first_error)) == 0);
@@ -694,12 +888,22 @@ static void timed_heartbeat(void)
     puts("PASS timed coordinator heartbeat advances while every worker ioctl is blocked");
 }
 
-int main(void)
+int main(int argc, char **argv)
 {
+    if (argc == 2 && !strcmp(argv[1], "--native-large-snapshot")) {
+        (void) alarm(600);
+        return native_large_snapshot();
+    }
     (void) alarm(30);
+    if (argc == 2 && !strcmp(argv[1], "--small-cap")) {
+        small_snapshot_boundaries();
+        return 0;
+    }
+    assert(argc == 1);
     independent_groups(); conflicting_groups(); chunk_boundaries();
-    deferred_and_filtered(); fatal_and_stop(); coordinator_failures();
+    deferred_and_filtered(); operational_enoent(); fatal_and_stop(); coordinator_failures();
     fallback_and_initialization(); allocation_failures();
+    snapshot_cap_boundaries();
     first_error_and_notifications(); timed_heartbeat();
     assert(!pthread_cond_destroy(&fixture_changed));
     assert(!pthread_mutex_destroy(&fixture_lock));

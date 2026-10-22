@@ -579,7 +579,7 @@ class Gate:
                       'cmd/zfs/rabin64_table.h','cmd/zfs/zfs_chunkdedup_user.c',
                       'include/sys/zfs_chunkdedup.h','module/zfs/zfs_chunkdedup.c',
                       'cmd/zfs/chunkdedup_hybrid.c','cmd/zfs/chunkdedup_hybrid.h',
-                      'cmd/zfs/chunkdedup_parallel.h',
+                      'cmd/zfs/chunkdedup_parallel.h','cmd/zfs/chunkdedup_checkpoint.h',
                       'include/sys/dsl_pool.h','module/zfs/dsl_pool.c'}
             self.require(isinstance(tested_files,list) and {x['path'] for x in tested_files}==required,
                          'tested_source_coverage',tested_files,sorted(required),
@@ -673,6 +673,54 @@ class Gate:
                          policy[0].get('test_sha256')==sha(self.kit/'lab-setup/tests/test_hybrid_policy.py'),
                          'hybrid_policy_boundary',policy,'current header; exact boundary, overflow and uncertainty checks',
                          'Run the focused current-source hybrid selection test.','TEST_FAILURE')
+            checkpoint=[d for p,d in self.documents['worker_batches'] if p.name=='checkpoint.json']
+            cases={'checkpoint_prefix_reload','cancellation_tail_recovery','sorted_cache_persistence',
+                   'report_receipt_integrity','orphan_sort_lock','exclusive_lock','wrong_binding',
+                   'manifest_corruption','payload_corruption','validate_before_truncate',
+                   'complete_driver_no_rescan','complete_driver_cached_sort',
+                   'partial_driver_only_unfinished','driver_identity_rejection',
+                   'cli_restrictions','published_report_preserved'}
+            sources=('chunkdedup_checkpoint.h','zfs_chunkdedup_user.c','chunkdedup_hybrid.c',
+                     'chunkdedup_hybrid.h','chunkdedup_parallel.h')
+            expected_sources={'cmd/zfs/'+n:sha(self.root/'source/cmd/zfs'/n) for n in sources}
+            expected_tests={n:sha(self.kit/'lab-setup/tests'/n)
+                            for n in ('test_checkpoint.py','checkpoint_test.c')}
+            proof=checkpoint[0] if len(checkpoint)==1 else {}
+            runs=proof.get('runs',[])
+            self.require(proof.get('schema')==1 and proof.get('status')=='PASS' and
+                         proof.get('source_sha256')==expected_sources and
+                         proof.get('test_sha256')==expected_tests and isinstance(runs,list) and len(runs)==2 and
+                         all(isinstance(r,dict) and r.get('mode')==mode and
+                             isinstance(r.get('cases'),list) and len(r['cases'])==len(cases) and
+                             all(isinstance(c,str) for c in r['cases']) and
+                             set(r['cases'])==cases for r,mode in zip(runs,('strict','sanitized'))),
+                         'checkpoint_resume_proof',checkpoint,
+                         'current-source strict and sanitized fresh-process resume, cache and refusal cases',
+                         'Run the actual checkpoint fixture and retain its hash-bound runtime receipt.',
+                         'TEST_FAILURE')
+            preflight=[d for p,d in self.documents['worker_batches'] if p.name=='recovery-preflight.json']
+            preflight_cases=set('''actual_scale_pass checkpoint_missing checkpoint_mismatch checkpoint_in_job
+                checkpoint_parent_escape checkpoint_prefix_sibling checkpoint_duplicate missing_launch_argv
+                missing_checkpoint_path missing_job_root missing_requested_workers missing_file_catalog_bytes
+                missing_snapshot_limit_bytes missing_group_index_bytes missing_group_index_limit_bytes
+                missing_sort_native_bytes missing_sort_chunk_bytes missing_scratch_reserve_bytes
+                missing_temp_free_bytes missing_restart_requested missing_restart_reason
+                missing_retained_scan_bytes missing_active_checkpoint missing_safety_stop_requested
+                unknown_catalog_bytes boolean_is_not_bytes negative_bytes snapshot_over_cap snapshot_at_cap
+                group_index_over_cap group_index_at_cap thread_mismatch space_below space_exact scratch_zero
+                preserve_performance_restart checkpointed_restart recovery_restart safety_stop_separate
+                safety_stop_cannot_admit_restart nonobject_hold cli_pass cli_missing cli_invalid'''.split())
+            proof=preflight[0] if len(preflight)==1 else {}
+            observed=proof.get('cases',[])
+            self.require(proof.get('schema')==1 and proof.get('status')=='PASS' and
+                         proof.get('preflight_sha256')==sha(self.kit/'workflow/recovery_preflight.py') and
+                         proof.get('test_sha256')==sha(self.kit/'workflow/test_recovery_preflight.py') and
+                         isinstance(observed,list) and len(observed)==len(preflight_cases) and
+                         all(isinstance(c,str) for c in observed) and set(observed)==preflight_cases,
+                         'recovery_preflight_proof',preflight,
+                         'current admission helper; capacity, scratch, checkpoint and restart refusal cases',
+                         'Run the recovery preflight selftest and retain its hash-bound runtime receipt.',
+                         'TEST_FAILURE')
         self.conformance()
 
     def conformance(self):

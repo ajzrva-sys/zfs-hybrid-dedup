@@ -1,57 +1,102 @@
 {
   "schema": 1,
-  "updated": "2026-10-21",
-  "scope": "Public component summaries; raw operational inventories and machine identifiers excluded",
-  "publication_projection_digest": "7d6fabfb5d2bc1d1b71b4a41154b0d4227aa49943980b010b257667ec0897fb0",
+  "updated": "2026-10-22",
+  "scope": "Public component summaries only; operational identifiers, installed artifact hashes, private paths and raw receipts excluded",
+  "publication_projection_digest": "344999a967b78f88840d71ad4ace57f057a7a011096a2b32faeefe29d9c91ff8",
   "local_evaluation": {
     "schema": 1,
-    "run_id": "20261021t175011z-49b856b3-a0",
     "profile": "local",
     "status": "PASS",
-    "source_digest": "69712a9e0d8b7cbce99195b78e2364c69e9d5364948084b632ca935568a651e1",
+    "source_digest": "cfafc3d2f00a51639ecc66512325730e079c1c8a6645f069bf580d47650a338b",
     "policy_id": "native-chunkdedup-prototype-v1",
-    "evaluated_at": "2026-10-21T17:50:46.127599+00:00",
-    "artifact_digests_checked": 189,
+    "evaluated_at": "2026-10-22T11:36:59.633551+00:00",
+    "artifact_digests_checked": 191,
     "assessments": {
-      "source_files_verified": 4334,
+      "source_files_verified": 4341,
       "immutable_baseline_files_verified": 141,
       "conformance_fixtures_verified": 35
     },
-    "feedback": [],
     "claim": "local models/conformance only"
   },
   "latest_full_native_evaluation": {
     "status": "NOT_RUN",
-    "publication_projection_digest": "7d6fabfb5d2bc1d1b71b4a41154b0d4227aa49943980b010b257667ec0897fb0",
-    "reason": "The combined optimizer and dirty-data gauge revision has separate focused native proofs; the complete original plus hybrid native suite was not rerun for the combined revision."
+    "publication_projection_digest": "344999a967b78f88840d71ad4ace57f057a7a011096a2b32faeefe29d9c91ff8",
+    "reason": "Separate focused optimizer/checkpoint and gauge native proofs do not constitute a fresh complete original plus hybrid native suite for this combined publication."
   },
   "optimizer": {
-    "source_identity": "bd27ec20b52818e05bfc2ead3ea47d6130b8c7a157a34236376c490b3640a5af",
-    "source_identity_scope": "Prior frozen full publication tree before dirty-data gauge; all existing optimizer changes match it.",
+    "source_identity": "344999a967b78f88840d71ad4ace57f057a7a011096a2b32faeefe29d9c91ff8",
+    "source_identity_scope": "OpenZFS implementation projection tested by the accepted checkpoint local gate and isolated native checkpoint run; publication workflow/docs are verified separately.",
     "local_profile": "PASS",
-    "source_files_checked": 4330,
     "freebsd_userspace_build": "PASS",
-    "focused_native_tests": {
+    "checkpoint_native_tests": {
       "status": "PASS",
+      "scope": "Fresh disposable file-vdev pool against the matching kernel; complete scan and cached-sort recovery only.",
+      "threads": 40,
+      "fixture_files": 196,
+      "fixture_bytes": 939524096,
+      "writer_source_read_bytes": 939524096,
+      "writer_real_sort_execs": 82,
+      "writer_kernel_share_calls": 0,
+      "writer_stopped_before_sharing": true,
+      "resume_source_ops_hard_vetoed": true,
+      "resume_source_analysis_attempts": 0,
+      "resume_sort_exec_hard_vetoed": true,
+      "resume_sort_exec_attempts": 0,
+      "resume_native_share_calls": 4864,
+      "resume_native_share_successes": 4864,
+      "saved_bytes": 637534208,
+      "hashes_metadata_and_cow_preserved": true,
+      "published_report_preserved": true,
+      "sorted_payload_identity_and_bytes_preserved": true,
+      "owned_pool_backing_checkpoint_cleanup": "PASS",
+      "native_partial_prefix_test": "NOT_RUN"
+    },
+    "checkpoint_focused_tests": {
+      "status": "PASS",
+      "modes": [
+        "strict",
+        "ASan/UBSan"
+      ],
+      "scope": "Actual checkpoint storage/driver with test transports: committed-prefix and complete reuse, checksum/options/source validation, exclusive locking, failure and cancellation cleanup."
+    },
+    "operational_error_propagation": {
+      "status": "PASS",
+      "modes": [
+        "strict",
+        "ASan/UBSan"
+      ],
+      "scope": "Actual sharing driver: multi-group source/destination open and native ENOENT, serial/watch parity, genuine EOF/empty input, stop precedence, concurrent drain/cleanup and stored first fatal error.",
+      "predecessor_negative_control_failed_as_expected": true
+    },
+    "parallel_sharing_snapshot": {
+      "ceiling_bytes": 8589934592,
+      "allocation_policy": "Allocate actual record bytes only; serial fallback on cap exceed or allocation failure.",
+      "native_large_fixture": {
+        "status": "PASS",
+        "scope": "Actual driver record allocation/load/cleanup, stubbed share transport; no native sharing or throughput claim.",
+        "record_size": 1608,
+        "records": 2569137,
+        "snapshot_bytes": 4131172296,
+        "allocation_request": 4131172296,
+        "records_read": 2569137,
+        "over_cap_no_allocation": true,
+        "share_ioctls": 0,
+        "cleanup_passed": true
+      }
+    },
+    "preceding_native_sharing_tests": {
+      "status": "PASS",
+      "source_identity_scope": "Pre-checkpoint userspace revision with the operational ENOENT correction.",
       "threads": [
         1,
         40
       ],
       "fixture_files": 196,
+      "fixture_bytes": 939524096,
       "saved_bytes_each": 637534208,
       "hashes_metadata_and_cow_preserved": true,
-      "temporary_catalog_cleanup": true,
-      "concurrent_native_share_stacks_observed": 6
-    },
-    "parallel_sort_synthetic_benchmark": {
-      "status": "PASS",
-      "input_bytes": 1073741824,
-      "workers": 40,
-      "serial_seconds": 29.809,
-      "parallel_seconds": 16.573,
-      "speedup": 1.7986484040306523,
-      "sorted_output_bytes_equal": true,
-      "scope": "Synthetic catalog including serial merge; not production filesystem throughput."
+      "native_overlap_observed": true,
+      "temporary_pool_and_catalog_cleanup": true
     }
   },
   "dirty_data_gauge": {
@@ -97,6 +142,111 @@
   "foreground_read_target": 1.25,
   "foreground_read_target_verified": false,
   "previous_validation": [
+    {
+      "schema": 1,
+      "updated": "2026-10-21",
+      "scope": "Public component summaries; raw operational inventories and machine identifiers excluded",
+      "publication_projection_digest": "7d6fabfb5d2bc1d1b71b4a41154b0d4227aa49943980b010b257667ec0897fb0",
+      "local_evaluation": {
+        "schema": 1,
+        "run_id": "20261021t175011z-49b856b3-a0",
+        "profile": "local",
+        "status": "PASS",
+        "source_digest": "69712a9e0d8b7cbce99195b78e2364c69e9d5364948084b632ca935568a651e1",
+        "policy_id": "native-chunkdedup-prototype-v1",
+        "evaluated_at": "2026-10-21T17:50:46.127599+00:00",
+        "artifact_digests_checked": 189,
+        "assessments": {
+          "source_files_verified": 4334,
+          "immutable_baseline_files_verified": 141,
+          "conformance_fixtures_verified": 35
+        },
+        "feedback": [],
+        "claim": "local models/conformance only"
+      },
+      "latest_full_native_evaluation": {
+        "status": "NOT_RUN",
+        "publication_projection_digest": "7d6fabfb5d2bc1d1b71b4a41154b0d4227aa49943980b010b257667ec0897fb0",
+        "reason": "The combined optimizer and dirty-data gauge revision has separate focused native proofs; the complete original plus hybrid native suite was not rerun for the combined revision."
+      },
+      "optimizer": {
+        "source_identity": "bd27ec20b52818e05bfc2ead3ea47d6130b8c7a157a34236376c490b3640a5af",
+        "source_identity_scope": "Prior frozen full publication tree before dirty-data gauge; all existing optimizer changes match it.",
+        "local_profile": "PASS",
+        "source_files_checked": 4330,
+        "freebsd_userspace_build": "PASS",
+        "focused_native_tests": {
+          "status": "PASS",
+          "threads": [
+            1,
+            40
+          ],
+          "fixture_files": 196,
+          "saved_bytes_each": 637534208,
+          "hashes_metadata_and_cow_preserved": true,
+          "temporary_catalog_cleanup": true,
+          "concurrent_native_share_stacks_observed": 6
+        },
+        "parallel_sort_synthetic_benchmark": {
+          "status": "PASS",
+          "input_bytes": 1073741824,
+          "workers": 40,
+          "serial_seconds": 29.809,
+          "parallel_seconds": 16.573,
+          "speedup": 1.7986484040306523,
+          "sorted_output_bytes_equal": true,
+          "scope": "Synthetic catalog including serial merge; not production filesystem throughput."
+        }
+      },
+      "dirty_data_gauge": {
+        "kernel_build": "PASS",
+        "compiler_warnings_as_errors": true,
+        "candidate_module_sha256": "7a836ada25ec533ae5af4f72f35e46b0ac7f0b0eb59c44f6cbb6cd5e56708401",
+        "kernel_source_files_checked": 782,
+        "direct_c_tests": {
+          "passed": 8,
+          "modes": [
+            "strict",
+            "ASan/UBSan"
+          ],
+          "scope": "Actual functions with userspace kstat/mutex stubs"
+        },
+        "isolated_vm": {
+          "status": "PASS",
+          "kernel": "FreeBSD 15.1-RELEASE-p4",
+          "cpus": 1,
+          "memory_gib": 4,
+          "network": false,
+          "shared_filesystem": false,
+          "physical_disk_passthrough": false,
+          "native_checks_passed": 10,
+          "peak_dirty_bytes": 15532544,
+          "positive_with_idle_pool_zero_checks": 4430,
+          "lifecycle_cycles": 5,
+          "concurrent_pollers": 3,
+          "unexpected_poll_errors": 0,
+          "drained_to_zero": true,
+          "read_only_fields": true,
+          "reserved_and_dotted_names": true,
+          "gauge_nodes_removed": true,
+          "guest_clean_shutdown": true,
+          "host_restoration": "PASS"
+        },
+        "installed_on_running_storage_host": false,
+        "documentation": "DIRTY_DATA.md"
+      },
+      "matched_filesystem_performance": "NOT_RUN",
+      "memory_comparison": "NOT_RUN",
+      "planned_power_loss": "NOT_RUN",
+      "foreground_read_target": 1.25,
+      "foreground_read_target_verified": false,
+      "local_evaluation_projection_relation": "All 4,138 implementation projection entries match the passing frozen run. Full-run and projection digests have different scopes; subsequent changes update publication verification metadata and kit checksums only.",
+      "workflow_safety_tests": {
+        "runner_unit_tests_passed": 14,
+        "helper_classification_cases_passed": 5,
+        "independent_evaluator_cases_passed": 20
+      }
+    },
     {
       "schema": 1,
       "updated": "2026-10-19",
@@ -500,10 +650,44 @@
       ]
     }
   ],
-  "local_evaluation_projection_relation": "All 4,138 implementation projection entries match the passing frozen run. Full-run and projection digests have different scopes; subsequent changes update publication verification metadata and kit checksums only.",
+  "local_evaluation_projection_relation": "All 4,139 implementation projection entries match the passing frozen publication run. Root AGENTS.md and the verification kit are outside that projection but included in the complete-tree local evaluation. Subsequent changes record this result in SOURCE.json, VALIDATION.json and kit checksums only.",
   "workflow_safety_tests": {
-    "runner_unit_tests_passed": 14,
-    "helper_classification_cases_passed": 5,
-    "independent_evaluator_cases_passed": 20
-  }
+    "recovery_preflight_selftests_passed": 44,
+    "independent_evaluator_cases_passed": 29,
+    "scope": "Focused recovery admission and adversarial evaluator checks; historical runner/helper counts remain in previous_validation."
+  },
+  "checkpoint_local_evaluation": {
+    "schema": 1,
+    "profile": "local",
+    "status": "PASS",
+    "source_digest": "f7b122ec0e318f2a64e7d99995bdf0eb6b2e5d665e1a3094abf39019cb72b72e",
+    "policy_id": "native-chunkdedup-prototype-v1",
+    "evaluated_at": "2026-10-22T11:04:44.359945+00:00",
+    "artifact_digests_checked": 189,
+    "assessments": {
+      "source_files_verified": 4337,
+      "immutable_baseline_files_verified": 141,
+      "conformance_fixtures_verified": 35
+    },
+    "claim": "local models/conformance only"
+  },
+  "production_checkpoint_resume": {
+    "status": "NOT_RUN",
+    "reason": "Checkpoint support applies to new invocations; an existing worker cannot adopt it in place. No production checkpoint recovery is claimed."
+  },
+  "production_parallel_sharing_throughput": {
+    "status": "NOT_RUN",
+    "reason": "Functional native fixtures and scan observations do not establish production sharing throughput."
+  },
+  "recovery_admission": {
+    "focused_selftests": "PASS",
+    "cases": 44,
+    "scope": "Read-only recovery admission checks with positive and negative cases; does not stop workers or adopt an uncheckpointed running process.",
+    "final_workflow_integration": "PASS"
+  },
+  "post_gate_metadata_updates": [
+    "SOURCE.json",
+    "VALIDATION.json",
+    "SHA256SUMS"
+  ]
 }

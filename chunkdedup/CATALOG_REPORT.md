@@ -35,3 +35,43 @@ estimates before sharing, not measured savings or permission to convert files.
 Review whole sharing groups and revalidate their current files before a later
 chunking run. Paths use UTF-8 with surrogateescape for undecodable filename bytes;
 Python's `os.fsencode()` recovers their original bytes.
+
+## Checkpoint and resume
+
+Add `--checkpoint /var/tmp/my-dataset-checkpoint` to `optimize` to create or
+resume a private durable checkpoint. Use the same target, method, minimum age,
+recursive setting and report path when resuming; the worker count may change.
+The option accepts one dataset or path and is unavailable for `watch`. Keep the
+checkpoint outside the scanned tree, with an existing parent directory.
+
+The coordinator commits complete file records and both raw catalogs about once
+per minute while scanning, and commits the complete scan before sorting. After
+a partial scan, restart walks metadata again but reuses committed files without
+reading or hashing their contents. In-flight files and work since the last
+commit may be repeated. A complete scan skips discovery entirely. Each finished
+native/chunk sort is committed independently and reused after restart. Catalog
+selection uses a disposable file-table copy so interrupted decisions cannot
+modify the saved scan or double-charge estimates.
+
+Payloads and the manifest are flushed and synced before atomic publication.
+Resume checks the schema, ABI, options, pool/dataset identity, target identity,
+committed sizes and SHA-256 digests, then validates saved source metadata. It
+reads the saved catalogs for integrity checking, not source file contents.
+Uncommitted tails are discarded only after all committed data validates. A
+missing committed payload or manifest, corrupt data or incompatible checkpoint
+fails without silently rescanning or replacing evidence. A nonexistent directory
+creates a new checkpoint on first use; during recovery, verify that the expected
+checkpoint directory still exists before launching. Changed source metadata
+also refuses reuse. Mount/device
+identity changes require a fresh checkpoint; this format is host-local.
+
+Checkpoint files are owner-only and locked against simultaneous use. They
+survive success, failure and cancellation; remove the directory explicitly when
+it is no longer needed. Retain enough disk space for both raw and sorted
+catalogs, sort spills, the working file table and reports. A published report is
+preserved on resume. Sharing may replay from the beginning; completed shares
+survive and source identity/kernel comparison checks still apply.
+
+An already running executable cannot gain checkpoint support in place. Leave
+such a worker running to preserve its existing progress; this option protects
+invocations started with the new executable.

@@ -26,7 +26,7 @@ REQUIRED = (
     'cmd/zfs/rabin64_table.h', 'cmd/zfs/zfs_chunkdedup_user.c',
     'include/sys/zfs_chunkdedup.h', 'module/zfs/zfs_chunkdedup.c',
     'cmd/zfs/chunkdedup_hybrid.c', 'cmd/zfs/chunkdedup_hybrid.h',
-    'cmd/zfs/chunkdedup_parallel.h',
+    'cmd/zfs/chunkdedup_parallel.h', 'cmd/zfs/chunkdedup_checkpoint.h',
     'include/sys/dsl_pool.h', 'module/zfs/dsl_pool.c',
 )
 MINIMUM_ASSERTIONS = {'chunker_api': 26, 'core_model': 104,
@@ -510,8 +510,15 @@ sys.exit(status)
         self.current['evidence']['artifacts'].append(self.artifact(policy))
         self.current['evidence']['hybrid_policy'] = json.loads(policy.read_text())
 
+        checkpoint = folder / 'checkpoint.json'
         self.execute(['sh', self.args.kit / 'lab-setup/tests/test_parallel_scan.sh',
-                      self.snapshot], env=dict(self.environment, CC=shlex.join(self.cc)))
+                      self.snapshot], env=dict(self.environment, CC=shlex.join(self.cc),
+                                              WORKFLOW_CHECKPOINT_REPORT=str(checkpoint)))
+        self.current['evidence']['artifacts'].append(self.artifact(checkpoint))
+        preflight = folder / 'recovery-preflight.json'
+        self.execute([sys.executable, self.args.kit / 'workflow/test_recovery_preflight.py',
+                      '--report', preflight])
+        self.current['evidence']['artifacts'].append(self.artifact(preflight))
         self.current['evidence']['parallel_scan'] = (
             'Actual bounded pthread pool; concurrent callbacks, ordered merge, '
             'backpressure, slot reuse and joined shutdown; strict and ASan/UBSan')

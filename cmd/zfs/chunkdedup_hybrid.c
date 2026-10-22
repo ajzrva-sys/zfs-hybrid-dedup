@@ -301,9 +301,9 @@ cd_sort_remove(const char *directory)
 	return (error);
 }
 
-int
-cd_hybrid_sort_parallel(FILE *input, FILE **output, const char *directory,
-    unsigned int threads, const atomic_int *stop)
+static int
+cd_hybrid_sort_parallel_impl(FILE *input, FILE **output, const char *directory,
+    unsigned int threads, const atomic_int *stop, FILE *destination, int hold_fd)
 {
 	if (input == NULL || output == NULL || directory == NULL ||
 	    threads == 0 || threads > CD_HYBRID_SORT_MAX_THREADS)
@@ -380,6 +380,9 @@ cd_hybrid_sort_parallel(FILE *input, FILE **output, const char *directory,
 			goto done;
 		}
 		if (pid == 0) {
+			/* An orphan must retain the checkpoint lock until it exits. */
+			if (hold_fd >= 0 && fcntl(hold_fd, F_SETFD, 0) != 0)
+				_exit(126);
 			if (dup2(runs[i].pipe[0], STDIN_FILENO) < 0 ||
 			    dup2(runs[i].fd, STDOUT_FILENO) < 0)
 				_exit(126);
@@ -414,13 +417,13 @@ cd_hybrid_sort_parallel(FILE *input, FILE **output, const char *directory,
 	}
 	if (error != 0 || (error = cd_sort_wait(runs, threads, stop)) != 0)
 		goto done;
-	if (threads == 1) {
+	if (threads == 1 && destination == NULL) {
 		sorted = fopen(runs[0].path, "r+");
 		if (sorted == NULL)
 			error = errno;
 		goto done;
 	}
-	sorted = tmpfile();
+	sorted = destination != NULL ? destination : tmpfile();
 	if (sorted == NULL) {
 		error = errno;
 		goto done;
@@ -431,6 +434,8 @@ cd_hybrid_sort_parallel(FILE *input, FILE **output, const char *directory,
 		goto done;
 	}
 	if (pid == 0) {
+		if (hold_fd >= 0 && fcntl(hold_fd, F_SETFD, 0) != 0)
+			_exit(126);
 		if (dup2(fileno(sorted), STDOUT_FILENO) < 0 ||
 		    setenv("LC_ALL", "C", 1) != 0 ||
 		    setenv("TMPDIR", temporary, 1) != 0)
@@ -479,10 +484,37 @@ done:
 	if (error == 0 && fseeko(sorted, 0, SEEK_SET) != 0)
 		error = errno;
 	if (error != 0) {
-		if (sorted != NULL)
+		if (sorted != NULL && sorted != destination)
 			(void) fclose(sorted);
 		return (error);
 	}
 	*output = sorted;
 	return (0);
+}
+
+int
+cd_hybrid_sort_parallel(FILE *input, FILE **output, const char *directory,
+    unsigned int threads, const atomic_int *stop)
+{
+	return (cd_hybrid_sort_parallel_impl(input, output, directory, threads,
+	    stop, NULL, -1));
+}
+
+/* The caller owns the durable destination, including failed partial output. */
+int
+cd_hybrid_sort_parallel_to(FILE *input, FILE *destination,
+    const char *directory, unsigned int threads, const atomic_int *stop,
+    int hold_fd)
+{
+	if (destination == NULL)
+		return (EINVAL);
+	/* Keep the inherited lock clear of stdin/stdout even when either is closed. */
+	int lock = fcntl(hold_fd, F_DUPFD_CLOEXEC, STDERR_FILENO + 1);
+	if (lock < 0)
+		return (errno);
+	FILE *output = NULL;
+	int error = cd_hybrid_sort_parallel_impl(input, &output, directory, threads,
+	    stop, destination, lock);
+	(void) close(lock);
+	return (error);
 }

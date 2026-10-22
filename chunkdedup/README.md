@@ -6,6 +6,7 @@ from this directory, or `./scripts/verify.sh` from the repository root.
 - [Status and remaining work](STATUS.md)
 - [Commands, selection policy and format boundaries](HYBRID.md)
 - [Catalog estimates and saved reports](CATALOG_REPORT.md)
+- [Recovery and operating guidance](RECOVERY.md)
 - [Current dirty-data gauge and isolated validation](DIRTY_DATA.md)
 - [Guarded FreeBSD lab recipe](lab-setup/README.md)
 - [Microsoft conformance fixtures and oracle source](conformance/README.md)
@@ -19,6 +20,11 @@ artifacts; current revision status is in STATUS.md and VALIDATION.json.
 
 Local verification covers the actual chunker and core model, worker batching,
 parallel scan/share execution, bounded catalog selection and reporting,
-parallel catalog sorting, and packaging. The native dirty-data gauge has a
+parallel catalog sorting, checkpoint integrity/recovery, error propagation and
+packaging. [Checkpoint and resume](CATALOG_REPORT.md#checkpoint-and-resume)
+describes stable paths, metadata validation and partial-prefix reuse.
+An isolated native checkpoint test completed sharing with source analysis and
+sorting blocked on resume. Production checkpoint recovery remains unverified.
+The native dirty-data gauge has a
 separate portable direct-function test and isolated VM evidence. These focused
 checks do not establish a full native-suite pass for the combined revision.

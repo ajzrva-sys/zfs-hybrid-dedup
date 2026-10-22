@@ -81,6 +81,22 @@ test('hybrid boundary test omitted with refreshed artifact hashes','TEST_FAILURE
 def hybridpolicyheader():
  p=run/'local/artifacts/worker_batches/hybrid-policy.json';value=json.loads(p.read_text());value['header_sha256']='0'*64;artifact_change('worker_batches',p,value)
 test('hybrid policy proof from another header with refreshed hashes','TEST_FAILURE',hybridpolicyheader,['hybrid_policy_boundary'])
+def checkpointproof(change):
+ p=run/'local/artifacts/worker_batches/checkpoint.json';value=json.loads(p.read_text());change(value);artifact_change('worker_batches',p,value)
+def missingcheckpoint():
+ both('worker_batches',lambda r:r['evidence'].update(artifacts=[d for d in r['evidence']['artifacts'] if not d['path'].endswith('/checkpoint.json')]))
+test('checkpoint runtime proof omitted','TEST_FAILURE',missingcheckpoint,['checkpoint_resume_proof'])
+test('checkpoint resume case omitted with refreshed hashes','TEST_FAILURE',lambda:checkpointproof(lambda d:d['runs'][0]['cases'].remove('complete_driver_no_rescan')),['checkpoint_resume_proof'])
+test('checkpoint cached sort case omitted with refreshed hashes','TEST_FAILURE',lambda:checkpointproof(lambda d:d['runs'][1]['cases'].remove('complete_driver_cached_sort')),['checkpoint_resume_proof'])
+test('checkpoint proof from another driver with refreshed hashes','TEST_FAILURE',lambda:checkpointproof(lambda d:d['source_sha256'].update({'cmd/zfs/zfs_chunkdedup_user.c':'0'*64})),['checkpoint_resume_proof'])
+test('checkpoint proof from another fixture with refreshed hashes','TEST_FAILURE',lambda:checkpointproof(lambda d:d['test_sha256'].update({'checkpoint_test.c':'0'*64})),['checkpoint_resume_proof'])
+def preflightproof(change):
+ p=run/'local/artifacts/worker_batches/recovery-preflight.json';value=json.loads(p.read_text());change(value);artifact_change('worker_batches',p,value)
+def missingpreflight():
+ both('worker_batches',lambda r:r['evidence'].update(artifacts=[d for d in r['evidence']['artifacts'] if not d['path'].endswith('/recovery-preflight.json')]))
+test('recovery preflight proof omitted','TEST_FAILURE',missingpreflight,['recovery_preflight_proof'])
+test('preflight restart refusal case omitted with refreshed hashes','TEST_FAILURE',lambda:preflightproof(lambda d:d['cases'].remove('preserve_performance_restart')),['recovery_preflight_proof'])
+test('preflight proof from another helper with refreshed hashes','TEST_FAILURE',lambda:preflightproof(lambda d:d.update(preflight_sha256='0'*64)),['recovery_preflight_proof'])
 
 def policydowngrade():
  p=run/'control/policy.json';d=json.loads(p.read_text());d['performance']['minimum_fixture_savings']=0;put(p,d);remember(kit/'workflow/policy.json').write_bytes(p.read_bytes());a=main();a['policy_sha256']=a['helpers']['policy.json']=sha(p);put(run/'run.json',a)
@@ -105,6 +121,7 @@ def missingtestedinput(name):
    if 'tested_sources_digest' in entry.get('evidence',{}):entry['evidence']['tested_sources_digest']=tested
  put(run/'run.json',a);put(run/'local/results.json',b)
 test('parallel implementation header omitted with refreshed receipt hashes','INFRA_FAILURE',lambda:missingtestedinput('cmd/zfs/chunkdedup_parallel.h'),['tested_source_coverage'])
+test('checkpoint implementation header omitted with refreshed receipt hashes','INFRA_FAILURE',lambda:missingtestedinput('cmd/zfs/chunkdedup_checkpoint.h'),['tested_source_coverage'])
 test('actual sorter implementation omitted with refreshed receipt hashes','INFRA_FAILURE',lambda:missingtestedinput('cmd/zfs/chunkdedup_hybrid.c'),['tested_source_coverage'])
 test('dirty-data gauge header omitted with refreshed receipt hashes','INFRA_FAILURE',lambda:missingtestedinput('include/sys/dsl_pool.h'),['tested_source_coverage'])
 test('dirty-data gauge implementation omitted with refreshed receipt hashes','INFRA_FAILURE',lambda:missingtestedinput('module/zfs/dsl_pool.c'),['tested_source_coverage'])

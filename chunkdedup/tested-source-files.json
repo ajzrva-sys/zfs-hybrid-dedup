@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "source_digest": "7d6fabfb5d2bc1d1b71b4a41154b0d4227aa49943980b010b257667ec0897fb0",
+  "source_digest": "344999a967b78f88840d71ad4ace57f057a7a011096a2b32faeefe29d9c91ff8",
   "files": [
     {
       "path": ".editorconfig",
@@ -743,7 +743,13 @@
     {
       "path": "cmd/zfs/Makefile.am",
       "type": "file",
-      "sha256": "dd385e2e8b5b23fadeb75d502bf0c9b7ca9d53b71d0f2a03cb1ad17798856f2a",
+      "sha256": "a7a923224c6fa6712f5ba319e2eb1599a1290bc802596b2677da45daf84a80a5",
+      "mode": 644
+    },
+    {
+      "path": "cmd/zfs/chunkdedup_checkpoint.h",
+      "type": "file",
+      "sha256": "b31acd52e6080b13efab99976f843ce74f3c4250b8782a6bef84d3cd67e7be8b",
       "mode": 644
     },
     {
@@ -761,13 +767,13 @@
     {
       "path": "cmd/zfs/chunkdedup_hybrid.c",
       "type": "file",
-      "sha256": "6a7651d05781a722edbf54a12da35a2eb8cee2cc3c46f4f1034f9d9cfd79672c",
+      "sha256": "362aa5bf954bb925ea43b8e412ea5b46010b11beb45abe7d27951280eea4708c",
       "mode": 644
     },
     {
       "path": "cmd/zfs/chunkdedup_hybrid.h",
       "type": "file",
-      "sha256": "2b028c703ba24b6f668eb20be7b619ab9f79f8bb42aa1d0e5d6ce767ca4f4202",
+      "sha256": "559ccd7036d54ff417fc14ff8b9788c82323acef4c58dbec97a715754ca887bb",
       "mode": 644
     },
     {
@@ -791,7 +797,7 @@
     {
       "path": "cmd/zfs/zfs_chunkdedup_user.c",
       "type": "file",
-      "sha256": "74a185b6405e50b584e1cb347d6131355cd00440269732d82cfcdab95d4df31c",
+      "sha256": "86a53808f7fa2813d0e9c485db1d8e50abb00c2ea8473a632073733448411ff5",
       "mode": 644
     },
     {

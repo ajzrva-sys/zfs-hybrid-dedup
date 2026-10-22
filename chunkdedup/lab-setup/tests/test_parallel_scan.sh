@@ -69,3 +69,6 @@ python3 "$here/test_parallel_sort.py" --repo "$1"
 
 # Exercise the actual optional FreeBSD dirty-data gauge with portable stubs.
 python3 "$here/test_dirty_data.py" --repo "$1"
+
+# Exercise durable scan checkpoint save/load and production resume decisions.
+python3 "$here/test_checkpoint.py" --repo "$1"
