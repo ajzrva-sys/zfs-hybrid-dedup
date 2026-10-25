@@ -1,0 +1,27 @@
+{
+  "schema": 1,
+  "recovered_date": "2026-10-25",
+  "files": [
+    {
+      "file": "run.sh.example",
+      "recovered_sha256": "ce431322d65a7f10a6ee8b2e2e12d4d973e8248c2e91575dc5d3b6afeed23d61",
+      "published_sha256": "275def839487aaedb6a6d447b53619e136bc6474d30be685125023b96ef0eee9",
+      "changes": "Host/pool/dataset identities and paths replaced; reference comment added."
+    },
+    {
+      "file": "snapshot.sh.example",
+      "recovered_sha256": "9bb29f95a50fa8f26c5235ce94a8c61654b3e077990082fd02ee1d3bdb8a3feb",
+      "published_sha256": "da7d7c661b1139e19c1e077361d40de981eb96f2eee5a06127484278ab67bcd7",
+      "changes": "Host/pool/dataset identities and paths replaced; reference comment added."
+    },
+    {
+      "file": "progress_probe.c",
+      "recovered_sha256": "e64380f608d54840cfa4ed86f2b085ef25dc959af04d56e45d620b27c60be100",
+      "published_sha256": "e64380f608d54840cfa4ed86f2b085ef25dc959af04d56e45d620b27c60be100",
+      "changes": "Byte-for-byte recovered source."
+    }
+  ],
+  "scope": "Recovered operational references, not a new kernel or optimizer implementation.",
+  "verification": "Recovered files matched remote SHA-256. Publication syntax/build and existing local gate are checked separately.",
+  "excluded": "Installed binaries, kernel modules, private operational receipts, live job state and catalog contents."
+}

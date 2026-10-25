@@ -1,0 +1,188 @@
+#!/bin/sh
+# Sanitized operational reference; review operations/README.md before use.
+# Read-only dashboard snapshot; no optimization or configuration changes.
+set -eu
+export PATH=/sbin:/bin:/usr/sbin:/usr/bin:/usr/local/sbin:/usr/local/bin
+run=/var/tmp/dedupe-controller
+include_datasets=no
+case "${1:-}" in --datasets) include_datasets=yes ;; '') ;; *) echo 'Unknown snapshot option' >&2; exit 2 ;; esac
+[ -s "$run/state.tsv" ] || { echo 'No started dedupe job on REPLACE_WITH_REVIEWED_HOST' >&2; exit 1; }
+# The controller replaces this file atomically. Read that generation once so
+# phase, dataset and PIDs cannot accidentally come from different transitions.
+snapshot=$(cat "$run/state.tsv")
+tab=$(printf '\t')
+phase=unknown
+controller=0
+worker=0
+current=
+global_state=
+message=
+while IFS="$tab" read -r key value; do
+    case "$key" in
+        phase) phase=$value ;;
+        controller_pid) controller=$value ;;
+        worker_pid) worker=$value ;;
+        current_dataset) current=$value ;;
+        state) global_state=$value ;;
+        message) message=$value ;;
+    esac
+done <<EOF
+$snapshot
+EOF
+printf '%s\n' "$snapshot" | awk -F '\t' '$1!="phase" && $1!="message"'
+controller_alive=0
+worker_alive=0
+if [ "$controller" != 0 ] && kill -0 "$controller" 2>/dev/null; then
+    controller_alive=1
+fi
+if [ "$worker" != 0 ] && kill -0 "$worker" 2>/dev/null; then
+    worker_alive=1
+fi
+printf 'controller_alive\t%s\nworker_alive\t%s\n' "$controller_alive" "$worker_alive"
+if [ "$worker_alive" = 1 ]; then
+    threads=$(ps -p "$worker" -o nlwp= | awk '{print $1}')
+    case "$threads" in ''|*[!0-9]*) threads=0 ;; esac
+    printf 'worker_threads\t%s\n' "$threads"
+fi
+if [ -s "$run/heartbeat" ]; then
+    printf 'updated_epoch\t%s\n' "$(cat "$run/heartbeat")"
+fi
+if [ -s "$run/progress-path" ]; then
+    progress=$(cat "$run/progress-path")
+    case "$progress" in "$run"/datasets/*/progress.tsv)
+        if [ -f "$progress" ]; then
+            # Controller phase wins outside a live scanning/sharing operation.
+            current_progress=$(cat "$progress")
+            printf '%s\n' "$current_progress" | awk -F '\t' '
+                $1=="scanned_bytes" || $1=="scanned_files" {print}
+                $1=="updated_epoch" {print "probe_updated_epoch\t" $2}'
+            if [ "$phase" = scanning ]; then
+                observed=$(printf '%s\n' "$current_progress" | awk -F '\t' '$1=="phase" {print $2}')
+                case "$observed" in scanning|sharing) phase=$observed ;; esac
+            fi
+        fi ;;
+    esac
+fi
+if [ "$worker_alive" = 1 ] && pgrep -P "$worker" -x sort >/dev/null 2>&1; then
+    phase=cataloging
+fi
+printf 'phase\t%s\n' "$phase"
+baseline=$(awk -F '\t' '$1=="targetpool" && $2=="bclonesaved" {print $3}' "$run/pools-before.tsv")
+pool_values=$(zpool get -Hp -o name,property,value bclonesaved,allocated targetpool)
+saved=$(printf '%s\n' "$pool_values" | awk -F '\t' '$2=="bclonesaved" {print $3}')
+allocated=$(printf '%s\n' "$pool_values" | awk -F '\t' '$2=="allocated" {print $3}')
+allocated_before=$(awk -F '\t' '$1=="targetpool" && $2=="allocated" {print $3}' "$run/pools-before.tsv")
+printf 'brt_saved_bytes\t%s\n' "$((saved - baseline))"
+printf 'pool_allocated_decrease_bytes\t%s\n' "$((allocated_before - allocated))"
+
+# These counters and rows describe persisted dataset outcomes. Merely creating
+# an item directory or finishing the worker is not a completed conversion.
+datasets_failed=0
+datasets_queued=0
+datasets_running=0
+order=
+if [ -s "$run/order.tsv" ]; then
+    order=$(cat "$run/order.tsv")
+elif [ -s "$run/queue.tsv" ]; then
+    order=$(cat "$run/queue.tsv")
+fi
+while IFS="$tab" read -r id name guid mounted point logical_total; do
+    [ -n "$id" ] || continue
+    case "$id" in *[!0-9]*) continue ;; esac
+    item="$run/datasets/$id"
+    started=0
+    completed=0
+    result=
+    exit_code=-
+    [ ! -s "$item/started_epoch" ] || started=$(cat "$item/started_epoch")
+    [ ! -s "$item/completed_epoch" ] || completed=$(cat "$item/completed_epoch")
+    [ ! -s "$item/status" ] || result=$(cat "$item/status")
+    [ ! -s "$item/exit-status" ] || exit_code=$(cat "$item/exit-status")
+    case "$started" in ''|*[!0-9]*) started=0 ;; esac
+    case "$completed" in ''|*[!0-9]*) completed=0 ;; esac
+    row_state=queued
+    if [ "$result" = PASS ] && [ "$exit_code" = 0 ] && [ "$completed" -gt 0 ]; then
+        row_state=complete
+    elif [ "$result" = FAILED ] || [ "$result" = RESTORATION_FAILED ]; then
+        row_state=failed
+    elif [ "$exit_code" != - ] && [ "$exit_code" != 0 ]; then
+        row_state=failed
+    elif [ "$name" = "$current" ] && [ "$controller_alive" = 1 ] && [ "$global_state" = RUNNING ]; then
+        row_state=running
+    elif [ "$started" -gt 0 ] || [ "$name" = "$current" ]; then
+        row_state=stopped
+    fi
+    case "$row_state" in
+        running) datasets_running=$((datasets_running + 1)); row_phase=$phase ;;
+        failed) datasets_failed=$((datasets_failed + 1)); row_phase=failed ;;
+        queued) datasets_queued=$((datasets_queued + 1)); row_phase=queued ;;
+        *) row_phase=$row_state ;;
+    esac
+    scanned_bytes=-
+    scanned_files=-
+    if [ -s "$item/progress.tsv" ]; then
+        item_progress=$(cat "$item/progress.tsv")
+        while IFS="$tab" read -r key value; do
+            case "$key" in
+                scanned_bytes) scanned_bytes=$value ;;
+                scanned_files) scanned_files=$value ;;
+            esac
+        done <<EOF
+$item_progress
+EOF
+    fi
+    brt_delta=-
+    allocation_decrease=-
+    if [ -s "$item/pool-before.tsv" ] && [ -s "$item/pool-after.tsv" ]; then
+        deltas=$(awk -F '\t' '
+            NR==FNR {if ($1=="targetpool") before[$2]=$3; next}
+            $1=="targetpool" {after[$2]=$3}
+            END {
+                if ("bclonesaved" in before && "bclonesaved" in after)
+                    printf "brt\t%.0f\n", after["bclonesaved"]-before["bclonesaved"]
+                if ("allocated" in before && "allocated" in after)
+                    printf "allocation\t%.0f\n", before["allocated"]-after["allocated"]
+            }' "$item/pool-before.tsv" "$item/pool-after.tsv")
+        while IFS="$tab" read -r key value; do
+            case "$key" in brt) brt_delta=$value ;; allocation) allocation_decrease=$value ;; esac
+        done <<EOF
+$deltas
+EOF
+    fi
+    processed=-
+    skipped=-
+    if [ "$exit_code" != - ] && [ -s "$item/optimize.log" ]; then
+        # Logs can contain millions of file lines. The exact final summary is
+        # near EOF; never walk the full log for a dashboard refresh.
+        summary=$(tail -n 8 "$item/optimize.log" | awk '
+            /^optimize: processed=[0-9]+ skipped=[0-9]+$/ {
+                p=$2; s=$3; sub(/^processed=/,"",p); sub(/^skipped=/,"",s)
+                result=p "\t" s
+            }
+            END {if (result!="") print result}')
+        if [ -n "$summary" ]; then
+            processed=${summary%%"$tab"*}
+            skipped=${summary#*"$tab"}
+        fi
+    fi
+    [ -n "$logical_total" ] || logical_total=-
+    if [ "$include_datasets" = yes ]; then
+        printf 'dataset\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+            "$id" "$name" "$row_state" "$row_phase" "$logical_total" \
+            "$scanned_bytes" "$scanned_files" "$started" "$completed" \
+            "$brt_delta" "$allocation_decrease" "$processed" "$skipped" "$exit_code"
+    fi
+done <<EOF
+$order
+EOF
+printf 'datasets_failed\t%s\ndatasets_queued\t%s\ndatasets_running\t%s\n' \
+    "$datasets_failed" "$datasets_queued" "$datasets_running"
+for kind in filesystems volumes; do
+    count=0
+    [ ! -f "$run/$kind-skipped.tsv" ] || count=$(awk 'END {print NR+0}' "$run/$kind-skipped.tsv")
+    printf 'skipped_%s\t%s\n' "$kind" "$count"
+done
+if [ -s "$run/stop-reason.txt" ]; then
+    message=$(cat "$run/stop-reason.txt")
+fi
+printf 'message\t%s\n' "$message"

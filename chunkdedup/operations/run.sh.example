@@ -1,0 +1,339 @@
+#!/bin/sh
+# Sanitized operational reference; review operations/README.md before use.
+# Operational block-only pass over REPLACE_WITH_REVIEWED_HOST's targetpool filesystems.
+set -eu
+export PATH=/sbin:/bin:/usr/sbin:/usr/bin:/usr/local/sbin:/usr/local/bin
+run=/var/tmp/dedupe-controller
+checkpoint_root=/var/tmp/dedupe-checkpoints
+tab=$(printf '\t')
+worker=
+watchdog=
+changed=no
+finished=no
+current=
+completed=0
+logical_completed=0
+failed=0
+phase=preparing
+state=RUNNING
+message='Preparing all eligible targetpool filesystems'
+
+carried_complete()
+{
+    saved=$run/datasets/$1
+    [ -s "$saved/carried-from" ] && [ -s "$saved/dataset-guid" ] &&
+        [ "$(cat "$saved/dataset")" = "$2" ] &&
+        [ "$(cat "$saved/dataset-guid")" = "$3" ] &&
+        [ "$(cat "$saved/status")" = PASS ] &&
+        [ "$(cat "$saved/exit-status")" = 0 ] || return 1
+    epoch=$(cat "$saved/completed_epoch")
+    case "$epoch" in ''|*[!0-9]*) return 1 ;; esac
+    [ "$epoch" -gt 0 ]
+}
+
+checkpoint_for()
+{
+    case "$1" in ''|*[!0-9]*) return 1 ;; esac
+    if [ "$2" = targetpool/archive/recovery-target ] || [ "$3" = /targetpool/archive/recovery-target ]; then
+        [ "$1" = REPLACE_WITH_RECOVERY_DATASET_GUID ] || return 1
+    fi
+    case "$1" in
+        REPLACE_WITH_RECOVERY_DATASET_GUID)
+            [ "$2" = targetpool/archive/recovery-target ] || return 1
+            [ "$3" = /targetpool/archive/recovery-target ] || return 1
+            ssd=/mnt/scratchpool/dedupe-catalogs
+            checkpoint=$ssd/checkpoint
+            for directory in /mnt /mnt/scratchpool "$ssd" "$checkpoint"; do
+                [ -d "$directory" ] && [ ! -L "$directory" ] || return 1
+                [ "$(stat -f '%u' "$directory")" = 0 ] || return 1
+                permissions=$(stat -f '%Lp' "$directory") || return 1
+                [ "$((0$permissions & 022))" -eq 0 ] || return 1
+            done
+            [ "$(stat -f '%u:%Lp' "$checkpoint")" = 0:700 ] || return 1
+            [ "$(zpool get -H -o value guid scratchpool)" = REPLACE_WITH_SCRATCH_POOL_GUID ] || return 1
+            [ "$(zpool get -H -o value health scratchpool)" = ONLINE ] || return 1
+            [ "$(zfs get -H -o value guid scratchpool/dedupe-catalogs)" = REPLACE_WITH_SCRATCH_DATASET_GUID ] || return 1
+            [ "$(zfs get -H -o value mounted scratchpool/dedupe-catalogs)" = yes ] || return 1
+            [ "$(zfs get -H -o value mountpoint scratchpool/dedupe-catalogs)" = "$ssd" ] || return 1
+            for name in manifest lock files.raw native.raw chunks.raw native.sorted chunks.sorted report.receipt chunk-estimates.jsonl; do
+                payload=$checkpoint/$name
+                [ -f "$payload" ] && [ ! -L "$payload" ] || return 1
+                [ "$(stat -f '%u:%Lp:%l' "$payload")" = 0:600:1 ] || return 1
+                [ "$name" = lock ] || [ -s "$payload" ] || return 1
+            done
+            [ "$(stat -f '%z' "$checkpoint/manifest")" = 4384 ] || return 1
+            [ "$(stat -f '%z' "$checkpoint/report.receipt")" = 64 ] || return 1
+            ;;
+        *) checkpoint=$checkpoint_root/$1 ;;
+    esac
+}
+
+write_state()
+{
+    {
+        printf 'state\t%s\nphase\t%s\ncurrent_dataset\t%s\n' "$state" "$phase" "$current"
+        printf 'started_epoch\t%s\ndatasets_total\t%s\ndatasets_completed\t%s\n' "$started" "$total" "$completed"
+        printf 'logical_total\t%s\nlogical_completed\t%s\nscan_total_bytes\t%s\n' "$logical_total" "$logical_completed" "${size:-0}"
+        printf 'controller_pid\t%s\nworker_pid\t%s\nmessage\t%s\n' "$$" "${worker:-0}" "$message"
+    } > "$run/state.new"
+    mv "$run/state.new" "$run/state.tsv"
+}
+
+restore_properties()
+{
+    errors=0
+    # Unmount private paths before CLI inheritance can try their normal paths.
+    if [ -s "$run/mounted-by-run.tsv" ]; then
+        sort -rn -k1,1 "$run/mounted-by-run.tsv" > "$run/unmount-order.tsv"
+        while IFS="$tab" read -r depth ds; do
+            if [ "$(zfs get -H -o value mounted "$ds")" = yes ]; then
+                zfs unmount "$ds" || errors=1
+            fi
+        done < "$run/unmount-order.tsv"
+    fi
+    # Originals are parent-first. Children stay pinned until their parent is restored.
+    while IFS="$tab" read -r ds prop value source received; do
+        case "$prop" in readonly|chunkdedup) ;; *) continue ;; esac
+        case "$source" in
+            local) zfs set -u "$prop=$value" "$ds" || errors=1 ;;
+            received) zfs inherit -S "$prop" "$ds" || errors=1 ;;
+            default|'inherited from '*) zfs inherit "$prop" "$ds" || errors=1 ;;
+            *) echo "Unsupported original source: $ds $prop $source" >&2; errors=1 ;;
+        esac
+    done < "$run/properties-before.tsv"
+    while IFS="$tab" read -r id ds guid was_mounted point bytes; do
+        [ "$was_mounted" = yes ] || continue
+        [ "$(zfs get -H -o value mounted "$ds")" = yes ] || continue
+        original=$(awk -F '\t' -v d="$ds" '$1==d && $2=="readonly" {print $3}' "$run/properties-before.tsv")
+        case "$original" in on) mode=ro ;; off) mode=rw ;; *) errors=1; continue ;; esac
+        mount -u -o "$mode" "$point" || errors=1
+    done < "$run/queue.tsv"
+    zfs get -Hpr -t filesystem -o name,property,value,source,received readonly,chunkdedup,canmount,mountpoint targetpool > "$run/properties-after.tsv" || errors=1
+    cmp "$run/properties-before.tsv" "$run/properties-after.tsv" || errors=1
+    zfs list -Hpr -t filesystem -o name,mounted targetpool > "$run/mounted-after.tsv" || errors=1
+    awk -F '\t' '{print $1 "\t" $3}' "$run/datasets-before.tsv" > "$run/mounted-original.tsv"
+    cmp "$run/mounted-original.tsv" "$run/mounted-after.tsv" || errors=1
+    return "$errors"
+}
+
+stop_worker()
+{
+    if [ -n "$worker" ] && kill -0 "$worker" 2>/dev/null; then
+        # sort is the only child executable used by this one-shot worker.
+        children=$(pgrep -P "$worker" -x sort || :)
+        [ -z "$children" ] || kill -TERM $children 2>/dev/null || :
+        kill -TERM "$worker" 2>/dev/null || :
+        wait "$worker" 2>/dev/null || :
+    fi
+    worker=
+}
+
+finish()
+{
+    rc=$?
+    trap - EXIT HUP INT TERM
+    [ -z "$watchdog" ] || kill -TERM "$watchdog" 2>/dev/null || :
+    stop_worker
+    if [ "$changed" = yes ]; then
+        phase=restoring
+        message='Restoring original properties and mounts'
+        write_state
+        if restore_properties; then
+            changed=no
+        else
+            state=RESTORATION_FAILED
+            phase=restoring
+            message='Restoration needs attention; inspect controller.log'
+            write_state
+            exit 1
+        fi
+    fi
+    zpool get -Hp -o name,property,value health,allocated,free,freeing,feature@chunkdedup,bcloneused,bclonesaved targetpool > "$run/pool-after.tsv" || rc=1
+    zpool status targetpool > "$run/pool-status-after.txt" || rc=1
+    if [ "$finished" = yes ] && [ "$rc" -eq 0 ]; then
+        state=PASS
+        phase=complete
+        message='All eligible passes finished; original properties and mounts restored'
+    else
+        state=FAILED
+        phase=stopped
+        message='Pass stopped; original properties and mounts restored; see retained evidence'
+        rc=1
+    fi
+    date +%s > "$run/completed_epoch"
+    write_state
+    exit "$rc"
+}
+
+[ "$(hostname -s)" = REPLACE_WITH_REVIEWED_HOST ]
+[ "$(kenv -q smbios.system.uuid)" = REPLACE_WITH_REVIEWED_HOST_UUID ]
+[ "$(sysctl -n vfs.zfs.version.module)" = 2.4.4-1 ]
+[ "$(sysctl -n vfs.zfs.chunkdedup_test_mode)" = 0 ]
+[ "$(zpool get -H -o value guid targetpool)" = REPLACE_WITH_TARGET_POOL_GUID ]
+[ "$(zpool get -H -o value health targetpool)" = ONLINE ]
+[ "$(zpool get -H -o value feature@chunkdedup targetpool)" = enabled ]
+[ "$(mount -p | awk '$2=="/" {print $1}')" = zroot/ROOT/zfs-hybrid-candidate ]
+[ -s "$run/PREPARED" ]
+[ "$(sha256 -q /boot/modules/zfs-hybrid-candidate.ko)" = "$(cat "$run/admitted-module.sha256")" ]
+[ "$(sha256 -q /sbin/zfs)" = "$(cat "$run/admitted-zfs.sha256")" ]
+[ "$(sha256 -q /sbin/zpool)" = "$(cat "$run/admitted-zpool.sha256")" ]
+[ ! -e "$run/started_epoch" ]
+[ -d "$checkpoint_root" ] && [ ! -L "$checkpoint_root" ]
+[ "$(stat -f '%u:%Lp' "$checkpoint_root")" = 0:700 ]
+[ -s "$run/progress_probe.so" ]
+zfs get -Hpr -t filesystem -o name,property,value,source,received readonly,chunkdedup,canmount,mountpoint targetpool > "$run/preflight-properties.tsv"
+cmp "$run/properties-before.tsv" "$run/preflight-properties.tsv"
+# File datasets only: encrypted filesystems and zvols have no supported operation.
+awk -F '\t' -v run="$run" 'BEGIN{OFS="\t"} $8=="off" && $7=="off" && $9=="off" && $10=="off" && $4~/^\// {++n; point=($3=="no" ? run "/mounts/" n : $4); print n,$1,$2,$3,point,$11}' "$run/datasets-before.tsv" > "$run/queue.tsv"
+cmp "$run/prepared-queue.tsv" "$run/queue.tsv"
+awk -F '\t' '$8!="off" || $7!="off" || $9!="off" || $10!="off" || $4!~/^\//' "$run/datasets-before.tsv" > "$run/filesystems-skipped.tsv"
+total=$(wc -l < "$run/queue.tsv" | tr -d ' ')
+logical_total=$(awk -F '\t' '{n+=$6} END{printf "%.0f",n}' "$run/queue.tsv")
+[ "$total" -gt 0 ]
+# Include every previously confirmed result in the first dashboard generation.
+# The unfinished recovery-target pass requires its imported SSD checkpoint; other GUIDs keep their stable paths.
+: > "$run/carried-validated.tsv"
+while IFS="$tab" read -r id ds guid was_mounted point bytes; do
+    if [ -s "$run/datasets/$id/carried-from" ]; then
+        [ "$(zfs get -H -o value guid "$ds")" = "$guid" ]
+        carried_complete "$id" "$ds" "$guid"
+        completed=$((completed + 1))
+        logical_completed=$((logical_completed + bytes))
+        printf '%s\t%s\t%s\n' "$id" "$ds" "$guid" >> "$run/carried-validated.tsv"
+    else
+        checkpoint_for "$guid" "$ds" "$point" || { echo "Required recovery checkpoint refused: $ds" >&2; exit 1; }
+    fi
+done < "$run/queue.tsv"
+started=$(date +%s)
+printf '%s\n' "$started" > "$run/started_epoch"
+printf '%s\n' "$$" > "$run/controller.pid"
+touch "$run/mounted-by-run.tsv"
+mkdir -p "$run/datasets" "$run/mounts"
+trap finish EXIT
+trap 'exit 130' HUP INT TERM
+write_state
+
+# Freeze inherited protection values while changing a parent dataset's settings.
+# This prevents temporarily making its other targetpool children writable.
+changed=yes
+while IFS="$tab" read -r ds prop value source received; do
+    case "$prop" in readonly|chunkdedup) zfs set -u "$prop=$value" "$ds" ;; esac
+done < "$run/properties-before.tsv"
+
+# Heartbeat and resource guard persist independently of the SSH connection.
+controller=$$
+(
+    trap - EXIT
+    trap 'exit 0' HUP INT TERM
+    trap 'rc=$?; if [ "$rc" -ne 0 ]; then printf "Resource guard failed\n" > "$run/stop-reason.txt"; kill -TERM "$controller" 2>/dev/null || :; fi' EXIT
+    while kill -0 "$controller" 2>/dev/null; do
+        date +%s > "$run/heartbeat.new"
+        mv "$run/heartbeat.new" "$run/heartbeat"
+        reason=
+        tmp_kb=$(df -k /tmp | awk 'NR==2 {print $4}')
+        pool_free=$(zpool get -Hp -o value free targetpool)
+        health=$(zpool get -H -o value health targetpool)
+        [ "$tmp_kb" -ge 134217728 ] || reason='Temporary catalog space below 128 GiB'
+        [ "$pool_free" -ge 137438953472 ] || reason='Backup pool free space below 128 GiB'
+        [ "$health" = ONLINE ] || reason='Backup pool health changed'
+        [ ! -e "$run/STOP" ] || reason='Stop requested'
+        if [ -n "$reason" ]; then
+            printf '%s\n' "$reason" > "$run/stop-reason.txt"
+            kill -TERM "$controller"
+            exit 0
+        fi
+        sleep 15
+    done
+) >> "$run/guard.log" 2>&1 &
+watchdog=$!
+
+# Small datasets first; each pass sees its whole dataset, preserving all matches.
+sort -n -k6,6 "$run/queue.tsv" > "$run/order.tsv"
+while IFS="$tab" read -r id current guid was_mounted point size; do
+    [ ! -e "$run/STOP" ]
+    [ "$(zfs get -H -o value guid "$current")" = "$guid" ]
+    [ "$(zpool get -H -o value health targetpool)" = ONLINE ]
+    item="$run/datasets/$id"
+    if [ -s "$item/carried-from" ]; then
+        carried_complete "$id" "$current" "$guid"
+        continue
+    fi
+    [ ! -e "$item" ]
+    mkdir -p "$item"
+    checkpoint_for "$guid" "$current" "$point" || { echo "Required recovery checkpoint refused: $current" >&2; exit 1; }
+    printf '%s\n' "$checkpoint" > "$item/checkpoint-path"
+    ln -s "$checkpoint/chunk-estimates.jsonl" "$item/chunk-estimates.jsonl"
+    printf '%s\n' "$current" > "$item/dataset"
+    printf '%s\n' "$guid" > "$item/dataset-guid"
+    zfs get -Hp -o name,property,value used,referenced,logicalreferenced,usedbysnapshots "$current" > "$item/allocation-before.tsv"
+    zpool get -Hp -o name,property,value allocated,free,bcloneused,bclonesaved,freeing targetpool > "$item/pool-before.tsv"
+    [ "$(zfs get -H -o value mounted "$current")" = "$was_mounted" ]
+    # Change offline properties before mounting; FreeBSD's property setter
+    # otherwise attempts a remount at the dataset's normal property path.
+    zfs set -u chunkdedup=on "$current"
+    zfs set -u readonly=off "$current"
+    if [ "$was_mounted" = no ]; then
+        depth=$(printf '%s' "$current" | awk -F / '{print NF}')
+        printf '%s\t%s\n' "$depth" "$current" >> "$run/mounted-by-run.tsv"
+        mkdir -p "$point"
+        mount -t zfs -o rw,noatime "$current" "$point"
+    else
+        mount -u -o rw "$point"
+    fi
+    # The administrative status operation needs an active mounted objset.
+    zfs chunkdedup status "$current" > "$item/cdc-before.txt"
+    : > "$item/progress.tsv"
+    printf '%s\n' "$item/progress.tsv" > "$run/progress-path.new"
+    mv "$run/progress-path.new" "$run/progress-path"
+    ln -sfn "$item/optimize.log" "$run/current.optimize.log"
+    ln -sfn "$item/optimize.stderr" "$run/current.optimize.stderr"
+    phase=scanning
+    message='Scanning whole dataset; verified native block sharing only'
+    date +%s > "$item/started_epoch"
+    write_state
+    env CD_PROGRESS_PATH="$item/progress.tsv" LD_PRELOAD="$run/progress_probe.so" /usr/bin/nice -n 20 /sbin/zfs chunkdedup optimize --method=block --threads=40 --min-age 3 --checkpoint "$checkpoint" --report "$checkpoint/chunk-estimates.jsonl" -r "$point" > "$item/optimize.log" 2> "$item/optimize.stderr" &
+    worker=$!
+    write_state
+    rc=0
+    wait "$worker" || rc=$?
+    worker=
+    printf '%s\n' "$rc" > "$item/exit-status"
+    phase=restoring
+    message='Restoring dataset protection and checking reference accounting'
+    write_state
+    zpool sync targetpool
+    zfs chunkdedup status "$current" > "$item/cdc-after.txt"
+    cmp "$item/cdc-before.txt" "$item/cdc-after.txt"
+    original_readonly=$(awk -F '\t' -v d="$current" '$1==d && $2=="readonly" {print $3}' "$run/properties-before.tsv")
+    original_chunkdedup=$(awk -F '\t' -v d="$current" '$1==d && $2=="chunkdedup" {print $3}' "$run/properties-before.tsv")
+    if [ "$was_mounted" = no ]; then zfs unmount "$current"; fi
+    zfs set -u "chunkdedup=$original_chunkdedup" "$current"
+    zfs set -u "readonly=$original_readonly" "$current"
+    if [ "$was_mounted" = yes ]; then
+        case "$original_readonly" in on) mount -u -o ro "$point" ;; off) mount -u -o rw "$point" ;; esac
+    fi
+    phase=verifying
+    write_state
+    [ "$(zpool get -H -o value feature@chunkdedup targetpool)" = enabled ]
+    [ "$(zpool get -H -o value health targetpool)" = ONLINE ]
+    [ "$(zfs get -H -o value readonly "$current")" = "$original_readonly" ]
+    [ "$(zfs get -H -o value chunkdedup "$current")" = "$original_chunkdedup" ]
+    zfs get -Hp -o name,property,value used,referenced,logicalreferenced,usedbysnapshots "$current" > "$item/allocation-after.tsv"
+    zpool get -Hp -o name,property,value allocated,free,bcloneused,bclonesaved,freeing targetpool > "$item/pool-after.tsv"
+    date +%s > "$item/completed_epoch"
+    if [ "$rc" -eq 0 ]; then
+        completed=$((completed + 1))
+        logical_completed=$((logical_completed + size))
+        printf 'PASS\n' > "$item/status"
+    else
+        failed=$((failed + 1))
+        printf 'FAILED\n' > "$item/status"
+    fi
+    printf '%s\t%s\t%s\n' "$current" "$rc" "$(date -u)" >> "$run/results.tsv"
+done < "$run/order.tsv"
+current=
+size=0
+worker=
+[ "$failed" -eq 0 ]
+finished=yes
+exit 0

@@ -7,6 +7,7 @@ from this directory, or `./scripts/verify.sh` from the repository root.
 - [Commands, selection policy and format boundaries](HYBRID.md)
 - [Catalog estimates and saved reports](CATALOG_REPORT.md)
 - [Recovery and operating guidance](RECOVERY.md)
+- [Recovered operational references](operations/README.md)
 - [Current dirty-data gauge and isolated validation](DIRTY_DATA.md)
 - [Guarded FreeBSD lab recipe](lab-setup/README.md)
 - [Microsoft conformance fixtures and oracle source](conformance/README.md)
