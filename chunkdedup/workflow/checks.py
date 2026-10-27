@@ -29,6 +29,11 @@ REQUIRED = (
     'cmd/zfs/chunkdedup_parallel.h', 'cmd/zfs/chunkdedup_checkpoint.h',
     'include/sys/dsl_pool.h', 'module/zfs/dsl_pool.c',
 )
+OPERATIONS = (
+    'chunkdedup/operations/run.sh.example',
+    'chunkdedup/operations/tests/test_controller.py',
+    'chunkdedup/operations/tests/fixture.py',
+)
 MINIMUM_ASSERTIONS = {'chunker_api': 26, 'core_model': 104,
                       'worker_batches': 26, 'packaging': 8}
 
@@ -515,6 +520,12 @@ sys.exit(status)
                       self.snapshot], env=dict(self.environment, CC=shlex.join(self.cc),
                                               WORKFLOW_CHECKPOINT_REPORT=str(checkpoint)))
         self.current['evidence']['artifacts'].append(self.artifact(checkpoint))
+        crash = folder / 'crash-recovery.json'
+        self.execute([sys.executable, self.args.kit / 'lab-setup/tests/test_crash_recovery.py',
+                      '--repo', self.snapshot, '--report', crash],
+                     env=dict(self.environment, CC=shlex.join(self.cc)))
+        self.current['evidence']['artifacts'].append(self.artifact(crash))
+        self.execute([sys.executable, self.args.repo / 'chunkdedup/lab-setup/tests/test_restore_validate.py'])
         preflight = folder / 'recovery-preflight.json'
         self.execute([sys.executable, self.args.kit / 'workflow/test_recovery_preflight.py',
                       '--report', preflight])
@@ -543,6 +554,11 @@ sys.exit(status)
         self.current['evidence']['scope'] = 'Immutable media-builder unit fixtures; synthetic package files, no real package installation or VM actions'
         if runtime_error:
             raise runtime_error
+        controller = folder / 'controller.json'
+        self.execute([sys.executable, self.snapshot / OPERATIONS[1],
+                      '--controller', self.snapshot / OPERATIONS[0], '--report', controller])
+        self.current['evidence']['artifacts'].append(self.artifact(controller))
+        self.current['evidence']['controller'] = json.loads(controller.read_text())
 
     def persist(self):
         statuses = [row['status'] for row in self.results]
@@ -567,7 +583,7 @@ sys.exit(status)
         self.source_digest = self.args.source_digest or computed
         if self.args.source_digest and self.args.source_digest != computed:
             raise CheckError('INFRA_FAILURE', 'passed source_digest does not match canonical supplied source tree')
-        relevant = [entry for entry in initial if entry['path'] in REQUIRED]
+        relevant = [entry for entry in initial if entry['path'] in REQUIRED + OPERATIONS]
         for entry in relevant:
             if entry['type'] != 'file':
                 continue

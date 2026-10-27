@@ -68,6 +68,24 @@ checkpoint_for()
     esac
 }
 
+check_resources()
+{
+    reason='Resource guard failed'
+    # Preserve command failures; a pipeline would hide a failed df behind awk.
+    tmp_usage=$(df -k /tmp) || return 1
+    tmp_kb=$(printf '%s\n' "$tmp_usage" | awk 'NR==2 {print $4}')
+    pool_free=$(zpool get -Hp -o value free targetpool) || return 1
+    health=$(zpool get -H -o value health targetpool) || return 1
+    case "$tmp_kb" in ''|*[!0-9]*) return 1 ;; esac
+    case "$pool_free" in ''|*[!0-9]*) return 1 ;; esac
+    reason=
+    [ "$tmp_kb" -ge 134217728 ] || reason='Temporary catalog space below 128 GiB'
+    [ "$pool_free" -ge 137438953472 ] || reason='Backup pool free space below 128 GiB'
+    [ "$health" = ONLINE ] || reason='Backup pool health changed'
+    [ ! -e "$run/STOP" ] || reason='Stop requested'
+    [ -z "$reason" ]
+}
+
 write_state()
 {
     {
@@ -204,6 +222,8 @@ while IFS="$tab" read -r id ds guid was_mounted point bytes; do
         checkpoint_for "$guid" "$ds" "$point" || { echo "Required recovery checkpoint refused: $ds" >&2; exit 1; }
     fi
 done < "$run/queue.tsv"
+# Refuse before any property changes or worker launch, then keep watching.
+check_resources || { printf '%s\n' "$reason" > "$run/stop-reason.txt"; exit 1; }
 started=$(date +%s)
 printf '%s\n' "$started" > "$run/started_epoch"
 printf '%s\n' "$$" > "$run/controller.pid"
@@ -229,15 +249,7 @@ controller=$$
     while kill -0 "$controller" 2>/dev/null; do
         date +%s > "$run/heartbeat.new"
         mv "$run/heartbeat.new" "$run/heartbeat"
-        reason=
-        tmp_kb=$(df -k /tmp | awk 'NR==2 {print $4}')
-        pool_free=$(zpool get -Hp -o value free targetpool)
-        health=$(zpool get -H -o value health targetpool)
-        [ "$tmp_kb" -ge 134217728 ] || reason='Temporary catalog space below 128 GiB'
-        [ "$pool_free" -ge 137438953472 ] || reason='Backup pool free space below 128 GiB'
-        [ "$health" = ONLINE ] || reason='Backup pool health changed'
-        [ ! -e "$run/STOP" ] || reason='Stop requested'
-        if [ -n "$reason" ]; then
+        if ! check_resources; then
             printf '%s\n' "$reason" > "$run/stop-reason.txt"
             kill -TERM "$controller"
             exit 0

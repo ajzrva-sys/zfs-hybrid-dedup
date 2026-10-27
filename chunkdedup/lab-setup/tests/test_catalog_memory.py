@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import shlex
 import subprocess
+import sys
 import tempfile
 
 
@@ -40,7 +41,8 @@ def main():
         for sanitized in (False, True):
             binary = folder / ('sanitized' if sanitized else 'strict')
             extra = ['-fsanitize=address,undefined', '-fno-omit-frame-pointer'] if sanitized else []
-            subprocess.run(command + extra + ['-o', str(binary)], check=True)
+            libraries = [] if sys.platform == 'darwin' else ['-lcrypto']
+            subprocess.run(command + extra + ['-o', str(binary)] + libraries, check=True)
             subprocess.run([str(binary), str(folder)], check=True, timeout=45,
                 stdout=subprocess.DEVNULL, env=dict(os.environ, ASAN_OPTIONS='detect_leaks=0:abort_on_error=1'))
             reports = []

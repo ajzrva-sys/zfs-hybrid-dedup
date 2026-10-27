@@ -1,22 +1,22 @@
 {
   "schema": 1,
-  "updated": "2026-10-22",
+  "updated": "2026-10-26",
   "scope": "Public component summaries only; operational identifiers, installed artifact hashes, private paths and raw receipts excluded",
-  "publication_projection_digest": "344999a967b78f88840d71ad4ace57f057a7a011096a2b32faeefe29d9c91ff8",
+  "publication_projection_digest": "60d4f9d39239a7b06c4db703ec3c4e2c28db499f382855ddfd0c562fd0fcaa1c",
   "local_evaluation": {
     "schema": 1,
     "profile": "local",
     "status": "PASS",
-    "source_digest": "cfafc3d2f00a51639ecc66512325730e079c1c8a6645f069bf580d47650a338b",
+    "source_digest": "a5d9622110f98a44f5a7e49338ccc8f4124f495cccbb4f45cb5b0f36459f69c4",
     "policy_id": "native-chunkdedup-prototype-v1",
-    "evaluated_at": "2026-10-22T11:36:59.633551+00:00",
-    "artifact_digests_checked": 191,
+    "evaluated_at": "2026-10-27T02:03:39.808398+00:00",
+    "artifact_digests_checked": 193,
     "assessments": {
-      "source_files_verified": 4341,
+      "source_files_verified": 4366,
       "immutable_baseline_files_verified": 141,
       "conformance_fixtures_verified": 35
     },
-    "claim": "local models/conformance only"
+    "claim": "Combined frozen publication local conformance/models, checkpoint/crash/restore-validator and controller command-fixture checks; no combined full native-suite claim."
   },
   "latest_full_native_evaluation": {
     "status": "NOT_RUN",
@@ -650,7 +650,7 @@
       ]
     }
   ],
-  "local_evaluation_projection_relation": "All 4,139 implementation projection entries match the passing frozen publication run. Root AGENTS.md and the verification kit are outside that projection but included in the complete-tree local evaluation. Subsequent changes record this result in SOURCE.json, VALIDATION.json and kit checksums only.",
+  "local_evaluation_projection_relation": "All 4,139 implementation projection entries match the passing frozen combined publication. Only SOURCE.json, VALIDATION.json and kit checksums changed afterward to record this result.",
   "workflow_safety_tests": {
     "recovery_preflight_selftests_passed": 44,
     "independent_evaluator_cases_passed": 29,
@@ -689,5 +689,43 @@
     "SOURCE.json",
     "VALIDATION.json",
     "SHA256SUMS"
-  ]
+  ],
+  "previous_local_evaluation": {
+    "schema": 1,
+    "profile": "local",
+    "status": "PASS",
+    "source_digest": "cfafc3d2f00a51639ecc66512325730e079c1c8a6645f069bf580d47650a338b",
+    "policy_id": "native-chunkdedup-prototype-v1",
+    "evaluated_at": "2026-10-22T11:36:59.633551+00:00",
+    "artifact_digests_checked": 191,
+    "assessments": {
+      "source_files_verified": 4341,
+      "immutable_baseline_files_verified": 141,
+      "conformance_fixtures_verified": 35
+    },
+    "claim": "local models/conformance only"
+  },
+  "sharing_recovery": {
+    "scope": "Selected-plan/frontier and authenticated sparse-proof recovery; portable process-crash tests; validation-only native checkpoint loading",
+    "native_driver_sha256": "56f2e58b8b1ebcbb5dfd7bee338279db3e5043b67c919bffbc400ad55eae17d4",
+    "native_checkpoint_header_sha256": "2331171636a1c4031b3355bd8736c6a2dfcdabfa9a6b63e2c86c89c534b3d02d",
+    "production_scale_restore_authentication": {
+      "status": "PASS",
+      "exit_code": 0,
+      "elapsed_seconds": 2112.6733045578003,
+      "catalog_gib_approximate": 505,
+      "source_files": 2569137,
+      "scope": "Private writable COW copy, full catalog hashes and saved source metadata. No source-content analysis or resumed sharing."
+    },
+    "production_sharing_resume": "NOT_RUN",
+    "abrupt_power_loss": "NOT_RUN",
+    "combined_full_native_suite": "NOT_RUN"
+  },
+  "reference_components": {
+    "prefetch_generated_fixture_checks": 37,
+    "prefetch_python_requirement": "3.11+",
+    "sharing_impact_generated_fixture_checks": 8,
+    "private_engine_oracle_tests": "NOT_RUN as a standalone published suite",
+    "operational_orchestration": "Excluded: host-specific deployment, status, saver, restoration, backup configurations and private operational receipts."
+  }
 }

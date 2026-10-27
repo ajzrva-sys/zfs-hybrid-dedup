@@ -89,3 +89,36 @@ multicore scaling. The hybrid optimizer itself defaults to online CPUs, capped
 at 64, and accepts `--threads=1..64`. The separate block-only command is
 currently serial. Matched performance/RAM and forced-power-loss qualification
 remain incomplete; the 1.25x foreground-read target is unqualified.
+
+## Deterministic crash qualification
+
+The local gate includes strict and ASan/UBSan process-crash tests at payload
+sync, manifest sync, atomic rename, directory sync, sort pipe-write and sort
+merge boundaries. Each test stops a fresh child session at a named marker,
+kills only that session and reopens the checkpoint in a separate process.
+Previously committed prefixes remain authoritative; uncommitted tails replay.
+These passing portable tests do not simulate power loss.
+
+The disposable native runner also supports a fresh test-only build:
+
+```sh
+./scripts/verify.sh --profile native --host bsd --crash-recovery --output ../hybrid-crash-verification
+```
+
+Local verification never executes this option. It retains the existing offline
+guest, storage, host-state and restoration guards. Eight additional native cases
+cover the publication/sort points and before/after-share interruption, with
+content, metadata, report, checkpoint and copy-on-write validation. Native crash
+execution remains **NOT_RUN**; availability of the runner is not a native PASS.
+
+Fault injection is enabled only by force-including `recovery_fault.h` in this
+private test build. Normal `CD_RECOVERY_POINT` calls are no-ops with no
+environment-controlled fault behavior. Fault builds must remain in the
+disposable guest and cannot be reused through normal cached-build receipts.
+Never modify or restart a production worker to adopt these test hooks.
+
+Abrupt guest power-off/reboot qualification requires a separately reviewed
+disposable lab and evidence for checkpoint recovery, source/metadata identity,
+contents and copy-on-write behavior after boot. No automated host power-off is
+added. Process-kill results, clean shutdowns and native loader authentication
+do not qualify abrupt power loss; those cases remain **NOT_RUN**.

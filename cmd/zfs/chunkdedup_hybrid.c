@@ -145,6 +145,7 @@ cd_sort_flush(struct cd_sort_run *run, const atomic_int *stop)
 		    run->used - offset);
 		if (written > 0) {
 			offset += (size_t)written;
+			CD_RECOVERY_POINT("sort-writing");
 			continue;
 		}
 		if (written == 0)
@@ -453,6 +454,7 @@ cd_hybrid_sort_parallel_impl(FILE *input, FILE **output, const char *directory,
 		_exit(127);
 	}
 	runs[0].pid = pid;
+	CD_RECOVERY_POINT("sort-merge");
 	error = cd_sort_wait(runs, 1, stop);
 done:
 	cd_sort_abort(runs, threads);

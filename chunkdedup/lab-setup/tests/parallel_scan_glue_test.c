@@ -21,6 +21,7 @@
 #include <string.h>
 #include <unistd.h>
 #include "chunkdedup_parallel.h"
+#include "chunkdedup_checkpoint.h"
 
 typedef unsigned int uint_t;
 typedef int boolean_t;
@@ -30,11 +31,9 @@ typedef int boolean_t;
 #define ARRAY_SIZE(a) (sizeof (a) / sizeof ((a)[0]))
 enum cd_method { CD_METHOD_AUTO, CD_METHOD_BLOCK, CD_METHOD_CHUNK };
 static volatile sig_atomic_t cd_stop;
-/* This preexisting fixture deliberately runs with checkpoints disabled. */
-struct cd_checkpoint { FILE *streams[5]; int loaded; };
+/* Checkpoint transport remains disabled, but catalog layout uses the actual
+ * checkpoint definitions, including its embedded sharing-progress record. */
 #include SCAN_TYPES_SOURCE
-static void cd_checkpoint_close(struct cd_checkpoint *checkpoint)
-{ (void)checkpoint; assert(!"checkpoint transport disabled in scan glue fixture"); }
 static int cd_catalog_checkpoint_save(struct cd_catalog *catalog, boolean_t complete)
 { (void)complete; assert(catalog->checkpoint == NULL); return 0; }
 
@@ -274,6 +273,7 @@ cancel_before_spool_cleanup(void)
 int
 main(void)
 {
+    (void)&cd_checkpoint_open; /* Real type dependency; no checkpoint transport. */
     (void) alarm(30);
     merge_and_links();
     copy_rejects_foreign_ids();

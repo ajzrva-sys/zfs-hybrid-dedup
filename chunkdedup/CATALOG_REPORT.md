@@ -51,7 +51,13 @@ reading or hashing their contents. In-flight files and work since the last
 commit may be repeated. A complete scan skips discovery entirely. Each finished
 native/chunk sort is committed independently and reused after restart. Catalog
 selection uses a disposable file-table copy so interrupted decisions cannot
-modify the saved scan or double-charge estimates.
+modify the saved scan or double-charge estimates. Once selection is committed,
+the immutable selected table, report binding and deferred dispositions are
+reused. Native-sharing progress is committed only after earlier requests drain
+and the target pool is synced. Recovery skips this completed prefix, preserving
+canonical/member position inside giant groups. Work beyond the last commit may
+replay. The usual 60-second publication interval can be delayed by active reads
+or sharing operations.
 
 Payloads and the manifest are flushed and synced before atomic publication.
 Resume checks the schema, ABI, options, pool/dataset identity, target identity,
@@ -69,8 +75,25 @@ Checkpoint files are owner-only and locked against simultaneous use. They
 survive success, failure and cancellation; remove the directory explicitly when
 it is no longer needed. Retain enough disk space for both raw and sorted
 catalogs, sort spills, the working file table and reports. A published report is
-preserved on resume. Sharing may replay from the beginning; completed shares
-survive and source identity/kernel comparison checks still apply.
+preserved on resume. Scan/sort-only checkpoints still repeat selection and sharing
+traversal. New sharing checkpoints reuse the committed plan/frontier; completed
+shares survive replay and source identity/kernel comparison checks still apply.
+
+An optional authenticated `sharing.proven` file can bind separately qualified
+completed whole-group ranges in a legacy catalog. The reader verifies their
+checkpoint/payload/selected bindings and group boundaries, skips only proven
+ranges and processes uncertain groups normally. Proof is retained across later
+sharing commits; missing or changed proof refuses recovery. Group or read
+counters alone cannot create a safe recovery frontier.
+
+`--restore-validate-only` requires a proof-bearing legacy import with authenticated
+`sharing.proven`; ordinary checkpoints without this proof are refused. It validates
+an already complete checkpoint without
+starting sharing. Its loader hashes committed catalogs and validates source
+metadata, report and sharing/proof state, so a large checkpoint still takes time
+to authenticate. It requires a private writable copy-on-write checkpoint copy
+because normal loader recovery may truncate uncommitted tails. See
+[restore validation](RECOVERY.md#validate-a-restore-without-starting-sharing).
 
 An already running executable cannot gain checkpoint support in place. Leave
 such a worker running to preserve its existing progress; this option protects

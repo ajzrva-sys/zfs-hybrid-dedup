@@ -9,6 +9,8 @@ here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
 temporary=$(mktemp -d "${TMPDIR:-/tmp}/zfs-parallel-scan.XXXXXX")
 trap 'rm -rf -- "$temporary"' EXIT HUP INT TERM
 compiler=${CC:-cc}
+checkpoint_libraries=
+if [ "$(uname -s)" != Darwin ]; then checkpoint_libraries=-lcrypto; fi
 "$compiler" -std=c11 -Wall -Wextra -Werror -pthread -g \
     -I"$headers" "$here/parallel_scan_test.c" -o "$temporary/parallel-scan-test"
 "$temporary/parallel-scan-test"
@@ -55,7 +57,7 @@ extract cd_scan_submit 'static int' >> "$temporary/functions.inc"
     -fsanitize=address,undefined -fno-omit-frame-pointer -I"$headers" \
     "-DSCAN_TYPES_SOURCE=\"$temporary/types.inc\"" \
     "-DSCAN_FUNCTIONS_SOURCE=\"$temporary/functions.inc\"" \
-    "$here/parallel_scan_glue_test.c" -o "$temporary/parallel-scan-glue"
+    "$here/parallel_scan_glue_test.c" -o "$temporary/parallel-scan-glue" $checkpoint_libraries
 "$temporary/parallel-scan-glue"
 
 # Exercise the current sharing driver through the same local verification gate.

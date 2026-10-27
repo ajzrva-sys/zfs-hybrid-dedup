@@ -1,6 +1,11 @@
 /* SPDX-License-Identifier: CDDL-1.0 */
 #ifndef CHUNKDEDUP_HYBRID_H
 #define CHUNKDEDUP_HYBRID_H
+/* Qualification builds may override this; normal binaries have no fault path. */
+#ifndef CD_RECOVERY_POINT
+#define CD_RECOVERY_POINT(name) ((void)0)
+#endif
+
 #include <stdint.h>
 #include <stdio.h>
 #include <stdatomic.h>

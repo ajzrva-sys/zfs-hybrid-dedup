@@ -1,0 +1,70 @@
+{
+  "platform": "FreeBSD",
+  "byteorder": "little",
+  "record_size": 1608,
+  "stat_size": 224,
+  "boolean_size": 4,
+  "block_method": 1,
+  "fields": {
+    "dataset": {
+      "offset": 0,
+      "size": 256
+    },
+    "path": {
+      "offset": 256,
+      "size": 1024
+    },
+    "dataset_id": {
+      "offset": 1512,
+      "size": 8
+    },
+    "block_size": {
+      "offset": 1520,
+      "size": 8
+    },
+    "method": {
+      "offset": 1604,
+      "size": 4
+    },
+    "chunked": {
+      "offset": 1592,
+      "size": 4
+    },
+    "deferred": {
+      "offset": 1600,
+      "size": 4
+    },
+    "st_dev": {
+      "offset": 1280,
+      "size": 8
+    },
+    "st_ino": {
+      "offset": 1288,
+      "size": 8
+    },
+    "st_mode": {
+      "offset": 1304,
+      "size": 2
+    },
+    "st_gen": {
+      "offset": 1416,
+      "size": 8
+    },
+    "st_size": {
+      "offset": 1392,
+      "size": 8
+    },
+    "st_mtim.tv_sec": {
+      "offset": 1344,
+      "size": 8
+    },
+    "st_mtim.tv_nsec": {
+      "offset": 1352,
+      "size": 8
+    },
+    "_end": {
+      "offset": 0,
+      "size": 0
+    }
+  }
+}

@@ -63,13 +63,24 @@ class NativeTests(unittest.TestCase):
             path = Path(temporary) / 'receipt.json'; receipt = self.cached_fixture()
             path.write_text(json.dumps(receipt))
             self.assertEqual(native.cached_build_receipt(path, '0' * 64), receipt)
-            for changes in [dict(status='RUNNING'), dict(phase='compile'), dict(source_digest='3' * 64),
+            for changes in [dict(qualification_faults=True), dict(status='RUNNING'), dict(phase='compile'), dict(source_digest='3' * 64),
                             dict(prefix='/tmp/other'), dict(binary='/tmp/zfs'), dict(module='/tmp/zfs.ko'),
                             dict(module_sha256='invalid'), dict(build_run_id='../escape')]:
                 with self.subTest(changes=changes):
                     path.write_text(json.dumps(dict(receipt, **changes)))
                     with self.assertRaises((AssertionError, TypeError)):
                         native.cached_build_receipt(path, '0' * 64)
+
+    def test_crash_build_does_not_replace_normal_cache_or_hybrid_receipt(self):
+        driver = native.GUEST_DRIVER
+        compile(driver, '<guest-driver>', 'exec')
+        self.assertIn("if C['mode']=='build' and not C.get('crash_recovery'):", driver)
+        self.assertIn("env['CPPFLAGS']+=' -include '", driver)
+        self.assertIn("receipt['recovery']=", driver)
+        tests = HERE.parent / 'lab-setup/tests'
+        source = (tests / 'crash_native.py').read_text()
+        self.assertIn("s.report = s.root / 'crash-progress.json'", source)
+        self.assertIn("'forced_vm_power_loss': 'NOT_RUN'", source)
 
     def test_smoke_media_freezes_cached_prefix_before_adaptation(self):
         for mode in ('build', 'smoke'):
@@ -168,7 +179,9 @@ class NativeTests(unittest.TestCase):
                 (HERE.parent / 'lab-setup/tests/regression.py').read_text())})
 
     def test_new_hybrid_media_and_report_are_bound_separately(self):
-        self.assertEqual(native.HYBRID_TEST_FILES, ('hybrid.py', 'hybrid_ctl.c'))
+        self.assertEqual(native.HYBRID_TEST_FILES[:2], ('hybrid.py', 'hybrid_ctl.c'))
+        self.assertIn('crash_native.py', native.HYBRID_TEST_FILES)
+        self.assertIn('recovery_fault.h', native.HYBRID_TEST_FILES)
         self.assertIn("t.getmembers()}=={'hybrid/'+name for name in C['hybrid_tests']}", native.GUEST_DRIVER)
         self.assertIn("sha(report),'test_files':C['hybrid_tests']", native.GUEST_DRIVER)
         self.assertIn("'hybrid-result.json'", native.GUEST_DRIVER)

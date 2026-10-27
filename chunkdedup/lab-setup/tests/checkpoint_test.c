@@ -156,6 +156,91 @@ report_receipt(const char *mode, const char *path, const char *report)
     closed_checkpoint(&checkpoint);
 }
 
+/* The same on-disk helper used by the real sharing coordinator, reopened by
+ * the Python runner in a separate process for every assertion below. */
+static void
+sharing_checkpoint(const char *mode, const char *path, const char *expected)
+{
+    struct cd_checkpoint cp;
+    assert(!cd_checkpoint_open(&cp, path, binding, sizeof (binding)));
+    assert(cp.complete && cp.sorted_mask == 3 && cp.count == 7);
+    FILE *selected = NULL;
+    unsigned char *deferred = NULL;
+    struct cd_checkpoint_share_progress progress = { 0 };
+    int error = cd_checkpoint_selected_load(&cp, &selected, &progress, &deferred);
+    if (!strcmp(mode, "sharing-unselected")) {
+        assert(!cp.selected && error == ENOENT && !selected && !deferred);
+    } else if (!strcmp(mode, "sharing-reject")) {
+        /* Missing committed state must not masquerade as an old checkpoint. */
+        assert(error != 0 && error != ENOENT && !selected && !deferred);
+    } else if (!strcmp(mode, "sharing-seal") ||
+        (!strcmp(mode, "sharing-recover") && error == ENOENT)) {
+        assert(!cp.selected && error == ENOENT);
+        selected = tmpfile();
+        assert(selected);
+        char bytes[256] = { 0 };
+        assert(cp.sizes[0] <= sizeof (bytes));
+        assert(!cd_checkpoint_read(fileno(cp.streams[0]), bytes, (size_t)cp.sizes[0], 0));
+        bytes[0] = 'S'; /* Selected table deliberately differs from files.raw. */
+        assert(fwrite(bytes, 1, (size_t)cp.sizes[0], selected) == cp.sizes[0]);
+        unsigned char bits[7] = { 0 };
+        assert(!cd_checkpoint_selected_save(&cp, selected, &progress, bits));
+        assert(cp.selected && progress.generation == 1 && progress.next_offset == 0);
+        assert(cd_checkpoint_selected_save(&cp, selected, &progress, bits) != 0);
+        assert(!fclose(selected));
+    } else {
+        assert(!error && cp.selected && selected && deferred);
+        assert(fgetc(selected) == 'S');
+        if (!strcmp(mode, "sharing-update")) {
+            assert(progress.generation == 1);
+            progress.next_offset = cp.sizes[3] / 2;
+            progress.in_group = progress.canonical_valid = 1;
+            const uint64_t canonical[] = { 1, 4096, 2, 123 * 4096, 4096, 4096 };
+            memcpy(progress.canonical, canonical, sizeof (canonical));
+            memset(progress.canonical_hash, 'a', 64); progress.canonical_hash[64] = 0;
+            progress.groups = 3; progress.issued = 5; progress.deferred = 2;
+            progress.unequal = 1; progress.successful = 3;
+            progress.shared_bytes = 8192; progress.already_shared_bytes = 4096;
+            progress.compared_bytes = 8192;
+            deferred[2] = deferred[6] = 1;
+            assert(!cd_checkpoint_share_save(&cp, &progress, deferred));
+            assert(progress.generation == 2);
+        } else if (!strcmp(mode, "sharing-done")) {
+            assert(progress.generation == 2);
+            progress.in_group = progress.canonical_valid = 0;
+            progress.next_offset = cp.sizes[3];
+            progress.native_done = 1;
+            assert(!cd_checkpoint_share_save(&cp, &progress, deferred));
+            assert(progress.generation == 3);
+        } else {
+            assert((!strcmp(mode, "sharing-verify") || !strcmp(mode, "sharing-recover")) && expected);
+            unsigned generation = (unsigned)strtoul(expected, NULL, 10);
+            assert(progress.generation == generation && progress.selected_size == cp.sizes[0]);
+            if (generation == 1) {
+                assert(progress.next_offset == 0 && !progress.in_group && !progress.native_done);
+                for (unsigned i = 0; i < 7; i++) assert(!deferred[i]);
+            } else {
+                assert(progress.next_offset == (generation == 2 ? cp.sizes[3] / 2 : cp.sizes[3]));
+                assert(progress.in_group == (generation == 2) &&
+                    progress.canonical_valid == (generation == 2) &&
+                    progress.native_done == (generation == 3));
+                const uint64_t canonical[] = { 1, 4096, 2, 123 * 4096, 4096, 4096 };
+                assert(!memcmp(progress.canonical, canonical, sizeof (canonical)));
+                assert(!strcmp(progress.canonical_hash,
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
+                assert(progress.groups == 3 && progress.issued == 5 && progress.deferred == 2 &&
+                    progress.unequal == 1 && progress.successful == 3);
+                assert(progress.shared_bytes == 8192 && progress.already_shared_bytes == 4096 &&
+                    progress.compared_bytes == 8192);
+                for (unsigned i = 0; i < 7; i++) assert(deferred[i] == (i == 2 || i == 6));
+            }
+        }
+        assert(!fclose(selected));
+        free(deferred);
+    }
+    closed_checkpoint(&cp);
+}
+
 typedef int boolean_t;
 typedef unsigned int uint_t, zfs_type_t;
 #define B_FALSE 0
@@ -426,6 +511,48 @@ sort_orphan_owner(const char *path, int output_fd)
     assert(!"orphan test owner should be killed while merge output is blocked");
 }
 
+/* Abrupt-death cases use the actual persistence and sort implementations. */
+static void
+crash_update(const char *path, bool verify)
+{
+    struct cd_checkpoint cp;
+    assert(!cd_checkpoint_open(&cp, path, binding, sizeof (binding)));
+    assert(cp.loaded && !cp.complete);
+    if (verify) {
+        assert(cp.count == 8 && cp.skipped == 2);
+        for (unsigned i = 0; i < 3; i++) {
+            rewind(cp.streams[i]);
+            char bytes[256] = { 0 };
+            size_t length = fread(bytes, 1, sizeof (bytes), cp.streams[i]);
+            assert(length == strlen(payload[i]) + strlen("next-file\n"));
+            assert(!memcmp(bytes, payload[i], strlen(payload[i])));
+            assert(!strcmp(bytes + strlen(payload[i]), "next-file\n"));
+        }
+    } else {
+        assert(cp.count == 7);
+        for (unsigned i = 0; i < 3; i++)
+            assert(fputs("next-file\n", cp.streams[i]) >= 0);
+        assert(!cd_checkpoint_commit(&cp, 8, 2, false, 0));
+    }
+    closed_checkpoint(&cp);
+}
+
+static void
+crash_sort(const char *path)
+{
+    struct cd_checkpoint cp;
+    assert(!cd_checkpoint_open(&cp, path, binding, sizeof (binding)));
+    assert(cp.loaded && cp.complete);
+    if (!(cp.sorted_mask & 1)) {
+        atomic_int stop = 0;
+        assert(!cd_hybrid_sort_parallel_to(cp.streams[1], cp.streams[3],
+            path, 2, &stop, cp.lockfd));
+        assert(!cd_checkpoint_commit(&cp, 7, 2, true, 1));
+    }
+    assert(cp.sorted_mask == 1 && cp.sizes[3] == strlen(payload[1]));
+    closed_checkpoint(&cp);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -435,7 +562,11 @@ main(int argc, char **argv)
     int stdin_flags = fcntl(STDIN_FILENO, F_GETFD);
     cd_checkpoint_close(&zero);
     assert(fcntl(STDIN_FILENO, F_GETFD) == stdin_flags);
-    if (!strcmp(argv[1], "create"))
+    if (!strcmp(argv[1], "crash-update") || !strcmp(argv[1], "crash-verify"))
+        crash_update(argv[2], !strcmp(argv[1], "crash-verify"));
+    else if (!strcmp(argv[1], "crash-sort"))
+        crash_sort(argv[2]);
+    else if (!strcmp(argv[1], "create"))
         create_checkpoint(argv[2], argc > 3 && !strcmp(argv[3], "complete"));
     else if (!strcmp(argv[1], "verify"))
         verify_checkpoint(argv[2], argc > 3 && !strcmp(argv[3], "complete"),
@@ -462,6 +593,8 @@ main(int argc, char **argv)
         assert(argc == 4);
         report_receipt(argv[1], argv[2], argv[3]);
     }
+    else if (!strncmp(argv[1], "sharing-", 8))
+        sharing_checkpoint(argv[1], argv[2], argc > 3 ? argv[3] : NULL);
     else
         checkpoint_driver_test(argc, argv);
     return (0);

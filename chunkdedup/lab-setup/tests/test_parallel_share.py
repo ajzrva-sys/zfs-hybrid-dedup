@@ -33,6 +33,7 @@ def emit(repo, folder):
     (folder / 'transport.inc').write_text('\n'.join(function(source, name) for name in
         ('cd_identity', 'cd_catalog_open_file', 'cd_deferred')))
     (folder / 'share.inc').write_text(core)
+    (folder / 'apply.inc').write_text(function(source, 'cd_catalog_apply'))
 
 
 def main():
@@ -73,7 +74,8 @@ def main():
                 binary = folder / f'share-{variant}-{sanitized}'
                 definitions = (['-DCD_SHARE_SNAPSHOT_LIMIT=(UINT64_C(4)*sizeof(struct cd_catalog_file))']
                                if variant == 'small' else [])
-                subprocess.run(command + extra + definitions + ['-o', str(binary)], check=True)
+                libraries = [] if sys.platform == 'darwin' else ['-lcrypto']
+                subprocess.run(command + extra + definitions + ['-o', str(binary)] + libraries, check=True)
                 arguments = (['--native-large-snapshot'] if variant == 'native' else
                              ['--small-cap'] if variant == 'small' else [])
                 subprocess.run([str(binary)] + arguments, check=True,

@@ -580,10 +580,13 @@ class Gate:
                       'include/sys/zfs_chunkdedup.h','module/zfs/zfs_chunkdedup.c',
                       'cmd/zfs/chunkdedup_hybrid.c','cmd/zfs/chunkdedup_hybrid.h',
                       'cmd/zfs/chunkdedup_parallel.h','cmd/zfs/chunkdedup_checkpoint.h',
-                      'include/sys/dsl_pool.h','module/zfs/dsl_pool.c'}
+                      'include/sys/dsl_pool.h','module/zfs/dsl_pool.c',
+                      'chunkdedup/operations/run.sh.example',
+                      'chunkdedup/operations/tests/test_controller.py',
+                      'chunkdedup/operations/tests/fixture.py'}
             self.require(isinstance(tested_files,list) and {x['path'] for x in tested_files}==required,
                          'tested_source_coverage',tested_files,sorted(required),
-                         'Include all actual chunker, worker, native-core and dirty-data gauge implementation inputs.')
+                         'Include all actual controller, command fixture, chunker, worker, native-core and dirty-data gauge inputs.')
         if tested_files is not None:
             source_map={x['path']:x for x in self.manifest['source']['files']}
             self.require(isinstance(tested_files,list) and tested_files and all(x==source_map.get(x['path']) for x in tested_files),
@@ -679,7 +682,14 @@ class Gate:
                    'manifest_corruption','payload_corruption','validate_before_truncate',
                    'complete_driver_no_rescan','complete_driver_cached_sort',
                    'partial_driver_only_unfinished','driver_identity_rejection',
-                   'cli_restrictions','published_report_preserved'}
+                   'cli_restrictions','published_report_preserved',
+                   'selected_plan_separate_process_reload',
+                   'sharing_frontier_canonical_counters_deferred_reload',
+                   'sharing_completion_reload',
+                   'committed_selected_plan_and_progress_missing_corruption_refused',
+                   'staged_advanced_progress_not_adopted',
+                   'staged_initial_selected_publication_completed',
+                   'unmarked_selected_evidence_retained'}
             sources=('chunkdedup_checkpoint.h','zfs_chunkdedup_user.c','chunkdedup_hybrid.c',
                      'chunkdedup_hybrid.h','chunkdedup_parallel.h')
             expected_sources={'cmd/zfs/'+n:sha(self.root/'source/cmd/zfs'/n) for n in sources}
@@ -709,7 +719,16 @@ class Gate:
                 unknown_catalog_bytes boolean_is_not_bytes negative_bytes snapshot_over_cap snapshot_at_cap
                 group_index_over_cap group_index_at_cap thread_mismatch space_below space_exact scratch_zero
                 preserve_performance_restart checkpointed_restart recovery_restart safety_stop_separate
-                safety_stop_cannot_admit_restart nonobject_hold cli_pass cli_missing cli_invalid'''.split())
+                safety_stop_cannot_admit_restart nonobject_hold cli_pass cli_missing cli_invalid
+                external_verified_pass external_unknown external_wrong_scope external_generation_mismatch
+                external_retained_mismatch external_path_mismatch external_checkpoint_in_source external_source_mismatch external_launch_mismatch
+                external_scan_incomplete external_sort_incomplete external_payload_missing external_payload_size_mismatch
+                external_payload_hash_unknown external_manifest_mismatch external_metadata_table_mismatch
+                external_metadata_rows_mismatch external_metadata_failure external_metadata_data_read
+                external_native_proof_missing external_native_producer_mismatch external_native_consumer_mismatch
+                external_native_implementation_mismatch external_native_analysis_attempt external_native_sort_attempt
+                external_native_bool_attempt external_native_completed_shares_unproven external_native_contents_unproven
+                external_capacity_hold'''.split())
             proof=preflight[0] if len(preflight)==1 else {}
             observed=proof.get('cases',[])
             self.require(proof.get('schema')==1 and proof.get('status')=='PASS' and
