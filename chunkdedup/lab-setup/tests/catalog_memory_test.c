@@ -15,6 +15,7 @@
 #include <time.h>
 #include <unistd.h>
 #include "chunkdedup_hybrid.h"
+#include "chunkdedup_checkpoint.h"
 typedef int boolean_t;
 typedef unsigned int uint_t;
 #define B_FALSE 0
@@ -63,11 +64,6 @@ static int cd_catalog_sort(struct cd_catalog *catalog,FILE *input,FILE **output,
     assert(catalog->checkpoint==NULL&&index<2);
     return cd_hybrid_sort_parallel(input,output,catalog->directory,threads,&cd_stop);
 }
-static int cd_checkpoint_report_save(struct cd_checkpoint *checkpoint,const char *path)
-{
-    (void)checkpoint;(void)path;
-    assert(!"checkpoint transport disabled in catalog fixture");return EINVAL;
-}
 #include "core.inc"
 static void cleanup(struct cd_catalog *c)
 {
@@ -108,6 +104,7 @@ static void setup(struct cd_catalog *c,enum cd_method method)
 }
 int main(int argc,char **argv)
 {
+    (void)&cd_checkpoint_open; /* Actual embedded catalog type; transport unused. */
     assert(argc==2);
     struct cd_catalog_file result[2][8]; uint64_t calls[2];
     for(int method=CD_METHOD_AUTO;method<=CD_METHOD_CHUNK;method++) {

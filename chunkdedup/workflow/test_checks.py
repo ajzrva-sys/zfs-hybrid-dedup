@@ -29,7 +29,7 @@ repo, root, kit = [p.resolve() for p in (options.repo, options.run_dir, options.
 assert not root.exists() and not root.is_relative_to(repo) and not root.is_relative_to(kit)
 root.mkdir(parents=True)
 source = root / 'source'
-for name in REQUIRED:
+for name in REQUIRED + ('chunkdedup/lab-setup/tests/test_restore_validate.py',):
     destination = source / name
     destination.parent.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(repo / name, destination)

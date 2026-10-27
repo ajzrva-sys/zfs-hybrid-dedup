@@ -68,6 +68,90 @@ def run():
           'retained_scan_bytes': 70_000_000_000_000, 'active_checkpoint': True}, status='PASS')
     check('recovery_restart', {'restart_requested': True, 'restart_reason': 'recovery',
           'retained_scan_bytes': 70_000_000_000_000, 'active_checkpoint': True}, status='PASS')
+    external = copy.deepcopy(facts)
+    generation = {'pid': 123, 'start_epoch': 1792641600, 'executable_sha256': '1'*64}
+    binding = {'dataset': 'fixture/fs', 'pool_guid': 11, 'dataset_guid': 22,
+               'device': 7, 'object': 34, 'target': '/source', 'age': 3,
+               'method': 'block', 'recursive': True,
+               'report_path': '/durable/123/chunk-estimates.jsonl'}
+    external.update(restart_requested=True, restart_reason='performance',
+                    retained_scan_bytes=70_000_000_000_000, active_checkpoint=False,
+                    active_generation=copy.deepcopy(generation), source_binding=copy.deepcopy(binding),
+                    launch_executable_sha256='2'*64)
+    external['launch_argv'] += ['--method=block', '--min-age=3', '--report', binding['report_path'], '-r', '/source']
+    payloads = {name: {'bytes': size, 'sha256': str(i+1)*64} for i, (name, size) in enumerate([
+        ('files.raw', facts['file_catalog_bytes']), ('native.raw', facts['sort_native_bytes']),
+        ('chunks.raw', facts['sort_chunk_bytes']), ('native.sorted', facts['sort_native_bytes']),
+        ('chunks.sorted', facts['sort_chunk_bytes'])])}
+    external['external_checkpoint'] = {
+        'schema': 1, 'kind': 'verified_legacy_catalog_import', 'checkpoint_path': '/durable/123',
+        'manifest_sha256': 'c'*64, 'exported_generation': copy.deepcopy(generation),
+        'retained_scan_bytes': external['retained_scan_bytes'], 'source_binding': copy.deepcopy(binding),
+        'record_size': 1608, 'complete': True, 'sorted_mask': 3, 'payloads': payloads,
+        'original_file_table_sha256': 'd'*64,
+        'implementation': {'importer_sha256': 'a'*64, 'adopter_sha256': 'b'*64},
+        'verification': {'status': 'PASS', 'receipt_sha256': 'e'*64, 'manifest_sha256': 'c'*64,
+            'payload_sha256': {name: value['sha256'] for name, value in payloads.items()},
+            'source_binding': copy.deepcopy(binding), 'metadata_table_sha256': 'd'*64,
+            'metadata_rows': facts['file_catalog_bytes']//1608, 'metadata_failures': 0, 'source_data_reads': 0},
+        'native_proof': {'status': 'PASS', 'receipt_sha256': 'f'*64,
+            'producer_executable_sha256': '1'*64, 'consumer_executable_sha256': '2'*64,
+            'importer_sha256': 'a'*64, 'adopter_sha256': 'b'*64,
+            'inspect_attempts': 0, 'read_attempts': 0, 'chunk_lookup_attempts': 0, 'sort_attempts': 0,
+            'complete_scan_reused': True, 'both_sorts_reused': True, 'actual_native_shares_verified': True,
+            'completed_shares_reused': True, 'contents_metadata_verified': True, 'payloads_unchanged': True}}
+
+    def external_check(name, mutate=lambda value: None, status='HOLD'):
+        value = copy.deepcopy(external)
+        mutate(value)
+        result = evaluate(value)
+        assert result['status'] == status, (name, result)
+        assert (not result['issues']) == (status == 'PASS'), (name, result)
+        assert value['active_checkpoint'] is False or name == 'external_wrong_scope'
+        cases.append(name)
+        return result
+
+    imported = external_check('external_verified_pass', status='PASS')
+    assert imported['external_checkpoint']['active_checkpoint'] is False
+    assert imported['external_checkpoint']['receipt_bytes_authenticated'] is False
+    external_check('external_unknown', lambda v: v.update(external_checkpoint=None))
+    external_check('external_wrong_scope', lambda v: v.update(active_checkpoint=True))
+    external_check('external_generation_mismatch', lambda v: v['active_generation'].update(pid=999))
+    external_check('external_retained_mismatch', lambda v: v['external_checkpoint'].update(retained_scan_bytes=1))
+    external_check('external_path_mismatch', lambda v: v['external_checkpoint'].update(checkpoint_path='/elsewhere'))
+    def import_inside_target(value):
+        old_report = value['source_binding']['report_path']
+        new_checkpoint, new_report = '/source/checkpoint', '/source/checkpoint/chunk-estimates.jsonl'
+        value['launch_argv'] = [new_checkpoint if a == value['checkpoint_path'] else
+                                new_report if a == old_report else a for a in value['launch_argv']]
+        value['checkpoint_path'] = new_checkpoint
+        value['external_checkpoint']['checkpoint_path'] = new_checkpoint
+        for binding in (value['source_binding'], value['external_checkpoint']['source_binding'],
+                        value['external_checkpoint']['verification']['source_binding']):
+            binding['report_path'] = new_report
+    external_check('external_checkpoint_in_source', import_inside_target)
+    external_check('external_source_mismatch', lambda v: v['source_binding'].update(dataset_guid=999))
+    external_check('external_launch_mismatch', lambda v: v['launch_argv'].append('/different-target'))
+    external_check('external_scan_incomplete', lambda v: v['external_checkpoint'].update(complete=False))
+    external_check('external_sort_incomplete', lambda v: v['external_checkpoint'].update(sorted_mask=1))
+    external_check('external_payload_missing', lambda v: v['external_checkpoint']['payloads'].pop('chunks.sorted'))
+    external_check('external_payload_size_mismatch', lambda v: v['external_checkpoint']['payloads']['native.raw'].update(bytes=1))
+    external_check('external_payload_hash_unknown', lambda v: v['external_checkpoint']['payloads']['native.raw'].update(sha256=None))
+    external_check('external_manifest_mismatch', lambda v: v['external_checkpoint']['verification'].update(manifest_sha256='0'*64))
+    external_check('external_metadata_table_mismatch', lambda v: v['external_checkpoint']['verification'].update(metadata_table_sha256='0'*64))
+    external_check('external_metadata_rows_mismatch', lambda v: v['external_checkpoint']['verification'].update(metadata_rows=1))
+    external_check('external_metadata_failure', lambda v: v['external_checkpoint']['verification'].update(metadata_failures=1))
+    external_check('external_metadata_data_read', lambda v: v['external_checkpoint']['verification'].update(source_data_reads=1))
+    external_check('external_native_proof_missing', lambda v: v['external_checkpoint'].pop('native_proof'))
+    external_check('external_native_producer_mismatch', lambda v: v['external_checkpoint']['native_proof'].update(producer_executable_sha256='0'*64))
+    external_check('external_native_consumer_mismatch', lambda v: v.update(launch_executable_sha256='0'*64))
+    external_check('external_native_implementation_mismatch', lambda v: v['external_checkpoint']['native_proof'].update(adopter_sha256='0'*64))
+    external_check('external_native_analysis_attempt', lambda v: v['external_checkpoint']['native_proof'].update(read_attempts=1))
+    external_check('external_native_sort_attempt', lambda v: v['external_checkpoint']['native_proof'].update(sort_attempts=1))
+    external_check('external_native_bool_attempt', lambda v: v['external_checkpoint']['native_proof'].update(sort_attempts=False))
+    external_check('external_native_completed_shares_unproven', lambda v: v['external_checkpoint']['native_proof'].update(completed_shares_reused=False))
+    external_check('external_native_contents_unproven', lambda v: v['external_checkpoint']['native_proof'].update(contents_metadata_verified=False))
+    external_check('external_capacity_hold', lambda v: v.update(temp_free_bytes=1))
     stop = evaluate({'safety_stop_requested': True, 'restart_requested': False})
     assert stop['status'] == 'PASS' and stop['decision'] == 'SAFETY_STOP_ONLY' and 'capacity' not in stop
     cases.append('safety_stop_separate')

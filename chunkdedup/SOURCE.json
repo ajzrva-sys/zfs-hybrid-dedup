@@ -1,14 +1,14 @@
 {
   "schema": 1,
   "base_revision": "71a9f9578616a90c3c14bb59629fb4d31bfd68d1",
-  "source_digest": "344999a967b78f88840d71ad4ace57f057a7a011096a2b32faeefe29d9c91ff8",
+  "source_digest": "60d4f9d39239a7b06c4db703ec3c4e2c28db499f382855ddfd0c562fd0fcaa1c",
   "source_file_count": 4139,
-  "patch_sha256": "e3354eed138b977aaa4f9109c3857e8867fee02c8f90ae08e0424df098d03532",
-  "patch_bytes": 383452,
+  "patch_sha256": "831418ecee1d2cf9111a70bee8999359ebd6e240aefb910d26024c8d98f9cad6",
+  "patch_bytes": 417088,
   "apply_check": {
     "returncode": 0,
     "scope": "Applied to a private Git index loaded at the pinned upstream base",
-    "result_tree": "39573ede105033730108e8bb0ceccc59ba53d1b9"
+    "result_tree": "b92fa867a97aca5655b0146dfce2bbd55e1ab016"
   },
   "local_verification": "PASS",
   "latest_full_native_validation": "NOT_RUN",
@@ -23,7 +23,8 @@
   "publication_layout": "OpenZFS source at repository root; verification kit in chunkdedup/",
   "source_projection": "Tracked OpenZFS paths excluding chunkdedup/, root AGENTS.md, scripts/verify.sh and the upstream gitlink. README.md maps to preserved chunkdedup/upstream/README.md; the digest excludes publication metadata and verification kit.",
   "report": "STATUS.md",
-  "local_evaluation_source_digest": "cfafc3d2f00a51639ecc66512325730e079c1c8a6645f069bf580d47650a338b",
-  "verification_scope": "All implementation projection entries match the passing frozen publication local run. Only SOURCE.json, VALIDATION.json and kit checksums were updated afterward to record its result; native and production qualification boundaries remain separate.",
-  "implementation_local_evaluation_source_digest": "f7b122ec0e318f2a64e7d99995bdf0eb6b2e5d665e1a3094abf39019cb72b72e"
+  "local_evaluation_source_digest": "a5d9622110f98a44f5a7e49338ccc8f4124f495cccbb4f45cb5b0f36459f69c4",
+  "verification_scope": "All implementation projection entries match the passing frozen combined-publication local run. Only SOURCE.json, VALIDATION.json and kit checksums were updated afterward to record its result; native and production qualification boundaries remain separate.",
+  "implementation_local_evaluation_source_digest": "a5d9622110f98a44f5a7e49338ccc8f4124f495cccbb4f45cb5b0f36459f69c4",
+  "previous_projection_digest": "344999a967b78f88840d71ad4ace57f057a7a011096a2b32faeefe29d9c91ff8"
 }

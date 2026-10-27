@@ -329,6 +329,10 @@ struct cd_catalog {
 	char directory[PATH_MAX];
 	uint64_t count, processed, skipped;
 	struct cd_checkpoint *checkpoint;
+	struct cd_checkpoint_share_progress share_progress;
+	unsigned char *share_deferred;
+	boolean_t selected_loaded;
+	char share_pool[ZFS_MAX_DATASET_NAME_LEN];
 	time_t checkpoint_at;
 	uint64_t seen_capacity;
 	enum cd_method method;
@@ -1171,6 +1175,8 @@ cd_catalog_report_finish(struct cd_catalog *c)
 }
 
 /* CHECKPOINT_DRIVER_BEGIN */
+/* Private recovery validator only; never enabled in the preserved producer. */
+static boolean_t cd_restore_validate_only;
 /* Bind reusable bytes to one target and to the on-disk record interpretation. */
 struct cd_checkpoint_binding {
 	uint64_t version, record_size, stat_size, dataset_guid, pool_guid;
@@ -1270,6 +1276,10 @@ cd_catalog_checkpoint_open(struct cd_catalog *c, const char *directory,
 		return (error);
 	}
 	c->checkpoint = checkpoint;
+	(void) strlcpy(c->share_pool, binding.dataset, sizeof (c->share_pool));
+	char *separator = strchr(c->share_pool, '/');
+	if (separator != NULL)
+		*separator = '\0';
 	(void) fclose(c->files);
 	(void) fclose(c->blocks);
 	(void) fclose(c->chunks);
@@ -1354,8 +1364,43 @@ cd_catalog_checkpoint_report(struct cd_catalog *c, const char *path)
 		}
 		if (errno != ENOENT)
 			return (errno);
+		struct stat selected;
+		if (c->checkpoint->selected || fstatat(c->checkpoint->dirfd,
+		    "files.selected", &selected, AT_SYMLINK_NOFOLLOW) == 0)
+			return (ESTALE);
+		if (errno != ENOENT)
+			return (errno);
 	}
 	return (cd_catalog_report_init(c, path));
+}
+
+/* A selected, fully authenticated checkpoint only: no staged-pair promotion. */
+static int
+cd_catalog_restore_validate(struct cd_catalog *c)
+{
+	if (c->checkpoint == NULL || !c->checkpoint->loaded ||
+	    !c->checkpoint->complete || !c->checkpoint->selected)
+		return (EPROTO);
+	FILE *selected = NULL;
+	unsigned char *deferred = NULL;
+	struct cd_checkpoint_share_progress progress;
+	int error = cd_checkpoint_selected_load(c->checkpoint, &selected,
+	    &progress, &deferred);
+	if (error == 0) {
+		const struct cd_checkpoint_proven_header *proof =
+		    cd_checkpoint_proven_header(c->checkpoint);
+		if (proof == NULL)
+			error = ESTALE;
+		else
+			(void) printf("restore-validation: PASS generation=%" PRIu64
+			    " files=%" PRIu64 " proof_ranges=%" PRIu64
+			    " target_metadata=validated sharing_started=false\n",
+			    progress.generation, c->count, proof->count);
+	}
+	if (selected != NULL)
+		(void) fclose(selected);
+	free(deferred);
+	return (error);
 }
 
 /* Selection mutates parents and estimates; never mutate the durable scan. */
@@ -1366,21 +1411,39 @@ cd_catalog_checkpoint_work(struct cd_catalog *c)
 		return (0);
 	if (!c->checkpoint->complete)
 		return (EPROTO);
+	FILE *source = NULL;
+	int error = cd_checkpoint_selected_load(c->checkpoint, &source,
+	    &c->share_progress, &c->share_deferred);
+	if (error == ENOENT) {
+		source = c->files;
+		error = 0;
+	} else if (error == 0) {
+		c->selected_loaded = B_TRUE;
+		c->sorted_blocks = c->checkpoint->streams[3];
+		c->sorted_chunks = c->checkpoint->streams[4];
+	}
+	if (error != 0)
+		return (error);
 	FILE *working = tmpfile();
-	if (working == NULL)
+	if (working == NULL) {
+		if (c->selected_loaded)
+			(void) fclose(source);
 		return (errno);
-	int error = fseeko(c->files, 0, SEEK_SET) != 0 ? errno : 0;
+	}
+	error = fseeko(source, 0, SEEK_SET) != 0 ? errno : 0;
 	unsigned char buffer[65536];
 	while (error == 0 && !cd_stop) {
-		size_t count = fread(buffer, 1, sizeof (buffer), c->files);
+		size_t count = fread(buffer, 1, sizeof (buffer), source);
 		if (count != 0 && fwrite(buffer, 1, count, working) != count)
 			error = errno != 0 ? errno : EIO;
 		if (count != sizeof (buffer)) {
-			if (ferror(c->files))
+			if (ferror(source))
 				error = EIO;
 			break;
 		}
 	}
+	if (c->selected_loaded)
+		(void) fclose(source);
 	if (error == 0 && cd_stop)
 		error = ECANCELED;
 	if (error == 0 && fseeko(working, 0, SEEK_SET) != 0)
@@ -1653,7 +1716,10 @@ cd_catalog_share_serial(struct cd_catalog *c)
 			fnvlist_add_uint64(args, "source_size",
 			    source.identity.st_size);
 			fnvlist_add_uint64(args, "source_offset", canonical.offset);
+			CD_RECOVERY_POINT("share-before");
 			error = lzc_chunkdedup(destination.dataset, args, &result);
+			if (error == 0)
+				CD_RECOVERY_POINT("share-after");
 			fnvlist_free(args);
 			nvlist_free(result);
 		}
@@ -1677,6 +1743,10 @@ cd_catalog_share_serial(struct cd_catalog *c)
 		(void) close(source_fd);
 	return (cd_stop ? 0 : error);
 }
+
+#ifndef CD_SHARE_CHECKPOINT_SECONDS
+#define	CD_SHARE_CHECKPOINT_SECONDS	60
+#endif
 
 #ifndef CD_SHARE_MAX_ITEMS
 #define	CD_SHARE_MAX_ITEMS	8192U
@@ -1721,6 +1791,10 @@ struct cd_share_state {
 	uint64_t count;
 	atomic_int first_error;
 	atomic_uint_fast64_t groups, issued, deferred, unequal, reported_issued;
+	atomic_uint_fast64_t successful, shared_bytes, already_shared_bytes, compared_bytes;
+	uint64_t item_offset;
+	uint64_t proven_index;
+	time_t checkpoint_at;
 	pthread_mutex_t lock;
 	pthread_cond_t completed;
 	size_t pending;
@@ -1765,10 +1839,16 @@ cd_share_progress(struct cd_share_state *state, boolean_t force)
 	    atomic_load(&state->reported_issued) < CD_SHARE_PROGRESS_ISSUED)
 		return (0);
 	if (printf("share: groups=%" PRIu64 " issued=%" PRIu64
-	    " deferred=%" PRIu64 " unequal=%" PRIu64 "\n",
+	    " deferred=%" PRIu64 " unequal=%" PRIu64
+	    " successful=%" PRIu64 " shared_bytes=%" PRIu64
+	    " already_shared_bytes=%" PRIu64 " compared_bytes=%" PRIu64 "\n",
 	    (uint64_t)atomic_load(&state->groups), issued,
 	    (uint64_t)atomic_load(&state->deferred),
-	    (uint64_t)atomic_load(&state->unequal)) < 0 || fflush(stdout) != 0)
+	    (uint64_t)atomic_load(&state->unequal),
+	    (uint64_t)atomic_load(&state->successful),
+	    (uint64_t)atomic_load(&state->shared_bytes),
+	    (uint64_t)atomic_load(&state->already_shared_bytes),
+	    (uint64_t)atomic_load(&state->compared_bytes)) < 0 || fflush(stdout) != 0)
 		return (cd_share_error(state, errno != 0 ? errno : EIO));
 	state->reported_at = now;
 	atomic_store(&state->reported_issued, issued);
@@ -1863,7 +1943,26 @@ cd_share_process(struct cd_share_job *job, struct cd_share_source *source,
 					(void) pthread_cond_signal(&state->completed);
 					(void) pthread_mutex_unlock(&state->lock);
 				}
+				CD_RECOVERY_POINT("share-before");
 				error = lzc_chunkdedup(destination.dataset, args, &result);
+				if (error == 0) {
+					uint64_t shared, already, compared;
+					if (result == NULL || nvlist_lookup_uint64(result,
+					    "shared_bytes", &shared) != 0 ||
+					    nvlist_lookup_uint64(result, "already_shared_bytes",
+					    &already) != 0 || nvlist_lookup_uint64(result,
+					    "compared_bytes", &compared) != 0 ||
+					    shared > item->length || already != item->length - shared ||
+					    compared != shared) {
+						error = EPROTO;
+					} else {
+						(void) atomic_fetch_add(&state->successful, 1);
+						(void) atomic_fetch_add(&state->shared_bytes, shared);
+						(void) atomic_fetch_add(&state->already_shared_bytes, already);
+						(void) atomic_fetch_add(&state->compared_bytes, compared);
+						CD_RECOVERY_POINT("share-after");
+					}
+				}
 				if (error != 0 && !cd_deferred(error) && error != EILSEQ)
 					(void) cd_share_error(state, error);
 			}
@@ -1931,6 +2030,8 @@ cd_share_merge(struct cd_catalog *c, struct cd_share_job *job)
 		int error = cd_catalog_record(c, event->file, &file, B_FALSE);
 		if (error == 0) {
 			file.deferred = B_TRUE;
+			if (c->share_deferred != NULL)
+				c->share_deferred[event->file] = 1;
 			error = cd_catalog_record(c, event->file, &file, B_TRUE);
 		}
 		(void) cd_share_error(job->state, error);
@@ -2022,14 +2123,102 @@ cd_share_conflict(const struct cd_share_job *a, const struct cd_share_job *b)
 	return (B_FALSE);
 }
 
+/* The producer emits fixed-width native rows. Validate every skip boundary
+ * against the original sorted stream, never against worker descriptors. */
+#define CD_SHARE_NATIVE_ROW_BYTES 191U
+static int
+cd_share_proven_boundary(struct cd_catalog *c, uint64_t at)
+{
+	uint64_t size = c->checkpoint->sizes[3];
+	if (at > size || at % CD_SHARE_NATIVE_ROW_BYTES != 0)
+		return (EILSEQ);
+	if (at == 0 || at == size)
+		return (0);
+	struct cd_catalog_item before, after;
+	if (fseeko(c->sorted_blocks, (off_t)(at - CD_SHARE_NATIVE_ROW_BYTES),
+	    SEEK_SET) != 0)
+		return (errno);
+	int error = cd_catalog_next(c->sorted_blocks, &before);
+	if (error == 0)
+		error = cd_catalog_next(c->sorted_blocks, &after);
+	if (error == 0 && (ftello(c->sorted_blocks) !=
+	    (off_t)(at + CD_SHARE_NATIVE_ROW_BYTES) ||
+	    before.file >= c->count || after.file >= c->count ||
+	    cd_catalog_same(&before, &after)))
+		error = EILSEQ;
+	return (error);
+}
+
+static int
+cd_share_proven_validate(struct cd_catalog *c)
+{
+	if (c->checkpoint == NULL || c->checkpoint->proven == NULL)
+		return (0);
+	const struct cd_checkpoint_proven_header *h =
+	    cd_checkpoint_proven_header(c->checkpoint);
+	const struct cd_checkpoint_proven_range *ranges =
+	    cd_checkpoint_proven_ranges(c->checkpoint);
+	if (h->native_size % CD_SHARE_NATIVE_ROW_BYTES != 0)
+		return (EILSEQ);
+	off_t saved = ftello(c->sorted_blocks);
+	if (saved < 0)
+		return (errno);
+	int error = cd_share_proven_boundary(c, h->boundary);
+	for (uint64_t i = 0; error == 0 && i < h->count; i++) {
+		if (cd_stop) {
+			error = ECANCELED;
+			break;
+		}
+		if (c->share_progress.in_group &&
+		    c->share_progress.next_offset >= ranges[i].start &&
+		    c->share_progress.next_offset < ranges[i].end) {
+			error = EILSEQ;
+			break;
+		}
+		error = cd_share_proven_boundary(c, ranges[i].start);
+		if (error == 0)
+			error = cd_share_proven_boundary(c, ranges[i].end);
+	}
+	if (fseeko(c->sorted_blocks, saved, SEEK_SET) != 0 && error == 0)
+		error = errno;
+	return (error);
+}
+
 /* EOF is not a published failure. The current item is bounded lookahead. */
 static int
 cd_share_next(struct cd_catalog *c, struct cd_share_state *state,
     struct cd_catalog_item *item, boolean_t *have)
 {
 	int error = cd_share_progress(state, B_FALSE);
-	if (error == 0)
+	off_t at = ftello(c->sorted_blocks);
+	if (error == 0 && at < 0)
+		error = errno;
+	if (error == 0 && c->checkpoint != NULL &&
+	    c->checkpoint->proven != NULL) {
+		const struct cd_checkpoint_proven_header *h =
+		    cd_checkpoint_proven_header(c->checkpoint);
+		const struct cd_checkpoint_proven_range *ranges =
+		    cd_checkpoint_proven_ranges(c->checkpoint);
+		while (state->proven_index < h->count) {
+			const struct cd_checkpoint_proven_range *range =
+			    &ranges[state->proven_index];
+			if ((uint64_t)at < range->start)
+				break;
+			if ((uint64_t)at < range->end) {
+				if (fseeko(c->sorted_blocks, (off_t)range->end,
+				    SEEK_SET) != 0) {
+					error = errno;
+					break;
+				}
+				at = (off_t)range->end;
+			}
+			state->proven_index++;
+		}
+	}
+	if (error == 0) {
+		state->item_offset = (uint64_t)at;
 		error = cd_catalog_next(c->sorted_blocks, item);
+	}
 	*have = error == 0;
 	if (error == ENOENT)
 		return (0);
@@ -2065,41 +2254,114 @@ cd_share_result(int error)
 	return (cd_stop ? 0 : error);
 }
 
+/* Only a drained coordinator may publish a completed-work frontier. */
+static int
+cd_share_checkpoint(struct cd_catalog *c, struct cd_share_state *state,
+    boolean_t in_group, const struct cd_catalog_item *key,
+    const struct cd_share_source *source, boolean_t native_done)
+{
+	if (c->checkpoint == NULL || cd_share_stopped(state))
+		return (0);
+	struct cd_checkpoint_share_progress next = c->share_progress;
+	next.next_offset = state->item_offset;
+	next.in_group = in_group;
+	next.native_done = native_done;
+	next.canonical_valid = in_group && source != NULL && source->have;
+	memset(next.canonical, 0, sizeof (next.canonical));
+	memset(next.canonical_hash, 0, sizeof (next.canonical_hash));
+	if (in_group) {
+		next.canonical[0] = key->dataset;
+		next.canonical[1] = key->length;
+		(void) strlcpy(next.canonical_hash, key->hash,
+		    sizeof (next.canonical_hash));
+		if (next.canonical_valid) {
+			next.canonical[2] = source->canonical.file;
+			next.canonical[3] = source->canonical.offset;
+			next.canonical[4] = source->canonical.length;
+			next.canonical[5] = source->canonical.object;
+		}
+	}
+	next.groups = atomic_load(&state->groups);
+	next.issued = atomic_load(&state->issued);
+	next.deferred = atomic_load(&state->deferred);
+	next.unequal = atomic_load(&state->unequal);
+	next.successful = atomic_load(&state->successful);
+	next.shared_bytes = atomic_load(&state->shared_bytes);
+	next.already_shared_bytes = atomic_load(&state->already_shared_bytes);
+	next.compared_bytes = atomic_load(&state->compared_bytes);
+	/* ioctl return commits a tx, not its durability. Sync the target pool. */
+	nvlist_t *sync_args = fnvlist_alloc();
+	fnvlist_add_boolean_value(sync_args, "force", B_FALSE);
+	int error = lzc_sync(c->share_pool, sync_args, NULL);
+	fnvlist_free(sync_args);
+	if (error == 0 && !cd_share_stopped(state)) {
+		CD_RECOVERY_POINT("share-data-synced");
+		error = cd_checkpoint_share_save(c->checkpoint, &next,
+		    c->share_deferred);
+	}
+	if (error == 0 && !cd_share_stopped(state)) {
+		c->share_progress = next;
+		state->checkpoint_at = time(NULL);
+		(void) printf("checkpoint: sharing_next=%" PRIu64
+		    " in_group=%u successful=%" PRIu64 "\n", next.next_offset,
+		    (unsigned)next.in_group, next.successful);
+		(void) fflush(stdout);
+	}
+	return (cd_share_error(state, error));
+}
+
 static int
 cd_catalog_share(struct cd_catalog *c, unsigned int threads)
 {
 	if (cd_stop)
 		return (0);
 	if (c->watch) {
+		if (c->checkpoint != NULL)
+			return (ENOTSUP);
 		(void) printf("share: serial (watch)\n");
 		(void) fflush(stdout);
 		return (cd_catalog_share_serial(c));
 	}
 	if (fflush(c->files) != 0)
 		return (cd_share_result(errno));
+	if (c->checkpoint != NULL && c->share_progress.native_done)
+		return (0);
 	if (c->count == 0)
 		return (0);
 	struct cd_catalog_file *files = NULL;
 	if (c->count <= CD_SHARE_SNAPSHOT_LIMIT / sizeof (*files))
 		files = malloc((size_t)c->count * sizeof (*files));
 	if (files == NULL) {
+		/* A serial fallback must never discard a durable bookmark. */
+		if (c->checkpoint != NULL)
+			return (ENOMEM);
 		(void) printf("share: serial (file snapshot unavailable)\n");
 		(void) fflush(stdout);
 		return (cd_catalog_share_serial(c));
 	}
 	int error = 0;
-	for (uint64_t i = 0; i < c->count && error == 0 && !cd_stop; i++)
+	for (uint64_t i = 0; i < c->count && error == 0 && !cd_stop; i++) {
 		error = cd_catalog_record(c, i, &files[i], B_FALSE);
+		if (error == 0 && c->share_deferred != NULL && c->share_deferred[i]) {
+			files[i].deferred = B_TRUE;
+			error = cd_catalog_record(c, i, &files[i], B_TRUE);
+		}
+	}
 	if (error != 0 || cd_stop) {
 		free(files);
 		return (cd_share_result(error));
 	}
 	struct cd_share_state state = { .files = files, .count = c->count };
 	atomic_init(&state.first_error, 0);
-	atomic_init(&state.groups, 0);
-	atomic_init(&state.issued, 0);
-	atomic_init(&state.deferred, 0);
-	atomic_init(&state.unequal, 0);
+	atomic_init(&state.groups, c->share_progress.groups);
+	atomic_init(&state.issued, c->share_progress.issued);
+	atomic_init(&state.deferred, c->share_progress.deferred);
+	atomic_init(&state.unequal, c->share_progress.unequal);
+	atomic_init(&state.successful, c->share_progress.successful);
+	atomic_init(&state.shared_bytes, c->share_progress.shared_bytes);
+	atomic_init(&state.already_shared_bytes, c->share_progress.already_shared_bytes);
+	atomic_init(&state.compared_bytes, c->share_progress.compared_bytes);
+	state.checkpoint_at = time(NULL);
 	atomic_init(&state.reported_issued, 0);
 	if ((error = pthread_mutex_init(&state.lock, NULL)) != 0) {
 		free(files);
@@ -2135,9 +2397,25 @@ cd_catalog_share(struct cd_catalog *c, unsigned int threads)
 	(void) cd_share_error(&state, error);
 	struct cd_catalog_item item;
 	boolean_t have = B_FALSE;
+	boolean_t resume_group = c->share_progress.in_group;
+	if (!cd_share_stopped(&state))
+		(void) cd_share_error(&state, cd_share_proven_validate(c));
+	if (c->checkpoint != NULL && fseeko(c->sorted_blocks,
+	    (off_t)c->share_progress.next_offset, SEEK_SET) != 0)
+		(void) cd_share_error(&state, errno);
 	if (!cd_share_stopped(&state))
 		(void) cd_share_next(c, &state, &item, &have);
+	if (resume_group && (!have || item.dataset != c->share_progress.canonical[0] ||
+	    item.length != c->share_progress.canonical[1] ||
+	    strcmp(item.hash, c->share_progress.canonical_hash) != 0))
+		(void) cd_share_error(&state, ESTALE);
 	while (have && !cd_share_stopped(&state)) {
+		if (c->checkpoint != NULL && !resume_group &&
+		    time(NULL) - state.checkpoint_at >= CD_SHARE_CHECKPOINT_SECONDS) {
+			while (cd_parallel_count(&pool) != 0)
+				cd_share_take(c, &pool, &state);
+			(void) cd_share_checkpoint(c, &state, B_FALSE, NULL, NULL, B_FALSE);
+		}
 		while (cd_parallel_full(&pool) && !cd_share_stopped(&state))
 			cd_share_take(c, &pool, &state);
 		if (cd_share_stopped(&state))
@@ -2161,27 +2439,53 @@ cd_catalog_share(struct cd_catalog *c, unsigned int threads)
 		if (error != 0 || cd_share_stopped(&state))
 			break;
 		if (job->count == 0) {
+			if (resume_group) {
+				(void) atomic_fetch_add(&state.groups, 1);
+				resume_group = B_FALSE;
+				(void) cd_share_checkpoint(c, &state, B_FALSE,
+				    NULL, NULL, !have);
+			}
 			cd_share_job_fini(job);
 			continue;
 		}
-		if (have && cd_catalog_same(&key, &item)) {
+		if (resume_group || (have && cd_catalog_same(&key, &item))) {
 			/* A giant run owns the coordinator after a complete barrier. */
 			while (cd_parallel_count(&pool) != 0)
 				cd_share_take(c, &pool, &state);
 			struct cd_share_source source = { .fd = -1 };
+			if (resume_group && c->share_progress.canonical_valid) {
+				uint64_t file = c->share_progress.canonical[2];
+				if (file >= c->count)
+					(void) cd_share_error(&state, EPROTO);
+				else {
+					source.canonical = (struct cd_share_item) {
+					    file, c->share_progress.canonical[3],
+					    c->share_progress.canonical[4],
+					    c->share_progress.canonical[5] };
+					error = cd_catalog_open_file(&files[file], &source.fd);
+					if (error == 0)
+						source.have = B_TRUE;
+					else
+						(void) cd_share_error(&state, error);
+				}
+			}
+			resume_group = B_FALSE;
 			while (!cd_share_stopped(&state)) {
 				error = cd_share_process(job, &source, B_TRUE);
 				cd_share_merge(c, job);
-				if (error != 0 || cd_share_stopped(&state) ||
-				    !have || !cd_catalog_same(&key, &item))
+				boolean_t more = have && cd_catalog_same(&key, &item);
+				if (job->complete && error == 0 && !cd_share_stopped(&state)) {
+					if (!more)
+						(void) atomic_fetch_add(&state.groups, 1);
+					(void) cd_share_checkpoint(c, &state, more, &key,
+					    &source, !have);
+				}
+				if (error != 0 || cd_share_stopped(&state) || !more)
 					break;
 				error = cd_share_fill(c, job, &key, &item, &have);
 				if (error != 0)
 					break;
 			}
-			if (job->complete && error == 0 &&
-			    (!have || !cd_catalog_same(&key, &item)))
-				(void) atomic_fetch_add(&state.groups, 1);
 			if (source.fd >= 0)
 				(void) close(source.fd);
 			cd_share_job_fini(job);
@@ -2237,6 +2541,8 @@ cd_catalog_share(struct cd_catalog *c, unsigned int threads)
 		}
 	}
 	free(jobs);
+	if (!have && !cd_share_stopped(&state))
+		(void) cd_share_checkpoint(c, &state, B_FALSE, NULL, NULL, B_TRUE);
 	(void) cd_share_progress(&state, B_TRUE);
 	error = atomic_load(&state.first_error);
 	(void) pthread_cond_destroy(&state.completed);
@@ -2249,13 +2555,30 @@ cd_catalog_share(struct cd_catalog *c, unsigned int threads)
 static int
 cd_catalog_apply(struct cd_catalog *c, uint64_t age, unsigned int threads)
 {
-	int error = cd_catalog_select(c, threads);
+	int error = 0;
+	if (c->selected_loaded) {
+		(void) printf("checkpoint: reused_selection sharing_next=%" PRIu64 "\n",
+		    c->share_progress.next_offset);
+		(void) fflush(stdout);
+	} else {
+		error = cd_catalog_select(c, threads);
+		if (error == 0 && !cd_stop && c->checkpoint != NULL) {
+			c->share_deferred = calloc(c->count == 0 ? 1 : (size_t)c->count, 1);
+			if (c->share_deferred == NULL)
+				error = ENOMEM;
+			else
+				error = cd_checkpoint_selected_save(c->checkpoint, c->files,
+				    &c->share_progress, c->share_deferred);
+		}
+	}
 	if (error == 0)
 		error = cd_catalog_share(c, threads);
 	for (uint64_t i = 0; error == 0 && i < c->count && !cd_stop; i++) {
 		struct cd_catalog_file file;
 		if ((error = cd_catalog_record(c, i, &file, B_FALSE)) != 0)
 			break;
+		if (c->share_deferred != NULL && c->share_deferred[i])
+			file.deferred = B_TRUE;
 		if (file.deferred) {
 			c->skipped++;
 			continue;
@@ -2313,6 +2636,7 @@ cd_catalog_fini(struct cd_catalog *c)
 {
 	free(c->retry);
 	free(c->groups);
+	free(c->share_deferred);
 	if (c->report != NULL)
 		(void) fclose(c->report);
 	if (c->report_temporary[0] != '\0')
@@ -2826,9 +3150,15 @@ cd_pass(const char *op, boolean_t recursive, uint64_t age, int argc,
 			(void) strlcpy(path, canonical, sizeof (path));
 			error = cd_catalog_checkpoint_open(&catalog, checkpoint_path,
 			    zhp, path, age, recursive);
+			if (error == 0 && cd_restore_validate_only &&
+			    (!catalog.checkpoint->loaded || !catalog.checkpoint->complete ||
+			    !catalog.checkpoint->selected))
+				error = EPROTO;
 			if (error == 0)
 				error = cd_catalog_checkpoint_report(&catalog, report_path);
-			if (error != 0 || catalog.checkpoint->complete)
+			if (error == 0 && cd_restore_validate_only)
+				error = cd_catalog_restore_validate(&catalog);
+			if (cd_restore_validate_only || error != 0 || catalog.checkpoint->complete)
 				goto target_done;
 			error = cd_scan_init(&scan, &catalog, age, threads);
 			if (error != 0)
@@ -2901,7 +3231,7 @@ target_done:
 		if (scan_started)
 			cd_scan_fini(&scan);
 		/* Discovery failures never leave a partially selected pass installed. */
-		if (ret == 0 && !cd_stop) {
+		if (ret == 0 && !cd_stop && !cd_restore_validate_only) {
 			int error = 0;
 			if (catalog.checkpoint == NULL ||
 			    !catalog.checkpoint->complete) {
@@ -2981,11 +3311,13 @@ int
 zfs_do_chunkdedup(int argc, char **argv)
 {
 	cd_stop = 0;
+	cd_restore_validate_only = B_FALSE;
 	if (argc < 3) {
 		(void) fprintf(stderr, "usage: zfs chunkdedup "
 		    "<optimize|status|verify|unoptimize> [-r] [--min-age days] "
 		    "[--method auto|block|chunk] [--methods] "
 		    "[--threads 1..64] [--report PATH] [--checkpoint DIR] "
+		    "[--restore-validate-only] "
 		    "<dataset|path>...\n"
 		    "       zfs chunkdedup watch [--interval seconds] "
 		    "[--min-age days] [--method auto|block|chunk] "
@@ -3014,11 +3346,12 @@ zfs_do_chunkdedup(int argc, char **argv)
 		{ "threads", required_argument, NULL, 't' },
 		{ "report", required_argument, NULL, 'R' },
 		{ "checkpoint", required_argument, NULL, 'C' },
+		{ "restore-validate-only", no_argument, NULL, 'V' },
 		{ NULL, 0, NULL, 0 }
 	};
 	int c;
 	optind = 2;
-	while ((c = getopt_long(argc, argv, "+ra:i:m:Mt:R:C:", options, NULL)) != -1) {
+	while ((c = getopt_long(argc, argv, "+ra:i:m:Mt:R:C:V", options, NULL)) != -1) {
 		if (c == 'r') {
 			if (watch)
 				return (2);
@@ -3042,6 +3375,10 @@ zfs_do_chunkdedup(int argc, char **argv)
 			if (watch || strcmp(op, "optimize") != 0 || optarg[0] == '\0')
 				return (2);
 			checkpoint_path = optarg;
+		} else if (c == 'V') {
+			if (watch || strcmp(op, "optimize") != 0)
+				return (2);
+			cd_restore_validate_only = B_TRUE;
 		} else if (c == 'M') {
 			if (strcmp(op, "status") != 0)
 				return (2);
@@ -3073,6 +3410,13 @@ zfs_do_chunkdedup(int argc, char **argv)
 	}
 	if (optind == argc)
 		return (2);
+	if (cd_restore_validate_only) {
+		struct stat checkpoint_stat;
+		if (checkpoint_path == NULL || report_path == NULL ||
+		    lstat(checkpoint_path, &checkpoint_stat) != 0 ||
+		    !S_ISDIR(checkpoint_stat.st_mode))
+			return (2);
+	}
 	if (checkpoint_path != NULL && argc - optind != 1)
 		return (2);
 	if (watch)

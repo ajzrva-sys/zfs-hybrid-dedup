@@ -33,7 +33,8 @@ STAGES = ('host_preflight', 'media_freeze', 'guest_boot', 'guest_build',
           'evidence_capture', 'guest_restore', 'host_restore', 'host_state_compare')
 MAX_USED = 48 << 30
 MIN_FREE = 128 << 30
-HYBRID_TEST_FILES = ('hybrid.py', 'hybrid_ctl.c')
+HYBRID_TEST_FILES = ('hybrid.py', 'hybrid_ctl.c', 'crash_native.py',
+                     'test_crash_recovery.py', 'test_checkpoint.py', 'recovery_fault.h')
 GUEST_PYTHON = '/usr/local/bin/python3.12'
 GUEST_ENV = 'export PATH=/sbin:/bin:/usr/sbin:/usr/bin:/usr/local/sbin:/usr/local/bin\n'
 TEST_PINS = {
@@ -364,6 +365,8 @@ elif phase=='build':
  # autoreconf honors AUTOPOINT. The bundled gettext helpers are frozen source;
  # retain them rather than copying the guest gettext package's newer versions.
  env=os.environ.copy();env.update({'LIBS':'-L/usr/local/lib -lintl','CPPFLAGS':'-I/usr/local/include','LDFLAGS':'-L/usr/local/lib','MAKE':'gmake','AUTOPOINT':'/usr/bin/true'})
+ if C.get('crash_recovery'):
+  env['CPPFLAGS']+=' -include '+str(R/'hybrid/recovery_fault.h')
  src=R/'source';started=time.time()
  def build_part(name,operation,infrastructure=True):
   receipt={'started':started,'source_digest':C['source_digest'],'phase':name,'status':'RUNNING'}
@@ -392,7 +395,7 @@ elif phase=='build':
  build_part('copy_prefix',copy_prefix)
  build_part('source_integrity',lambda:save('source-after.json',source_check()))
  B=build_part('build_receipt',lambda:{'source_digest':C['source_digest'],'module':str(src/'module/openzfs.ko'),'module_sha256':sha(src/'module/openzfs.ko'),
-    'binary':Z,'binary_sha256':sha(Z),'prefix':P,'build_run_id':C['run_id'],'started':started,'finished':time.time(),'phase':'complete','status':'PASS'})
+    'binary':Z,'binary_sha256':sha(Z),'prefix':P,'qualification_faults':bool(C.get('crash_recovery')),'build_run_id':C['run_id'],'started':started,'finished':time.time(),'phase':'complete','status':'PASS'})
  save('build-status.json',B);C['build']=B;save('config.json',C)
 elif phase=='load':
  B=C['build'];assert B['source_digest']==C['source_digest']
@@ -444,11 +447,18 @@ elif phase=='test':
   report=R/'hybrid-result.json'
   if report.is_file():
    receipt=json.loads((R/'native-result.json').read_text());receipt['hybrid_result']={'path':report.name,'sha256':sha(report),'test_files':C['hybrid_tests']};save('native-result.json',receipt)
- if C['mode']=='build':
+ if C.get('crash_recovery'):
+  sys.path.insert(0,str(R/'hybrid'))
+  import crash_native
+  recovery=crash_native.run(h.Suite(m,C,R))
+  receipt=json.loads((R/'native-result.json').read_text())
+  receipt['recovery']={'status':recovery['status'],'interruption':'SIGKILL','power_loss':'not_run','sha256':sha(R/'crash-result.json')}
+  save('native-result.json',receipt)
+ if C['mode']=='build' and not C.get('crash_recovery'):
   latest=pathlib.Path('/root/lab/workflow/latest-build.json');temp=latest.with_suffix('.tmp');temp.write_text(json.dumps(C['build']));os.replace(temp,latest)
 elif phase=='capture':
  data={}
- for name in ['source-before.json','source-bootstrap.json','source-after.json','source-observed.json','build-status.json','loaded.json','guest-provenance.json','native-result.json','hybrid-result.json','baseline.json','restore.json']:
+ for name in ['source-before.json','source-bootstrap.json','source-after.json','source-observed.json','build-status.json','loaded.json','guest-provenance.json','native-result.json','hybrid-result.json','crash-result.json','crash-progress.json','baseline.json','restore.json']:
   if (R/name).is_file():data[name]=json.loads((R/name).read_text())
  if (R/'hybrid.log').is_file():data['hybrid.log']=(R/'hybrid.log').read_text(errors='replace')[-100000:]
  if (R/'tests/work/results.json').is_file():data['regression.json']=json.loads((R/'tests/work/results.json').read_text())
@@ -578,6 +588,7 @@ def cached_build_receipt(path, source_digest):
     receipt = json.loads(Path(path).read_text())
     assert isinstance(receipt, dict), 'cached receipt must be an object'
     assert receipt.get('status') == 'PASS' and receipt.get('phase') == 'complete', 'cached build is not complete/PASS'
+    assert not receipt.get('qualification_faults'), 'fault-injected builds cannot be reused as normal builds'
     assert receipt.get('source_digest') == source_digest, 'cached build source differs'
     run_id = receipt.get('build_run_id', '')
     assert re.fullmatch(r'[a-z0-9][a-z0-9-]{0,39}', run_id), 'invalid cached build identity'
@@ -713,6 +724,7 @@ class Runner:
         config = {'schema': 1, 'run_id': self.args.run_id, 'nonce': self.nonce,
                   'source_digest': self.args.source_digest, 'guest_run': self.guest_run,
                   'prefix': prefix, 'mode': self.args.mode, 'pool': 'cdwf-' + self.args.run_id,
+                  'crash_recovery': getattr(self.args, 'crash_recovery', False),
                   'build_timeout': self.args.build_timeout, 'cases': cases, 'adapter': adaptation,
                   'suite_sha256': adaptation['regression.py']['original_sha256'],
                   'hybrid_tests': {name: file_digest(tests / name) for name in HYBRID_TEST_FILES}}
@@ -829,6 +841,14 @@ class Runner:
             paths.append(self.artifact(path))
         self.data['guest_evidence'] = paths
         self.data['source_iso_sha256'] = self.iso_sha
+        if 'crash-progress.json' in evidence and 'crash-result.json' not in evidence:
+            self.data['recovery'] = {'status': 'INCOMPLETE', 'interruption': 'SIGKILL', 'forced_vm_power_loss': 'NOT_RUN'}
+        if 'crash-result.json' in evidence:
+            result = evidence['crash-result.json']
+            assert result['run_id'] == self.args.run_id and result['payload_nonce'] == self.nonce
+            assert result['source_digest'] == self.args.source_digest
+            assert result['status'] == 'PASS' and len(result['cases']) == 8
+            self.data['recovery'] = {'status': 'PASS', 'interruption': 'SIGKILL', 'forced_vm_power_loss': 'NOT_RUN'}
         if 'native-result.json' in evidence:
             result = evidence['native-result.json']
             assert result['run_id'] == self.args.run_id and result['payload_nonce'] == self.nonce
@@ -965,6 +985,7 @@ def main(argv=None):
     p.add_argument('--source-manifest', type=Path, required=True)
     p.add_argument('--source-digest', required=True)
     p.add_argument('--mode', choices=['build', 'smoke'], default='build')
+    p.add_argument('--crash-recovery', action='store_true')
     p.add_argument('--cached-build-receipt', type=Path)
     p.add_argument('--build-timeout', type=int, default=3600)
     p.add_argument('--test-timeout', type=int, default=1200)
@@ -977,6 +998,8 @@ def main(argv=None):
         p.error('only the explicit retained bsd lab is supported')
     if not 60 <= args.build_timeout <= 7200 or not 60 <= args.test_timeout <= 3600:
         p.error('timeouts must be bounded: build60..7200, test60..3600 seconds')
+    if args.crash_recovery and args.mode != 'build':
+        p.error('crash recovery requires a fresh test-only build')
     if args.cached_build_receipt and args.mode != 'smoke':
         p.error('--cached-build-receipt is accepted only in smoke mode')
     if args.mode == 'smoke':

@@ -224,6 +224,8 @@ def verify_attempt(source, files, original, parent, number, args, controls, repa
                        '--source-manifest', str(run / 'source-files.json'), '--source-digest', digest,
                        '--run-id', nonce, '--host', args.host,
                        '--mode', 'smoke' if args.profile == 'native-smoke' else 'build']
+            if getattr(args, 'crash_recovery', False):
+                command += ['--crash-recovery']
             if args.profile == 'native-smoke':
                 command += ['--cached-build-receipt', str(args.cached_build_receipt)]
             code, _ = execute(command, run / 'native-driver.log', timeout=args.native_timeout, grace=180)
@@ -355,6 +357,7 @@ def main():
     parser.add_argument('--repo', type=Path, required=True)
     parser.add_argument('--kit', type=Path, default=HERE.parent)
     parser.add_argument('--profile', choices=('local', 'native', 'native-smoke'), default='local')
+    parser.add_argument('--crash-recovery', action='store_true', help='test-only fault build and guest SIGKILL suite; native fresh build only')
     parser.add_argument('--host', help='explicit SSH host for the isolated bhyve lab')
     parser.add_argument('--cached-build-receipt', type=Path, help='prior PASS build receipt; native-smoke only')
     parser.add_argument('--output', type=Path, help='new run directory; defaults to REPO_PARENT/verification')
@@ -364,6 +367,8 @@ def main():
     parser.add_argument('--native-timeout', type=int, default=5400)
     parser.add_argument('--repair-timeout', type=int, default=600)
     args = parser.parse_args()
+    if args.crash_recovery and args.profile != 'native':
+        parser.error('--crash-recovery requires --profile native and a fresh test-only build')
     args.repo, args.kit = args.repo.resolve(), args.kit.resolve()
     if args.profile in ('native', 'native-smoke') and not args.host:
         parser.error('native verification needs --host; no host is selected implicitly')

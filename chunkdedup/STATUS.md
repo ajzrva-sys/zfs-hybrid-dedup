@@ -1,7 +1,7 @@
-# Validation status — 22 October 2026
+# Validation status — 26 October 2026
 
 The current publication includes parallel native sharing, bounded catalog
-selection and saved reports, parallel catalog sorting, durable checkpoints,
+selection and saved reports, parallel catalog sorting, durable sharing checkpoints,
 and the FreeBSD read-only per-pool dirty-data gauge. [SOURCE.json](SOURCE.json) and
 [tested-source-files.json](tested-source-files.json) identify it separately
 from the complete repository snapshots used by local verification.
@@ -55,14 +55,15 @@ drain/cleanup; EOF and empty catalogs still complete normally.
 ## Durable checkpoint proof
 
 `optimize --checkpoint DIR` retains committed scan records, raw catalogs and
-finished sorts. A partial scan rewalks metadata and skips committed file content;
+finished sorts. Sharing checkpoints retain the selected plan, deferred state and
+a drained, target-pool-synced sharing frontier. A partial scan rewalks metadata and skips committed file content;
 a complete scan bypasses discovery. Resume validates checkpoint integrity,
 options, target identity and saved source metadata before reuse. The same
 published report is preserved. See [checkpoint and resume](CATALOG_REPORT.md#checkpoint-and-resume)
 for lifecycle, storage requirements and compatibility limits, and
 [recovery guidance](RECOVERY.md) for operating boundaries.
 
-The current FreeBSD userspace candidate passed an isolated native test with
+The preceding FreeBSD userspace candidate passed an isolated native test with
 196 files containing 939,524,096 bytes. The writer analyzed the source, executed
 82 real sort children, and stopped before any kernel share. A separate process
 then resumed with source-inspection/read/chunk-lookup calls and sort execution
@@ -72,12 +73,46 @@ published report and sorted payload identities remained intact. The owned
 pool, backing file and checkpoint workspace were removed afterward.
 
 This proves complete-scan and cached-sort recovery in the isolated fixture.
+The newer reader also accepts separately admitted, authenticated whole-group
+`sharing.proven` ranges, retaining uncertain groups for normal processing and
+rejecting missing, changed or incompatible proof. Portable actual-driver checks
+cover selected-plan reload, committed sharing/deferred state and sparse-proof
+validation. Committed frontiers represent completed work; cursor and issued
+operation counters do not.
+
 Focused strict and ASan/UBSan tests also cover committed-prefix recovery,
-corruption, incompatible options, locking and cancellation. Production resume,
+corruption, incompatible options, locking and cancellation. Production sharing resume,
 production sharing throughput and forced-power-loss recovery remain **NOT_RUN**.
 Existing workers retain their running executable and cannot adopt checkpoints
 retroactively; future invocations must start with `--checkpoint` and stable
 checkpoint/report paths.
+
+## Restore validation and interruption scope
+
+`optimize --restore-validate-only` uses the native checkpoint loader with the
+original target/options/report bindings and refuses incomplete scan/selection
+state. It validates catalog digests, every saved source-file identity, selected
+state, report and required authenticated sparse proof, then exits without source-content
+analysis or sharing. This mode requires a proof-bearing legacy import and
+refuses ordinary checkpoints without `sharing.proven`. The loader requires a writable private copy-on-write
+checkpoint copy: it locks/open streams for recovery and may discard uncommitted
+tails after committed data validates. The held/original checkpoint is preserved.
+
+An actual production-scale native loader run returned exit zero and
+`restore-validation: PASS` after approximately 35.2 minutes. It authenticated
+roughly 505 GiB of catalog payloads and 2.57 million source-file identities.
+This establishes full-size loader authentication before shutdown. It does not
+establish resumed production sharing, a quick cold restart, or abrupt-power-loss
+recovery. Subsequent small-file readback is separate from repeating this full
+loader validation.
+
+Deterministic portable process-crash checks run in strict and ASan/UBSan builds.
+They stop test-only child sessions at named publication/sort boundaries, kill
+those sessions and reopen checkpoints in separate processes. Committed prefixes
+survive and uncommitted work replays. Normal builds compile the fault hooks to
+no-ops. The optional disposable-guest native crash runner is available but its
+native interruption and abrupt-power-off cases remain **NOT_RUN**. These source
+checks and the full-size loader result do not replace the combined native suite.
 
 ## Current dirty-data gauge
 

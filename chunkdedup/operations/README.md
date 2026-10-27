@@ -85,3 +85,12 @@ shutdown and live resource transitions remain unqualified. Run native work only
 in a disposable FreeBSD VM with file-backed pools and an admitted candidate;
 never adapt these fixtures or receipts to qualify production. No production
 pool, running job, checkpoint or preparation receipt is used by this suite.
+
+## Reusable reference primitives
+
+[Prefetch planning and cohort helpers](prefetch-reference/README.md) and
+[sharing proof/throttling helpers](sharing-reference/README.md) retain their
+qualified source bytes. They are reference components with generated-fixture
+checks, not portable deployments of the host-specific accelerator, six-hour
+saver, restore orchestration or status command. Private launch configurations,
+job generations, backup/restore receipts and catalogs remain outside Git.

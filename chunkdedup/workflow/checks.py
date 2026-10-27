@@ -520,6 +520,12 @@ sys.exit(status)
                       self.snapshot], env=dict(self.environment, CC=shlex.join(self.cc),
                                               WORKFLOW_CHECKPOINT_REPORT=str(checkpoint)))
         self.current['evidence']['artifacts'].append(self.artifact(checkpoint))
+        crash = folder / 'crash-recovery.json'
+        self.execute([sys.executable, self.args.kit / 'lab-setup/tests/test_crash_recovery.py',
+                      '--repo', self.snapshot, '--report', crash],
+                     env=dict(self.environment, CC=shlex.join(self.cc)))
+        self.current['evidence']['artifacts'].append(self.artifact(crash))
+        self.execute([sys.executable, self.args.repo / 'chunkdedup/lab-setup/tests/test_restore_validate.py'])
         preflight = folder / 'recovery-preflight.json'
         self.execute([sys.executable, self.args.kit / 'workflow/test_recovery_preflight.py',
                       '--report', preflight])

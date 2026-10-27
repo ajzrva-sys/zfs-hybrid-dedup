@@ -21,11 +21,17 @@ artifacts; current revision status is in STATUS.md and VALIDATION.json.
 
 Local verification covers the actual chunker and core model, worker batching,
 parallel scan/share execution, bounded catalog selection and reporting,
-parallel catalog sorting, checkpoint integrity/recovery, error propagation and
-packaging. [Checkpoint and resume](CATALOG_REPORT.md#checkpoint-and-resume)
+parallel catalog sorting, checkpoint integrity/recovery, selected sharing plans,
+committed sharing frontiers, sparse proof admission, deterministic process-crash
+recovery, error propagation and packaging.
+[Checkpoint and resume](CATALOG_REPORT.md#checkpoint-and-resume)
 describes stable paths, metadata validation and partial-prefix reuse.
 An isolated native checkpoint test completed sharing with source analysis and
-sorting blocked on resume. Production checkpoint recovery remains unverified.
+sorting blocked on resume. A separate production-scale native loader check
+authenticated a saved checkpoint and real source metadata without starting
+sharing. Production sharing restart and abrupt-power-loss recovery remain
+unverified. [Restore validation](RECOVERY.md#validate-a-restore-without-starting-sharing)
+describes the required private checkpoint copy and its cost.
 The native dirty-data gauge has a
 separate portable direct-function test and isolated VM evidence. These focused
 checks do not establish a full native-suite pass for the combined revision.

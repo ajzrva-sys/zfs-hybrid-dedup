@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -192,6 +193,20 @@ def exercise(binary, folder, include_driver=True):
         before = contents(path)
         run('reject', path)
         assert contents(path) == before
+    # An optional completion proof is never permission to resume or trim a
+    # legacy/unselected generation, including an unfinished scan.
+    for stage in ('partial', 'complete'):
+        path = folder / ('legacy-stray-proof-' + stage)
+        run('create', path, *(['complete'] if stage == 'complete' else []))
+        if stage == 'complete':
+            run('sorted', path, 3)
+        with (path / 'files.raw').open('ab') as stream:
+            stream.write(b'uncommitted tail must survive stray-proof refusal')
+        (path / 'sharing.proven').write_bytes(b'nonempty unsupported proof')
+        (path / 'sharing.proven').chmod(0o600)
+        before = contents(path)
+        run('reject', path)
+        assert contents(path) == before
     passed.append('manifest_corruption')
 
     raw_names = ['files.raw', 'native.raw', 'chunks.raw', 'native.sorted', 'chunks.sorted']
@@ -225,7 +240,67 @@ def exercise(binary, folder, include_driver=True):
     run('reject', path)
     assert contents(path) == before
     passed.append('validate_before_truncate')
-    print('PASS actual checkpoint prefixes, fresh-process reload, sorted caches, locking, cancellation tails and fail-closed corruption')
+    sharing = folder / 'sharing'
+    run('create', sharing, 'complete')
+    run('sorted', sharing, 3)
+    run('sharing-unselected', sharing)
+    unselected = contents(sharing)
+    for name in ('files.selected', 'sharing.state'):
+        stray = folder / ('unmarked-' + name)
+        shutil.copytree(sharing, stray)
+        (stray / name).write_bytes(b'uncommitted evidence')
+        (stray / name).chmod(0o600)
+        run('sharing-unselected', stray)
+        assert not (stray / name).exists()
+        archives = list(stray.glob('uncommitted-selected.*'))
+        assert len(archives) == 1 and (archives[0] / name).read_bytes() == b'uncommitted evidence'
+        assert contents(stray) == unselected
+    run('sharing-seal', sharing)
+    run('sharing-verify', sharing, 1)
+    initial = contents(sharing)
+    staged = folder / 'sharing-staged-initial'
+    shutil.copytree(sharing, staged)
+    (staged / 'manifest').write_bytes(unselected['manifest'])
+    run('sharing-verify', staged, 1)
+    assert (staged / 'manifest').read_bytes() == initial['manifest']
+    run('sharing-update', sharing)
+    run('sharing-verify', sharing, 2)
+    advanced = contents(sharing)
+    staged_advanced = folder / 'sharing-staged-advanced'
+    shutil.copytree(sharing, staged_advanced)
+    (staged_advanced / 'manifest').write_bytes(unselected['manifest'])
+    before = contents(staged_advanced)
+    run('sharing-reject', staged_advanced)
+    assert contents(staged_advanced) == before
+    assert advanced['files.selected'] == initial['files.selected']
+    assert advanced['manifest'] == initial['manifest']
+    assert advanced['sharing.state'] != initial['sharing.state']
+    run('sharing-done', sharing)
+    run('sharing-verify', sharing, 3)
+    passed.extend(('selected_plan_separate_process_reload',
+                   'sharing_frontier_canonical_counters_deferred_reload',
+                   'sharing_completion_reload', 'unmarked_selected_evidence_retained',
+                   'staged_initial_selected_publication_completed',
+                   'staged_advanced_progress_not_adopted'))
+    for name in ('files.selected', 'sharing.state'):
+        for mutation in ('missing', 'corrupt', 'truncated', 'extra'):
+            damaged = folder / ('sharing-' + name + '-' + mutation)
+            shutil.copytree(sharing, damaged)
+            target = damaged / name
+            value = target.read_bytes()
+            if mutation == 'missing':
+                target.unlink()
+            elif mutation == 'corrupt':
+                target.write_bytes(bytes([value[0] ^ 1]) + value[1:])
+            elif mutation == 'truncated':
+                target.write_bytes(value[:-1])
+            else:
+                target.write_bytes(value + b'!')
+            before = contents(damaged)
+            run('sharing-reject', damaged)
+            assert contents(damaged) == before
+    passed.append('committed_selected_plan_and_progress_missing_corruption_refused')
+    print('PASS actual checkpoint prefixes, fresh-process reload, selected-plan/frontier/deferred state, locking, cancellation tails and fail-closed corruption')
 
     if include_driver:
         run('driver-write', folder / 'driver')
