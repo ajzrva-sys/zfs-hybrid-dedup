@@ -120,6 +120,7 @@ def missingtestedinput(name):
   for entry in rows:
    if 'tested_sources_digest' in entry.get('evidence',{}):entry['evidence']['tested_sources_digest']=tested
  put(run/'run.json',a);put(run/'local/results.json',b)
+test('controller omitted with refreshed receipt hashes','INFRA_FAILURE',lambda:missingtestedinput('chunkdedup/operations/run.sh.example'),['tested_source_coverage'])
 test('parallel implementation header omitted with refreshed receipt hashes','INFRA_FAILURE',lambda:missingtestedinput('cmd/zfs/chunkdedup_parallel.h'),['tested_source_coverage'])
 test('checkpoint implementation header omitted with refreshed receipt hashes','INFRA_FAILURE',lambda:missingtestedinput('cmd/zfs/chunkdedup_checkpoint.h'),['tested_source_coverage'])
 test('actual sorter implementation omitted with refreshed receipt hashes','INFRA_FAILURE',lambda:missingtestedinput('cmd/zfs/chunkdedup_hybrid.c'),['tested_source_coverage'])

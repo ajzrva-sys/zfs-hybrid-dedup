@@ -16,6 +16,9 @@ REQUIRED = (
     'cmd/zfs/chunkdedup_hybrid.c', 'cmd/zfs/chunkdedup_hybrid.h',
     'cmd/zfs/chunkdedup_parallel.h', 'cmd/zfs/chunkdedup_checkpoint.h',
     'include/sys/dsl_pool.h', 'module/zfs/dsl_pool.c',
+    'chunkdedup/operations/run.sh.example',
+    'chunkdedup/operations/tests/test_controller.py',
+    'chunkdedup/operations/tests/fixture.py',
 )
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--repo', type=Path, required=True)

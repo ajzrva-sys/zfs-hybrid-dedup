@@ -23,5 +23,14 @@
   ],
   "scope": "Recovered operational references, not a new kernel or optimizer implementation.",
   "verification": "Recovered files matched remote SHA-256. Publication syntax/build and existing local gate are checked separately.",
-  "excluded": "Installed binaries, kernel modules, private operational receipts, live job state and catalog contents."
+  "excluded": "Installed binaries, kernel modules, private operational receipts, live job state and catalog contents.",
+  "controller_revisions": [
+    {
+      "date": "2026-10-25",
+      "file": "run.sh.example",
+      "sha256": "18e82a7dbd4dd5ac486efd90f480640cf2e8a2b5164f1c1fd5c3b56027ebccb4",
+      "changes": "Synchronous resource refusal before mutation; shared watchdog checks preserve command failures and reject malformed readings. Identity and checkpoint guards retained.",
+      "qualification": "Deterministic isolated command fixtures; native pool execution and production recovery unqualified."
+    }
+  ]
 }

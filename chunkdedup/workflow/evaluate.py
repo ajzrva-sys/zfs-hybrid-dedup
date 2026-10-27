@@ -580,10 +580,13 @@ class Gate:
                       'include/sys/zfs_chunkdedup.h','module/zfs/zfs_chunkdedup.c',
                       'cmd/zfs/chunkdedup_hybrid.c','cmd/zfs/chunkdedup_hybrid.h',
                       'cmd/zfs/chunkdedup_parallel.h','cmd/zfs/chunkdedup_checkpoint.h',
-                      'include/sys/dsl_pool.h','module/zfs/dsl_pool.c'}
+                      'include/sys/dsl_pool.h','module/zfs/dsl_pool.c',
+                      'chunkdedup/operations/run.sh.example',
+                      'chunkdedup/operations/tests/test_controller.py',
+                      'chunkdedup/operations/tests/fixture.py'}
             self.require(isinstance(tested_files,list) and {x['path'] for x in tested_files}==required,
                          'tested_source_coverage',tested_files,sorted(required),
-                         'Include all actual chunker, worker, native-core and dirty-data gauge implementation inputs.')
+                         'Include all actual controller, command fixture, chunker, worker, native-core and dirty-data gauge inputs.')
         if tested_files is not None:
             source_map={x['path']:x for x in self.manifest['source']['files']}
             self.require(isinstance(tested_files,list) and tested_files and all(x==source_map.get(x['path']) for x in tested_files),
